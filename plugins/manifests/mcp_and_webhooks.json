@@ -1,0 +1,34 @@
+[
+  {
+    "name": "lookup_customer_ledger",
+    "description": "Read-only lookup of a customer's billing ledger entries via the billing MCP server.",
+    "protocol": "mcp_http",
+    "endpoint_url": "${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}",
+    "secret_key": "BILLING_WEBHOOK_SECRET",
+    "requires_approval": false,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "customer": {"type": "string", "description": "Customer slug, e.g. acme."},
+        "month": {"type": "string", "description": "Optional month filter, YYYY-MM."}
+      },
+      "required": ["customer"]
+    }
+  },
+  {
+    "name": "notify_billing_system",
+    "description": "Signs and POSTs a refund-batch notification to the billing system webhook. Requires human approval.",
+    "protocol": "http",
+    "endpoint_url": "${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}",
+    "secret_key": "BILLING_WEBHOOK_SECRET",
+    "requires_approval": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "batch_id": {"type": "string", "description": "Batch id returned by prepare_refund_batch."},
+        "note": {"type": "string", "description": "Optional operator-visible note."}
+      },
+      "required": ["batch_id"]
+    }
+  }
+]

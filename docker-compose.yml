@@ -1,0 +1,132 @@
+x-app-env: &app-env
+  POSTGRES_DSN: postgresql://haas:haas_dev_password@postgres:5432/haas_db
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  PLUGINS_DIR: /app/plugins
+  BILLING_MCP_URL: ${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}
+  BILLING_WEBHOOK_URL: ${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: haas
+      POSTGRES_PASSWORD: haas_dev_password
+      POSTGRES_DB: haas_db
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U haas -d haas_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  haas-api:
+    build: .
+    image: haas-distributed:3.0.0
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *app-env
+    volumes:
+      - ./plugins:/app/plugins:ro
+      - scratchpad_vol:/tmp/haas_scratchpad
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Orchestrator worker: holds OPENROUTER_API_KEY, never runs arbitrary tool code
+  worker-orchestrator:
+    image: haas-distributed:3.0.0
+    command: >
+      celery -A app.worker.celery_app worker
+      -Q q_orchestrator
+      -c 8
+      --loglevel=INFO
+      -n orchestrator@%h
+    environment:
+      <<: *app-env
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-sk-or-v1-replace-me}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      DEFAULT_PRIMARY_MODEL: ${DEFAULT_PRIMARY_MODEL:-deepseek/deepseek-chat-v3-0324}
+      DEFAULT_PLANNER_MODEL: ${DEFAULT_PLANNER_MODEL:-deepseek/deepseek-r1}
+    volumes:
+      - ./plugins:/app/plugins:ro
+      - scratchpad_vol:/tmp/haas_scratchpad
+    depends_on:
+      haas-api:
+        condition: service_healthy
+
+  # Isolated tool worker: NO OpenRouter key, no PostgreSQL DSN, dropped capabilities, read-only rootfs
+  worker-tools:
+    image: haas-distributed:3.0.0
+    command: >
+      celery -A app.worker.celery_app worker
+      -Q q_tools_fast,q_tools_sandbox
+      -c 8
+      --loglevel=INFO
+      -n tools@%h
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      PLUGINS_DIR: /app/plugins
+      BILLING_MCP_URL: ${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}
+      BILLING_WEBHOOK_URL: ${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001
+    volumes:
+      - ./plugins:/app/plugins:ro
+      - scratchpad_vol:/tmp/haas_scratchpad
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Optional real-time Celery monitor (localhost only; set FLOWER_BASIC_AUTH to protect it)
+  flower:
+    image: haas-distributed:3.0.0
+    command: celery -A app.worker.celery_app flower --port=5555
+    ports:
+      - "127.0.0.1:5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      FLOWER_BASIC_AUTH: ${FLOWER_BASIC_AUTH:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  pg_data:
+  scratchpad_vol:

@@ -1,0 +1,29 @@
+# Overlay for end-to-end testing: swaps OpenRouter and the billing endpoints for a local mock.
+#   docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml up --build -d
+x-mock-env: &mock-env
+  SSRF_ALLOWED_HOSTS: mock
+  BILLING_MCP_URL: http://mock:9000/mcp
+  BILLING_WEBHOOK_URL: http://mock:9000/hooks/refund-batches
+
+services:
+  mock:
+    image: haas-distributed:3.0.0
+    command: uvicorn mock_services:app --app-dir /mock --host 0.0.0.0 --port 9000
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ./tests/e2e:/mock:ro
+    depends_on:
+      - haas-api
+
+  haas-api:
+    environment:
+      <<: *mock-env
+  worker-orchestrator:
+    environment:
+      <<: *mock-env
+      OPENROUTER_BASE_URL: http://mock:9000/v1
+      OPENROUTER_API_KEY: sk-or-v1-e2e-mock-key
+  worker-tools:
+    environment:
+      <<: *mock-env
