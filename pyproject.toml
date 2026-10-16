@@ -22,13 +22,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "textual>=0.86"]
+tui = ["textual>=0.86"]
+
+[project.scripts]
+haas-chat = "haas_cli.chat:main"
+haas-plugin = "haas_cli.plugin:main"
 
 # The repo root also holds plugins/ and tests/, which setuptools' flat-layout
 # auto-discovery would reject as "multiple top-level packages".
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "haas_cli*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+# Templates contain `{{placeholders}}` and are not valid Python until scaffolded.
+extend-exclude = ["plugins/_templates"]

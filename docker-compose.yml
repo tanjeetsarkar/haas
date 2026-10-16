@@ -45,6 +45,9 @@ services:
       - "8000:8000"
     environment:
       <<: *app-env
+      # The API stamps these defaults on every run it creates (the workers only obey them).
+      DEFAULT_PRIMARY_MODEL: ${DEFAULT_PRIMARY_MODEL:-deepseek/deepseek-chat-v3-0324}
+      DEFAULT_PLANNER_MODEL: ${DEFAULT_PLANNER_MODEL:-deepseek/deepseek-r1}
     volumes:
       - ./plugins:/app/plugins:ro
       - scratchpad_vol:/tmp/haas_scratchpad

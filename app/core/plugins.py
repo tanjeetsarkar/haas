@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -329,6 +330,9 @@ class PluginRegistry:
                 )
                 if spec and spec.loader:
                     mod = importlib.util.module_from_spec(spec)
+                    # Pydantic resolves postponed annotations (`from __future__ import annotations`)
+                    # through sys.modules, so the plugin module must be registered before it runs.
+                    sys.modules[spec.name] = mod
                     spec.loader.exec_module(mod)
                     if hasattr(mod, "register"):
                         mod.register(self)

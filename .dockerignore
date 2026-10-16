@@ -25,3 +25,10 @@ wheels
 *.db-shm
 *.db-wal
 celerybeat-schedule*
+**/node_modules
+**/frontend/dist
+**/__pycache__
+**/.env
+**/.env.*
+**/test-results
+**/playwright-report

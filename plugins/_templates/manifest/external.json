@@ -1,0 +1,17 @@
+{
+  "name": "{{tool_name}}",
+  "description": "TODO: what the remote endpoint does and when to call it. Say if it is read-only.",
+  "protocol": "{{protocol}}",
+  "endpoint_url": "${{{env_var}}:-https://api.example.com/{{tool_name}}}",
+  "secret_key": "{{secret_key}}",
+  "requires_approval": false,
+  "queue": "q_tools_fast",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {"type": "string", "description": "TODO: identifier, e.g. 'cust_123'."},
+      "limit": {"type": "integer", "description": "Optional maximum number of results.", "default": 10}
+    },
+    "required": ["id"]
+  }
+}
