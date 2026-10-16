@@ -1,0 +1,21 @@
+{
+  "id": "github-ops",
+  "name": "Github Ops",
+  "description": "Reads and triages GitHub issues, pull requests and CI status, and (with human approval) opens issues or posts comments. Use when the user asks about a repo's open issues, a PR's state or diff size, failing checks/CI, release readiness, or wants an issue filed or a comment posted.",
+  "version": "1.0.0",
+  "category": "devops",
+  "provides": {
+    "skills": [
+      "github-ops"
+    ],
+    "tools": [
+      "github_add_comment",
+      "github_create_issue",
+      "github_get_ci_status",
+      "github_get_issue",
+      "github_get_pull_request",
+      "github_list_issues",
+      "github_list_pull_requests"
+    ]
+  }
+}

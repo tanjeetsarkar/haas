@@ -1,6 +1,6 @@
-# Writing an external-tool manifest
+# Writing an external-tool endpoint
 
-File: `plugins/manifests/<name>.json` — one object or a list. Use it when a service already speaks HTTP/MCP.
+File: `plugins/<id>/endpoints/<name>.json` — one object or a list. Use it when a service already speaks HTTP/MCP.
 
 ```json
 {

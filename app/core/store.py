@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at DOUBLE PRECISION NOT NULL
 );
 
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS skill_allowlist_json JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS registry_fingerprint TEXT;
+
 CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs (thread_id);
 """
 
@@ -169,6 +172,8 @@ class DistributedStore:
         max_steps: int,
         max_cost_usd: float,
         webhook_url: str | None,
+        skill_allowlist: list[str] | None = None,
+        registry_fingerprint: str | None = None,
     ) -> None:
         now = time.time()
         async with self.pool.acquire() as conn:
@@ -178,12 +183,14 @@ class DistributedStore:
                     run_id, thread_id, tenant_id, traceparent, status,
                     primary_model, planner_model, active_skills_json,
                     messages_checkpoint_json, max_steps, max_cost_usd,
-                    webhook_url, created_at, updated_at
+                    webhook_url, created_at, updated_at,
+                    skill_allowlist_json, registry_fingerprint
                 ) VALUES (
                     $1, $2, $3, $4, 'running',
                     $5, $6, $7::jsonb,
                     $8::jsonb, $9, $10,
-                    $11, $12, $13
+                    $11, $12, $13,
+                    $14::jsonb, $15
                 )
                 """,
                 run_id,
@@ -199,6 +206,10 @@ class DistributedStore:
                 webhook_url,
                 now,
                 now,
+                json.dumps(sorted(skill_allowlist))
+                if skill_allowlist is not None
+                else None,
+                registry_fingerprint,
             )
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -210,6 +221,12 @@ class DistributedStore:
         d["active_skills"] = _loads(d["active_skills_json"])
         d["messages"] = _loads(d["messages_checkpoint_json"])
         d["fingerprints"] = _loads(d["fingerprints_json"])
+        # NULL = unrestricted (also the value for runs created before allowlists existed).
+        d["skill_allowlist"] = (
+            _loads(d["skill_allowlist_json"])
+            if d.get("skill_allowlist_json") is not None
+            else None
+        )
         d["pending_tool_calls"] = (
             _loads(d["pending_tool_calls_json"])
             if d["pending_tool_calls_json"]

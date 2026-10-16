@@ -1,6 +1,6 @@
 # Writing a Python tool
 
-File: `plugins/tools/<name>.py`, self-contained (no sibling imports; `_`-prefixed files are skipped), exposing
+File: `plugins/<id>/tools/<name>.py`, self-contained (no sibling imports; `_`-prefixed files are skipped), exposing
 `register(registry)`.
 
 ```python

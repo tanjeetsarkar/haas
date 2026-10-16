@@ -30,6 +30,7 @@ class RunContext:
     tenant_id: str
     traceparent: str
     active_skills: set[str] = field(default_factory=set)
+    skill_allowlist: set[str] | None = None  # None = unrestricted
     allowed_secrets: set[str] = field(default_factory=set)
     _scoped_secrets: dict[str, str] = field(default_factory=dict, repr=False)
     http_client: httpx.AsyncClient | None = field(default=None, repr=False)

@@ -1,0 +1,18 @@
+{
+  "id": "revenue-ops",
+  "name": "Revenue Ops",
+  "description": "Investigates revenue anomalies, refund exposure and billing-system sync for SaaS subscriptions. Use when the user asks about quarterly revenue, MRR changes, duplicate or failed charges, refunds, or notifying the billing system.",
+  "version": "1.0.0",
+  "category": "finance",
+  "provides": {
+    "skills": [
+      "revenue-ops"
+    ],
+    "tools": [
+      "lookup_customer_ledger",
+      "notify_billing_system",
+      "prepare_refund_batch",
+      "query_revenue_metrics"
+    ]
+  }
+}

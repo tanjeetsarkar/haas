@@ -1,0 +1,18 @@
+{
+  "id": "data-analyst",
+  "name": "Data Analyst",
+  "description": "Explores and analyses tabular data: loads CSV (pasted or from a URL) into a private SQLite scratch database, profiles quality, and answers questions with read-only SQL. Use when the user provides or links a CSV/spreadsheet export, asks for statistics, trends, top-N, group-bys, joins, outliers, duplicates or data-quality checks.",
+  "version": "1.0.0",
+  "category": "data",
+  "provides": {
+    "skills": [
+      "data-analyst"
+    ],
+    "tools": [
+      "dataset_list",
+      "dataset_load",
+      "dataset_profile",
+      "dataset_query"
+    ]
+  }
+}

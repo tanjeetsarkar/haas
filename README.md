@@ -5,10 +5,10 @@ Implementation of [docs/dockerized_celery_haas_spec.md](docs/dockerized_celery_h
 ## Repository layout
 
 * [app/](app/): FastAPI API, shared core modules, and Celery workers.
-* [haas_cli/](haas_cli/): `haas-chat` (Textual chat TUI) and `haas-plugin` (scaffold/validate plugins).
-* [plugins/](plugins/): skills, native tools, external endpoint manifests and [authoring templates](plugins/_templates/README.md).
+* [haas_cli/](haas_cli/): `haas-chat` (Textual chat TUI) and `haas-plugin` (scaffold, list/inspect, doctor, migrate plugin packs).
+* [plugins/](plugins/): plugin packs (`plugins/<id>/` bundling skills, native tools and endpoint manifests) and [authoring templates](plugins/_templates/README.md).
 * [tests/](tests/): unit tests (core, CLI/TUI, plugins) and Docker-backed end-to-end checks.
-* [docs/](docs/): architecture specification, original design proposals and the [TUI usage guide](docs/tui_usage.md).
+* [docs/](docs/): architecture specification, [plugin architecture](docs/plugin_architecture.md), original design proposals and the [TUI usage guide](docs/tui_usage.md).
 
 ## Run
 
@@ -42,9 +42,13 @@ Full navigation guide (screen layout, keys, slash commands, approvals, secrets, 
 
 ## Plugins: skills and tools
 
-Sample plugins (each has a `SKILL.md`, references where useful, tools and unit tests):
+Each capability is a **plugin pack** `plugins/<id>/` with a static `plugin.json` plus its `skills/`, `tools/` and
+`endpoints/`. Packs can be allowed/denied by operators, skills can be limited per tenant or run, and a skill is only
+offered when all its tools exist. Design and rationale: [docs/plugin_architecture.md](docs/plugin_architecture.md).
 
-| Skill | Tools | Needs |
+Sample packs (each has a `SKILL.md`, references where useful, tools and unit tests):
+
+| Pack / skill | Tools | Needs |
 |---|---|---|
 | `github-ops` | list/get issues, list/get PRs, CI status, **create issue\***, **add comment\*** | `GITHUB_TOKEN` |
 | `web-research` | `web_search`, `web_fetch_page`, `web_extract_links` | `BRAVE_API_KEY` for search only |
@@ -57,14 +61,20 @@ Sample plugins (each has a `SKILL.md`, references where useful, tools and unit t
 \* approval-gated. Create your own from the templates:
 
 ```bash
-haas-plugin new skill my-skill --tools my_tool --secrets MY_TOKEN
-haas-plugin new tool my_tool --skill my-skill [--approval] [--sandbox]
-haas-plugin new manifest my_remote_tool --protocol mcp_http --secret MY_TOKEN
-haas-plugin validate            # run before restarting
+haas-plugin new plugin my-pack --tools my_tool --secrets MY_TOKEN --category ops
+haas-plugin new tool my_tool --plugin my-pack --skill my-pack [--approval] [--sandbox]
+haas-plugin new endpoint my_remote_tool --plugin my-pack --protocol mcp_http --secret MY_TOKEN
+haas-plugin doctor              # run before restarting (also: list, inspect <id>, migrate)
 docker compose restart haas-api worker-orchestrator worker-tools
 ```
 
 Authoring guide: [plugins/_templates/README.md](plugins/_templates/README.md).
+
+Operator controls (identical for the API and every worker; see [.env.example](.env.example)):
+`PLUGINS_ALLOW`, `PLUGINS_DENY`, `PLUGINS_EXTRA_DIRS`, `PLUGINS_STRICT`, `SKILLS_PROMPT_MAX_CHARS`,
+`TENANT_SKILL_ALLOWLISTS`. `POST /v1/runs` accepts an optional `skills` list that can only narrow the tenant's
+allowlist; `GET /v1/plugins` reports plugin status and the registry fingerprint. Upgrading from the flat
+`plugins/skills|tools|manifests` layout: run `haas-plugin migrate` once.
 
 Set `FLOWER_BASIC_AUTH` in `.env` to protect the Flower UI. The sample billing endpoints
 are placeholders; configure `BILLING_MCP_URL` and `BILLING_WEBHOOK_URL` for your services,
@@ -111,6 +121,7 @@ MCP `2026-07-28` Streamable HTTP, Celery canvas, PyPI versions (all dependencies
 | Tool execution | Sync handler called inline (blocked the loop, timeout never fired) | Run via `asyncio.to_thread` under `wait_for` |
 | Tool unlocking | Any registered tool callable | Only core tools + tools of active skills (enforced on the tool worker) |
 | `read_skill_reference` | `startswith` path check (prefix bypass) | `is_relative_to` |
+| Plugin packaging | Flat type-based `skills/ tools/ manifests/` dirs linked by name strings | `plugins/<id>/plugin.json` packs, static manifest, policy, readiness, isolation ([details](docs/plugin_architecture.md)) |
 | Plugin loading | Tool modules executed without being registered in `sys.modules` | Registered first; otherwise pydantic cannot resolve `Literal`/other typing imports under `from __future__ import annotations` |
 | SSRF | Literal/hostname check at registration | Also DNS-resolved check at call time, IPv4-mapped IPv6, webhook URLs validated; optional `SSRF_ALLOWED_HOSTS` for dev |
 | Resume | Redis lock before authz, stale-status race | Tenant check first, atomic `UPDATE … WHERE status='input_required'` |

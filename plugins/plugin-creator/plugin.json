@@ -1,0 +1,13 @@
+{
+  "id": "plugin-creator",
+  "name": "Plugin Creator",
+  "description": "Designs and drafts new HaaS plugins: skills (SKILL.md + references), Python tools and external HTTP/MCP manifests, following this harness's conventions. Use when the user wants to create, extend, review or debug a skill, tool or manifest, or asks how plugins, approval gating, secrets or tool queues work.",
+  "version": "1.0.0",
+  "category": "meta",
+  "provides": {
+    "skills": [
+      "plugin-creator"
+    ],
+    "tools": []
+  }
+}

@@ -1,10 +1,10 @@
 ---
 name: plugin-creator
-description: "Designs and drafts new HaaS plugins: skills (SKILL.md + references), Python tools and external HTTP/MCP manifests, following this harness's conventions. Use when the user wants to create, extend, review or debug a skill, tool or manifest, or asks how plugins, approval gating, secrets or tool queues work."
+description: "Designs and drafts new HaaS plugin packs: plugin.json, skills (SKILL.md + references), Python tools and external HTTP/MCP endpoints, following this harness's conventions. Use when the user wants to create, extend, review or debug a plugin, skill, tool or endpoint, or asks how plugins, approval gating, secrets or tool queues work."
 license: Apache-2.0
-compatibility: "Advisory skill with no tools: it produces file contents in the chat; the user saves them (see `haas-plugin new …` and `haas-plugin validate`)."
+compatibility: "Advisory skill with no tools: it produces file contents in the chat; the user saves them (see `haas-plugin new …` and `haas-plugin doctor`)."
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   required_tools: ""
   allowed_secrets: ""
 ---
@@ -19,16 +19,18 @@ You cannot write files. Produce complete, copy-ready file contents and tell the 
    the system/API involved, which actions change state (→ approval), which secrets are needed, read-only vs write.
    **Done when:** you can state the skill's trigger phrases and the tool list in one sentence each.
 2. **Choose the shape** using the table in `plugin_anatomy.md` (via `read_skill_reference`):
-   instructions only → skill; custom logic or computation → Python tool; existing HTTP/MCP service → manifest.
+   instructions only → skill; custom logic or computation → Python tool; existing HTTP/MCP service → endpoint.
+   Everything lives in one plugin pack `plugins/<id>/`; add to an existing pack when the domain matches.
 3. **Draft the files** in this order, each in its own fenced block with its path as a heading:
-   - `plugins/skills/<name>/SKILL.md` — follow `skill_authoring.md` (frontmatter rules, body structure, size).
-   - `plugins/tools/<name>.py` — follow `tool_authoring.md` (args schema, errors, SSRF-safe HTTP, secrets, approval).
-   - `plugins/manifests/<name>.json` — follow `manifest_authoring.md` for remote tools.
+   - `plugins/<id>/plugin.json` — id (= directory), description, version, `category`, `provides`, `requires`.
+   - `plugins/<id>/skills/<name>/SKILL.md` — follow `skill_authoring.md` (frontmatter rules, body structure, size).
+   - `plugins/<id>/tools/<name>.py` — follow `tool_authoring.md` (args schema, errors, SSRF-safe HTTP, secrets, approval).
+   - `plugins/<id>/endpoints/<name>.json` — follow `endpoint_authoring.md` for remote tools.
    - Tests: one pytest per tool using `httpx.MockTransport`; cover success, each remediation error, and secret denial.
 4. **Self-review** against the checklist at the end of `plugin_anatomy.md`; fix violations before showing the draft.
 5. **Hand off** with the exact commands:
-   `haas-plugin new skill <name> …` (scaffold) → paste the drafted contents → `haas-plugin validate` →
-   `docker compose restart haas-api worker-orchestrator worker-tools` → try it with `haas-chat --preload <name>`.
+   `haas-plugin new plugin <id> …` (scaffold) → paste the drafted contents → `haas-plugin doctor` →
+   `docker compose restart haas-api worker-orchestrator worker-tools` → try it with `haas-chat --preload <skill>`.
 
 ## Rules
 
@@ -38,4 +40,4 @@ You cannot write files. Produce complete, copy-ready file contents and tell the 
 - Never suggest bypassing the SSRF guard, sandbox queue or approval gate.
 - Prefer a small, sharp skill over a broad one; keep SKILL.md under ~100 lines and move detail to `references/`.
 
-References: `plugin_anatomy.md`, `skill_authoring.md`, `tool_authoring.md`, `manifest_authoring.md`.
+References: `plugin_anatomy.md`, `skill_authoring.md`, `tool_authoring.md`, `endpoint_authoring.md`.

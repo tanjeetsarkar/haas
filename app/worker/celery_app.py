@@ -39,7 +39,7 @@ celery_app.conf.update(
 
 @worker_process_init.connect
 def init_worker_plugins(**kwargs) -> None:
-    """Loads all SKILL.md, Python tools, and MCP manifests when each worker process forks."""
+    """Loads every enabled plugin pack (skills, Python tools, endpoint manifests) when each worker process forks."""
     settings.plugins_dir.mkdir(parents=True, exist_ok=True)
     settings.scratchpad_dir.mkdir(parents=True, exist_ok=True)
-    registry.discover_all(settings.plugins_dir)
+    registry.discover_from_settings(settings)

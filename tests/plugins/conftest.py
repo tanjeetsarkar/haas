@@ -15,8 +15,8 @@ PLUGINS = Path(__file__).resolve().parents[2] / "plugins"
 
 
 def load_tools(filename: str) -> PluginRegistry:
-    """Loads a plugins/tools/*.py file exactly like PluginRegistry.discover_all does."""
-    path = PLUGINS / "tools" / filename
+    """Loads a plugins/<plugin>/tools/*.py file like PluginRegistry.discover_all does."""
+    (path,) = PLUGINS.glob(f"*/tools/{filename}")
     spec = importlib.util.spec_from_file_location(f"haas_plugin_{path.stem}", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)

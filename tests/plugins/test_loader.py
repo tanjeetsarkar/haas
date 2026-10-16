@@ -26,9 +26,13 @@ def register(registry):
 def test_discover_all_supports_postponed_annotations_with_typing_imports(
     tmp_path: Path,
 ):
-    (tmp_path / "tools").mkdir()
-    (tmp_path / "tools" / "lit_tools.py").write_text(TOOL_SRC)
+    (tmp_path / "lit" / "tools").mkdir(parents=True)
+    (tmp_path / "lit" / "plugin.json").write_text(
+        '{"id": "lit", "description": "Literal tool plugin."}'
+    )
+    (tmp_path / "lit" / "tools" / "lit_tools.py").write_text(TOOL_SRC)
     reg = PluginRegistry()
     reg.discover_all(tmp_path)
     schema = reg.tools["lit_tool"].to_openai_schema()
     assert schema["function"]["parameters"]["properties"]["mode"]["enum"] == ["a", "b"]
+    assert reg.tools["lit_tool"].plugin_id == "lit"

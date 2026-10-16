@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.context import SecurityViolationError, validate_safe_outbound_url
-from app.core.plugins import registry
+from app.core.plugins import registry, resolve_run_allowlist
 from app.core.store import DistributedStore, ThreadOwnershipError
 from app.worker.tasks import aggregate_step_task, execute_tool_task, llm_step_task
 
@@ -22,12 +22,10 @@ TERMINAL_STATUSES = ("completed", "failed", "cancelled", "input_required")
 TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 
 
-def build_tier1_system_prompt() -> str:
-    catalog = [
-        f"- `{name}`: {skill.description}"
-        for name, skill in sorted(registry.skills.items())
-    ]
-    catalog_block = "\n".join(catalog) if catalog else "(No domain skills installed)"
+def build_tier1_system_prompt(allowed_skills: list[str] | None = None) -> str:
+    catalog_block = registry.render_catalog(
+        allowed_skills, settings.skills_prompt_max_chars
+    )
     return (
         "You are an autonomous execution agent running inside a deterministic distributed harness.\n"
         "1. Review the Domain Skills Catalog below. When a task matches a skill, call "
@@ -41,7 +39,7 @@ def build_tier1_system_prompt() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.plugins_dir.mkdir(parents=True, exist_ok=True)
-    registry.discover_all(settings.plugins_dir)
+    registry.discover_from_settings(settings)
     await store.init(ensure_schema=True)
     yield
     await store.close()
@@ -54,6 +52,8 @@ class CreateRunRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     thread_id: str | None = None
     preload_skills: list[str] = Field(default_factory=list)
+    # Optional allowlist for this run; can only narrow the tenant's allowed skills.
+    skills: list[str] | None = None
     primary_model: str | None = None
     planner_model: str | None = None
     max_steps: int = Field(default=settings.default_max_steps, ge=1, le=50)
@@ -90,10 +90,22 @@ async def create_run(
     x_tenant_id: str = Header(default="default-tenant"),
     traceparent: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    unknown = [s for s in req.preload_skills if s not in registry.skills]
+    try:
+        allowlist = resolve_run_allowlist(
+            settings.tenant_skill_allowlist(x_tenant_id), req.skills
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    usable = registry.effective_skills(registry.skills, allowlist)
+    if req.skills is not None:
+        unknown = sorted(set(req.skills) - set(registry.skills))
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"Unknown skills: {unknown}")
+    unknown = [s for s in req.preload_skills if s not in usable]
     if unknown:
         raise HTTPException(
-            status_code=422, detail=f"Unknown preload_skills: {unknown}"
+            status_code=422,
+            detail=f"Unknown, unavailable or not permitted preload_skills: {unknown}",
         )
     if req.webhook_url:
         try:
@@ -113,7 +125,9 @@ async def create_run(
     except ThreadOwnershipError:
         raise HTTPException(status_code=404, detail="Thread not found.")
     if not history:
-        history.append({"role": "system", "content": build_tier1_system_prompt()})
+        history.append(
+            {"role": "system", "content": build_tier1_system_prompt(allowlist)}
+        )
     history.append({"role": "user", "content": req.prompt})
 
     await store.store_ephemeral_secrets(run_id, req.secrets)
@@ -129,6 +143,8 @@ async def create_run(
         max_steps=req.max_steps,
         max_cost_usd=req.max_cost_usd,
         webhook_url=req.webhook_url,
+        skill_allowlist=allowlist,
+        registry_fingerprint=registry.fingerprint,
     )
     await store.publish_event(
         run_id, "run_queued", {"run_id": run_id, "thread_id": thread_id}
@@ -208,7 +224,8 @@ async def resume_run(
         status="running",
         pending_tool_calls=None,
     )
-    allowed_keys = registry.resolve_allowed_secrets(active_skills)
+    allowlist = run.get("skill_allowlist")
+    allowed_keys = registry.resolve_allowed_secrets(active_skills, allowlist)
     scoped_secrets = await store.get_scoped_secrets(run_id, allowed_keys)
 
     sigs = []
@@ -221,6 +238,7 @@ async def resume_run(
                 tenant_id=run["tenant_id"],
                 traceparent=run["traceparent"],
                 active_skills=sorted(active_skills),
+                skill_allowlist=allowlist,
                 allowed_secrets=sorted(allowed_keys),
                 scoped_secrets=scoped_secrets,
                 tool_call=tc,
@@ -302,8 +320,24 @@ async def get_run(
 
 
 @app.get("/v1/plugins")
-async def get_plugins() -> dict[str, Any]:
+async def get_plugins(
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    tenant_list = settings.tenant_skill_allowlist(x_tenant_id)
     return {
+        "fingerprint": registry.fingerprint,
+        "plugins": [
+            {
+                "id": r.id,
+                "status": r.status,
+                "version": r.manifest.version if r.manifest else None,
+                "category": r.manifest.category if r.manifest else None,
+                "skills": r.skills,
+                "tools": r.tools,
+                "error": r.error or None,
+            }
+            for r in sorted(registry.plugins.values(), key=lambda x: x.id)
+        ],
         "skills": [
             {
                 "name": s.name,
@@ -312,8 +346,13 @@ async def get_plugins() -> dict[str, Any]:
                 "required_tools": s.required_tools,
                 "allowed_secrets": s.allowed_secrets,
                 "references": s.available_references,
+                "plugin": s.plugin_id,
+                "category": s.category,
+                "hidden": s.hidden,
+                "ready": s.ready,
             }
             for s in sorted(registry.skills.values(), key=lambda x: x.name)
+            if tenant_list is None or s.name in tenant_list
         ],
         "tools": [
             {"name": t.name, "queue": t.queue, "requires_approval": t.requires_approval}

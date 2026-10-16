@@ -6,8 +6,27 @@
 |---|---|---|
 | Teach the model a procedure using existing tools | Skill only | Cheapest; `SKILL.md` body is the SOP |
 | New logic, computation, parsing, calling an API directly | Python tool + skill | Full control, typed args, unit-testable |
-| Service already exposes HTTP or MCP | Manifest + skill | No code; HMAC signing and SSRF guard built in |
+| Service already exposes HTTP or MCP | Endpoint JSON + skill | No code; HMAC signing and SSRF guard built in |
 | Needs long reference material | Skill + `references/*.md` | Loaded on demand, not in every prompt |
+
+## Plugin pack layout
+
+Everything belongs to one plugin pack; `plugin.json` is read without running any plugin code.
+
+```
+plugins/<id>/
+├── plugin.json                 # id (= dir name), description, version, category, enabled, provides, requires
+├── skills/[<group>/]<name>/SKILL.md   (+ references/)   # groups are organisation only
+├── tools/*.py                  # register(registry)
+└── endpoints/*.json            # remote HTTP / MCP tools
+```
+
+- `provides.skills` / `provides.tools` declare what the pack registers; a mismatch fails the plugin.
+- `requires.plugins` lists packs whose tools your skills use. Skill and tool names stay globally unique.
+- `category` (also settable per skill as `metadata.category`) groups the skill catalog once it is large.
+- `metadata.disable_model_invocation: "true"` hides a skill from the model; it is then only usable via preload.
+- A skill is **ready** only if all its `required_tools` exist; unready skills are not offered to the model.
+- Operators can allow/deny whole plugins (`PLUGINS_ALLOW` / `PLUGINS_DENY`) and restrict skills per tenant or run.
 
 ## Loading tiers (why descriptions matter)
 
@@ -35,4 +54,5 @@
 - [ ] Tool args have `Field(description=…)` with formats/examples; limits and caps on sizes and counts.
 - [ ] Expected failures raise `ToolRemediationError` with an actionable message.
 - [ ] Outbound HTTP validates URLs (`validate_safe_outbound_url(..., resolve_dns=True)`), no auto-redirects, timeouts set.
-- [ ] No `TODO` left, tests added, `haas-plugin validate` passes.
+- [ ] `plugin.json` has `provides` (and `requires` for tools from other packs); no `TODO` left.
+- [ ] Tests added, `haas-plugin doctor` passes.

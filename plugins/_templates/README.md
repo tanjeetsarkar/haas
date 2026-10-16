@@ -1,6 +1,6 @@
 # Plugin authoring guide
 
-A plugin extends the harness with **skills** (instructions the model loads on demand) and **tools**
+A **plugin pack** extends the harness with **skills** (instructions the model loads on demand) and **tools**
 (code or remote endpoints the model can call). Everything under `plugins/` is bind-mounted into the
 containers (`./plugins:/app/plugins:ro`), so **restart the API and workers to pick up changes**:
 
@@ -10,25 +10,47 @@ docker compose restart haas-api worker-orchestrator worker-tools
 
 ```
 plugins/
-├── skills/<name>/SKILL.md            # Tier 1: name+description always in context; Tier 2: body on activation
-│   └── references/*.md               # Tier 3: read on demand via `read_skill_reference`
-├── tools/<name>.py                   # Python tools: `register(registry)` using @registry.tool
-├── manifests/<name>.json             # Remote tools: plain HTTP (HMAC-signed) or MCP Streamable HTTP
-└── _templates/                       # these templates (never loaded by the harness)
+├── <id>/                              # one pack per capability/domain; <id> = plugin.json "id"
+│   ├── plugin.json                    # static manifest: id, description, version, category, enabled, provides, requires
+│   ├── skills/[<group>/]<name>/SKILL.md   # Tier 1: name+description always in context; Tier 2: body on activation
+│   │   └── references/*.md            # Tier 3: read on demand via `read_skill_reference`
+│   ├── tools/<name>.py               # Python tools: `register(registry)` using @registry.tool
+│   └── endpoints/<name>.json         # Remote tools: plain HTTP (HMAC-signed) or MCP Streamable HTTP
+└── _templates/                        # these templates (never loaded by the harness)
 ```
 
-## Fast path: scaffold, edit, validate
+## Fast path: scaffold, edit, doctor
 
 ```bash
-haas-plugin new skill github-ops --tools github_list_issues --secrets GITHUB_TOKEN
-haas-plugin new tool github_list_issues --skill github-ops          # Python tool (add --approval / --sandbox)
-haas-plugin new manifest billing_lookup --protocol mcp_http --secret BILLING_KEY
-haas-plugin validate                                                  # exits 1 on errors
+haas-plugin new plugin github-ops --tools github_list_issues --secrets GITHUB_TOKEN --category devops
+haas-plugin new tool github_list_issues --plugin github-ops --skill github-ops   # Python tool (add --approval / --sandbox)
+haas-plugin new endpoint billing_lookup --plugin github-ops --protocol mcp_http --secret BILLING_KEY
+haas-plugin new skill triage --plugin github-ops                                  # a second skill in the same pack
+haas-plugin doctor                                                                # exits 1 on errors
+haas-plugin list                                                                  # status of every pack + registry fingerprint
+haas-plugin inspect github-ops                                                    # skills, tools, queues, readiness
 ```
 
 `new` copies the files in this folder and fills in the names; search for `TODO` and replace each one.
-`validate` loads everything exactly like the server does and also checks cross-references
-(see below). Run it before every restart.
+`doctor` (alias `validate`) loads everything exactly like the server does, including disabled packs, and also
+checks cross-references (see below). Run it before every restart. A flat `plugins/skills|tools|manifests`
+layout from older versions is no longer loaded: run `haas-plugin migrate` once.
+
+## `plugin.json`
+
+| Key | Meaning |
+|---|---|
+| `id` | Required; lowercase `a-z0-9-`, **identical to the directory name**. Provenance only: skill and tool names stay globally unique. |
+| `description` | Required; one sentence. |
+| `version`, `category` | Shown by `list`/`inspect`; `category` is the default group of the pack's skills in the prompt catalog once it is large. |
+| `enabled` | `false` ships the pack switched off (an explicit `PLUGINS_ALLOW` entry turns it on). |
+| `skills`, `tools`, `endpoints` | Paths/globs inside the pack. Defaults: `["skills"]`, `["tools/*.py"]`, `["endpoints/*.json"]`. Anything resolving outside the pack is rejected. |
+| `provides` | `{"skills": [...], "tools": [...]}`: what the pack must register. A mismatch fails the pack (`doctor` shows why). |
+| `requires` | `{"plugins": [...]}`: packs whose tools your skills use; loaded first, blocked if they are missing. |
+
+A pack that fails to load is isolated (its tools and skills are rolled back; the rest keep serving) unless
+`PLUGINS_STRICT=true`. Operators control packs with `PLUGINS_ALLOW` / `PLUGINS_DENY` / `PLUGINS_EXTRA_DIRS`,
+skills per tenant with `TENANT_SKILL_ALLOWLISTS`, and per run with `skills` in `POST /v1/runs`.
 
 ## How the pieces connect
 
@@ -36,6 +58,8 @@ haas-plugin validate                                                  # exits 1 
 |---|---|
 | `SKILL.md` `description` | Listed in the system prompt catalog (≤1024 chars). The model decides to `activate_skill` from this text alone. |
 | `metadata.required_tools` | Tools unlocked only after the skill is activated (space/comma separated). |
+| `metadata.category` | Optional group heading in the catalog (defaults to the pack's `category`). |
+| `metadata.disable_model_invocation: "true"` | Hides the skill from the catalog and `activate_skill`; it can only be used through `preload_skills` / `haas-chat --preload`. |
 | `metadata.allowed_secrets` | The only secret keys tools may read via `ctx.get_secret()` while the skill is active. |
 | `requires_approval=True` | The run pauses (`input_required`) until a human approves in the TUI/API. Use for anything that writes, spends, sends or deletes. |
 | `sandbox=True` / `"queue": "q_tools_sandbox"` | Runs on the read-only sandbox worker queue (writable `/tmp` only). |
@@ -63,8 +87,9 @@ Callers supply secrets **per run** (`secrets` in `POST /v1/runs`; in `haas-chat`
 * Never log or return secret values. Untrusted text (web pages, tickets) is data, not instructions.
 * The module is loaded standalone: no sibling imports; files starting with `_` are skipped.
 * Add unit tests (see `tests/plugins/` for patterns with `httpx.MockTransport`).
+* A skill is only offered when every tool in its `required_tools` exists (it is "ready"); `haas-plugin inspect` shows why not.
 
-## Manifest checklist (remote tools)
+## Endpoint checklist (remote tools)
 
 * `protocol`: `http` (POST JSON body) or `mcp_http` (JSON-RPC `tools/call`, MCP `2026-07-28`).
 * `endpoint_url` supports `${ENV_VAR:-default}`; must be a public https/http URL (SSRF guard; set
@@ -75,7 +100,7 @@ Callers supply secrets **per run** (`secrets` in `POST /v1/runs`; in `haas-chat`
 ## Testing a plugin end to end
 
 ```bash
-haas-plugin validate
+haas-plugin doctor
 docker compose restart haas-api worker-orchestrator worker-tools
 curl -s localhost:8000/v1/plugins | jq '.skills[].name'
 HAAS_SECRET_GITHUB_TOKEN=... haas-chat --preload github-ops     # preloading guarantees the skill is active

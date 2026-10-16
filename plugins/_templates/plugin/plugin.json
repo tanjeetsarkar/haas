@@ -1,0 +1,7 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "description": "TODO: one sentence on what this plugin adds and who it is for.",
+  "version": "1.0.0",
+  "category": "{{category}}"
+}

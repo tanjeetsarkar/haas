@@ -1,0 +1,17 @@
+{
+  "id": "web-research",
+  "name": "Web Research",
+  "description": "Researches questions on the public web: searches, reads pages, follows links and produces a cited summary. Use when the user asks to look something up online, verify a claim, compare sources, read or summarise a URL, or find documentation or news.",
+  "version": "1.0.0",
+  "category": "research",
+  "provides": {
+    "skills": [
+      "web-research"
+    ],
+    "tools": [
+      "web_extract_links",
+      "web_fetch_page",
+      "web_search"
+    ]
+  }
+}

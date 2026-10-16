@@ -1,0 +1,15 @@
+{
+  "id": "weather",
+  "name": "Weather",
+  "description": "Gets current weather and multi-day forecasts for any named place (Open-Meteo, no API key). Use when the user asks about the weather, temperature, rain, wind, whether to bring an umbrella, or conditions for travel or outdoor plans.",
+  "version": "1.0.0",
+  "category": "utilities",
+  "provides": {
+    "skills": [
+      "weather"
+    ],
+    "tools": [
+      "get_weather_forecast"
+    ]
+  }
+}

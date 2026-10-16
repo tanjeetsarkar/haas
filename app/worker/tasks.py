@@ -137,7 +137,23 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
             primary_model=run["primary_model"],
             planner_model=run["planner_model"],
         )
-        tools_payload = registry.resolve_sorted_tool_schemas(active_skills)
+        skill_allowlist: list[str] | None = run.get("skill_allowlist")
+        tools_payload = registry.resolve_sorted_tool_schemas(
+            active_skills, skill_allowlist
+        )
+
+        # API and workers load plugins independently (rolling restarts, stale mounts); flag it.
+        drift = bool(
+            run.get("registry_fingerprint")
+            and run["registry_fingerprint"] != registry.fingerprint
+        )
+        if drift:
+            log.warning(
+                "registry drift on %s: run created with %s, this worker has %s",
+                run_id,
+                run["registry_fingerprint"],
+                registry.fingerprint,
+            )
 
         await store.publish_event(
             run_id,
@@ -147,6 +163,7 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 "model": chosen_model,
                 "active_skills": sorted(active_skills),
                 "unlocked_tools_count": len(tools_payload),
+                **({"registry_drift": True} if drift else {}),
             },
         )
 
@@ -275,7 +292,9 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
             status="running",
         )
 
-        allowed_secret_keys = registry.resolve_allowed_secrets(active_skills)
+        allowed_secret_keys = registry.resolve_allowed_secrets(
+            active_skills, skill_allowlist
+        )
         scoped_secrets = await store.get_scoped_secrets(run_id, allowed_secret_keys)
 
         tool_signatures = []
@@ -296,6 +315,7 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                     tenant_id=run["tenant_id"],
                     traceparent=run["traceparent"],
                     active_skills=sorted(active_skills),
+                    skill_allowlist=skill_allowlist,
                     allowed_secrets=sorted(allowed_secret_keys),
                     scoped_secrets=scoped_secrets,
                     tool_call=tc,
@@ -328,6 +348,7 @@ def execute_tool_task(
     allowed_secrets: list[str],
     scoped_secrets: dict[str, str],
     tool_call: dict[str, Any],
+    skill_allowlist: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Runs on `worker-tools` (`q_tools_fast` or `q_tools_sandbox`).
@@ -343,6 +364,9 @@ def execute_tool_task(
             allowed_secrets=set(allowed_secrets),
             scoped_secrets=scoped_secrets,
             tool_call=tool_call,
+            skill_allowlist=set(skill_allowlist)
+            if skill_allowlist is not None
+            else None,
         )
     )
 
@@ -370,6 +394,7 @@ async def _async_execute_tool(
     allowed_secrets: set[str],
     scoped_secrets: dict[str, str],
     tool_call: dict[str, Any],
+    skill_allowlist: set[str] | None = None,
 ) -> dict[str, Any]:
     tc_id = tool_call["id"]
     fn_name = tool_call["function"]["name"]
@@ -377,7 +402,9 @@ async def _async_execute_tool(
     fp = _fingerprint(fn_name, raw_args)
 
     tool = registry.tools.get(fn_name)
-    if not tool or fn_name not in registry.resolve_unlocked_tool_names(active_skills):
+    if not tool or fn_name not in registry.resolve_unlocked_tool_names(
+        active_skills, skill_allowlist
+    ):
         return _outcome(
             tc_id,
             fn_name,
@@ -406,7 +433,8 @@ async def _async_execute_tool(
             thread_id=thread_id,
             tenant_id=tenant_id,
             traceparent=traceparent,
-            active_skills=active_skills,
+            active_skills=registry.effective_skills(active_skills, skill_allowlist),
+            skill_allowlist=skill_allowlist,
             allowed_secrets=allowed_secrets,
             _scoped_secrets=scoped_secrets,
             http_client=http_client,

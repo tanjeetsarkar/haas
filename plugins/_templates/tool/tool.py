@@ -1,6 +1,6 @@
 """{{title}} tools. Loaded by `PluginRegistry.discover_all` via `register(registry)`.
 
-Rules for files in plugins/tools/:
+Rules for files in plugins/<plugin>/tools/:
 * Self-contained: files are loaded standalone, so sibling modules cannot be imported.
   (Files starting with `_` are skipped entirely.)
 * Declare `ctx: RunContext` to get the run context; omit it if you do not need it.

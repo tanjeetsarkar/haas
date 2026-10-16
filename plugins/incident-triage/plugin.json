@@ -1,0 +1,16 @@
+{
+  "id": "incident-triage",
+  "name": "Incident Triage",
+  "description": "Triages production incidents from pasted logs and impact facts: finds the first error, error spikes and dominant failure signatures, classifies severity SEV1-SEV4, and drafts the incident summary or postmortem. Use when the user shares logs or stack traces, reports an outage, error spike, latency or availability problem, or asks how severe an incident is.",
+  "version": "1.0.0",
+  "category": "devops",
+  "provides": {
+    "skills": [
+      "incident-triage"
+    ],
+    "tools": [
+      "analyze_log_text",
+      "classify_incident_severity"
+    ]
+  }
+}
