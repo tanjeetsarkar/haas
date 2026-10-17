@@ -13,7 +13,7 @@ Turn the current trusted single-domain Compose stack into a multi-tenant
 Harness-as-a-Service that meets every TARGET in the [SDD](design/sdd.md),
 [architecture](design/architecture.md), [data model](design/data-model.md),
 [integrations](design/integrations-usage.md), [threat model](design/threat-model.md) and
-[operations](design/operations-migration.md) documents. On top of that, the roadmap adds three
+[operations](design/operations-migration.md) documents. On top of that, the roadmap adds four
 product tracks:
 
 * an **open plugin marketplace** ([design](design/marketplace.md))
@@ -21,6 +21,8 @@ product tracks:
   facade; [design](design/multi-agent.md))
 * a **developer platform** (contract-first API, Python/TypeScript SDKs, unified CLI;
   [design](design/developer-platform.md))
+* a **first-class terminal experience** (mission control, agent workbench, approvals,
+  marketplace and operations; [design](design/tui-experience.md))
 
 ## Decisions in force
 
@@ -32,6 +34,7 @@ product tracks:
 | Agent protocols | Native HACP, A2A in/out, agents as MCP server, OpenAI-compatible facade (ADR-12) |
 | SDKs | Python and TypeScript; React widgets optional |
 | Deployment | Cloud-agnostic Kubernetes (Helm + Terraform); Compose stays the dev profile |
+| Terminal product | Evolve the Textual TUI into `haas chat`; share authorized API/SDK contracts, keyboard-first progressive disclosure; no web-UI dependency |
 
 ## Invariants every item must respect
 
@@ -42,6 +45,9 @@ product tracks:
 5. Every feature ships with migration, RLS policy, authorization check, audit event, metrics,
    security test, docs and SDK surface.
 6. The `prod` profile fails closed when a required control is missing.
+7. A user-facing capability is not release-complete until its Track T journey, authorization,
+   error/recovery states, keyboard tests and usage docs ship in the same milestone.
+   Backend groundwork can merge first; non-user-facing exemptions must be explicit.
 
 ## Dependency overview
 
@@ -49,9 +55,15 @@ product tracks:
 flowchart LR
     P0["P0 Foundations"] --> P1["P1 Identity"] --> P2["P2 Schema"] --> P3["P3 Durable workflow"] --> P4["P4 Isolation"] --> P5["P5 Operations"] --> P6["P6 Cells + GA"]
     P0 --> D["Track D: Developer platform"]
+    P0 --> T["Track T: Terminal experience"]
+    P1 -.-> T
+    P3 -.-> T
+    P5 -.-> T
     P3 --> A["Track A: Multi-agent"]
     P4 --> A
     P4 --> M["Track M: Marketplace"]
+    A -.-> T
+    M -.-> T
     A --> P6
     M --> P6
 ```
@@ -59,6 +71,23 @@ flowchart LR
 Marketplace items that need no code execution (skill-only plugins, private registries,
 remote MCP/OpenAPI through the egress proxy) may ship before P4. Code plugins from
 third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
+
+### Terminal delivery alongside each phase
+
+Do the **T0 bridge before Phase 1 implementation**; it closes the gap between Phase 0's
+API and today's chat UI. Subsequent waves ship with their server capabilities, not after GA.
+All new Track T items are targets, not implemented features.
+
+| Server milestone | Required terminal increment |
+|---|---|
+| Before Phase 1 | `t0-foundation`, `t0-run-control`, `t0-qualification`: navigation, run list/reattach/cancel, safe input and terminal tests |
+| Phase 1 | `t1-identity`, `t1-administration`: authenticated profiles, tenant context, role-aware administration |
+| Phase 2 | `t2-agents`, `t2-threads`: agent revisions, thread history/branches/conflicts |
+| Phase 3 | `t3-inspector`, `t3-approvals`, `t3-budgets`: durable timeline/recovery, decisions and cost; `t3-output` when token streaming ships |
+| Phase 4 | `t4-artifacts`, `t4-access`: evidence/workspace previews, credential bindings, sandbox/egress policy explanations |
+| Phase 5 | `t5-operations`, `t5-performance`: service diagnostics, webhook/retention workflows and large-session quality |
+| Marketplace / multi-agent / developer tracks | `t-m-*`, `t-a-*`, `t-d-*` ship incrementally with the corresponding APIs |
+| Phase 6 | `t6-qualification`: cross-role, safety, terminal, compatibility and usability gates before launch |
 
 ---
 
@@ -68,19 +97,19 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 |---|---|---|---|---|
 | p0-design-scope | Bring marketplace, multi-agent and developer platform into design scope (SDD FR-15..24, ADR-09..12, TM-23..34, SEC-16..26, ERD §4a) | — | Docs review | ✅ |
 | p0-roadmap-doc | This roadmap, linked from README and design index | p0-design-scope | — | ✅ |
-| p0-ci | GitHub Actions: ruff, pyright, pytest, Compose E2E, coverage, pip-audit, gitleaks, Trivy, SBOM, CodeQL | — | CI green on main | ⬜ |
-| p0-migrations | Alembic baseline of current schema; separate advisory-locked migration job; remove startup DDL | — | Upgrade/downgrade test | ⬜ |
-| p0-profiles | `dev` / `prod` profiles; prod refuses header tenancy, default tenant, placeholder keys, open Flower/stores | — | Startup fail-closed tests | ⬜ |
-| p0-observability-base | JSON logs with redaction filter, OpenTelemetry for API/Celery/httpx, `/livez` + `/readyz` | — | Trace across API→worker in E2E | ⬜ |
-| p0-quick-wins | Cancel endpoint, run listing (cursor), body/prompt limits, problem+json, unique MCP JSON-RPC ids, orphan reaper, scratchpad GC, encrypted Redis secrets | p0-migrations | Unit + E2E | ⬜ |
-| p0-baseline-tests | Freeze E2E as regression; OpenAPI snapshot of `/v1` | p0-ci | CI | ⬜ |
+| p0-ci | GitHub Actions: ruff, pyright, pytest, Compose E2E, coverage, pip-audit, gitleaks, Trivy, SBOM, CodeQL | — | CI green on main | 🚧 |
+| p0-migrations | Alembic baseline of current schema; separate advisory-locked migration job; remove startup DDL | — | Upgrade/downgrade test | ✅ |
+| p0-profiles | `dev` / `prod` profiles; prod refuses header tenancy, default tenant, placeholder keys, open Flower/stores | — | Startup fail-closed tests | ✅ |
+| p0-observability-base | JSON logs with redaction filter, OpenTelemetry for API/Celery/httpx, `/livez` + `/readyz` | — | Trace across API→worker in E2E | ✅ |
+| p0-quick-wins | Cancel endpoint, run listing (cursor), body/prompt limits, problem+json, unique MCP JSON-RPC ids, orphan reaper, scratchpad GC, encrypted Redis secrets | p0-migrations | Unit + E2E | ✅ |
+| p0-baseline-tests | Freeze E2E as regression; OpenAPI snapshot of `/v1` | p0-ci | CI | 🚧 |
 
 ## Phase 1 — Identity and tenant authority
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p1-authn | OIDC JWT (JWKS rotation) + tenant-scoped hashed API keys; header stripping | p0-profiles | SEC-01 | ⬜ |
-| p1-tenant-registry | Tenants, principals, memberships, lifecycle state machine, revocation epoch, bootstrap admin | p0-migrations | SEC-02 | ⬜ |
+| p1-authn | OIDC JWT (JWKS rotation) + tenant-scoped hashed API keys; header stripping | p0-profiles, t0-qualification | SEC-01 | ⬜ |
+| p1-tenant-registry | Tenants, principals, memberships, lifecycle state machine, revocation epoch, bootstrap admin | p0-migrations, t0-qualification | SEC-02 | ⬜ |
 | p1-rbac | Policy decision point; admin/submitter/approver/auditor/operator/break-glass | p1-authn, p1-tenant-registry | SEC-02, SEC-13 | ⬜ |
 | p1-tenant-policy | Deny-by-default models, destinations, plugin grants, budgets, retention (replaces `TENANT_SKILL_ALLOWLISTS`) | p1-rbac | SEC-04 | ⬜ |
 | p1-admin-api | Tenant/member/API-key/policy endpoints + CLI | p1-rbac, p1-tenant-policy | SEC-13 | ⬜ |
@@ -95,7 +124,7 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 | p2-rls | Non-owner role, forced RLS, `SET LOCAL` tenant, pool-reuse tests | p2-schema-expand | SEC-03 | ⬜ |
 | p2-agent-revisions | Draft → validate → publish immutable agent revisions; runs pin them | p1-tenant-policy, p2-schema-expand | FR-14 | ⬜ |
 | p2-legacy-migration | Tenant mapping, backfill, quarantine, drain-to-terminal cutover | p2-rls | Migration counts | ⬜ |
-| p2-thread-fencing | `history_version`, one active run per thread, explicit branching | p2-schema-expand | SEC-15 | ⬜ |
+| p2-thread-fencing | `history_version`, one active run per thread, tenant-scoped thread/history/branch APIs | p2-schema-expand | SEC-15 | ⬜ |
 
 ## Phase 3 — Durable workflow correctness
 
@@ -142,7 +171,7 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 |---|---|---|---|---|
 | p6-cells | Durable placement with fencing; dedicated cells | p5-k8s-helm | Isolation/failover test | ⬜ |
 | p6-security-qualification | SEC-01..SEC-26, external pentest, threat-model refresh | p6-cells, m-install-grants, a-attenuation-budget | Full matrix | ⬜ |
-| p6-launch | Canary tenants, on-call, status page, go-live review | p6-security-qualification, p5-load-slo, p5-backup-dr | Go-live review | ⬜ |
+| p6-launch | Canary tenants, on-call, status page, go-live review | p6-security-qualification, p5-load-slo, p5-backup-dr, t6-qualification | Go-live review | ⬜ |
 
 ---
 
@@ -152,15 +181,53 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 |---|---|---|---|---|
 | d-api-contract | OpenAPI 3.1, event JSON Schemas, AsyncAPI, Spectral + oasdiff, deprecation policy (ADR-16) | p0-ci | FR-23 | ⬜ |
 | d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | ⬜ |
+| d-capabilities | Versioned identity-scoped feature/action capabilities and event-schema compatibility metadata; never substitutes for server authorization | d-api-contract, p1-rbac | TUI-02, TUI-07 | ⬜ |
 | d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
 | d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
-| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat) | d-sdk-python | FR-24 | ⬜ |
+| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | ⬜ |
 | d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | ⬜ |
 | d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ⬜ |
 | d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | ⬜ |
 | d-openai-compat | `/v1/chat/completions` + Responses facade over agent revisions | p2-agent-revisions, p3-durable-events | SEC-24 | ⬜ |
 | d-token-streaming | Optional `run.output.delta` events | p3-durable-events | Contract tests | ⬜ |
 | d-react-widgets | Optional chat/timeline/approval components | d-sdk-typescript | — | ⬜ |
+
+## Track T — Terminal experience
+
+[Experience design](design/tui-experience.md) defines the screens, interaction model,
+API prerequisites and measurable `TUI-01..07` gates. Keep Textual; incrementally turn
+`haas-chat` into a first-class `haas chat` workbench. Each item includes missing scoped
+API/SDK queries and negative tests needed for its journey; no direct store/broker access.
+
+| ID | Ship with | Item | Depends on | Gates | Status |
+|---|---|---|---|---|---|
+| t0-foundation | Before P1 | Adaptive shell, navigation/command palette, contextual help, themes/no-color/ASCII, focus navigation, bounded safe content rendering | p0-profiles | TUI-04, TUI-05 | ✅ |
+| t0-run-control | Before P1 | Cursor run browser, filter where supported, attach/reattach, explicit cooperative cancel vs detach, problem details, masked secret form; migrate Esc approval behavior with docs/tests | t0-foundation, p0-quick-wins | TUI-01, TUI-03, TUI-05 | ✅ |
+| t0-qualification | Before P1 | Pilot/snapshot/resize regression baseline, keyboard journeys and mock-API fault fixtures; document finite replay and current cancellation limits | t0-run-control | TUI-01, TUI-03..05 | ✅ |
+| t1-identity | P1 | Login/logout, credential-store or memory-only sessions, environment profiles, tenant switching, auth expiry/revocation and production banner | t0-qualification, p1-authn, p1-tenant-registry | TUI-02, SEC-26 | ⬜ |
+| t1-administration | P1 | Authorized membership/API-key/policy workflows, scoped plugin inventory, audit view and capability-aware actions | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | ⬜ |
+| t2-agents | P2 | Draft/validate/publish agent revisions, structured configuration, revision/permission diff and pinned run launcher | t1-administration, p2-agent-revisions | FR-14, TUI-01, TUI-02 | ⬜ |
+| t2-threads | P2 | Persistent thread/history browser, search/paging contracts, explicit branch and active-run/version conflict recovery | t1-identity, t0-run-control, p2-thread-fencing | SEC-15, TUI-03 | ⬜ |
+| t3-inspector | P3 | Searchable durable timeline, plans/attempts/tool evidence, replay/gap/reconnect states, correlation IDs, unknown-effect and recovery explanations | t2-threads, p3-steps-invocations, p3-durable-events | TUI-01, TUI-03 | ⬜ |
+| t3-approvals | P3 | Approval inbox, exact-batch argument/destination/permission review, digest/expiry, actor history and truthful cancellation states | t1-administration, t3-inspector, p3-approvals-v2, p3-cancellation | SEC-06, SEC-12, TUI-02, TUI-03 | ⬜ |
+| t3-budgets | P3 | Reserved/observed/settled cost, deadlines and quota indicators, budget denial/recovery; no misleading estimated balances | t3-inspector, p3-budget-ledger | TUI-01, TUI-03 | ⬜ |
+| t3-output | D, when enabled | Batched token deltas, user-controlled follow/pause, streaming Markdown/code and final-output reconciliation | t3-inspector, d-token-streaming | TUI-03, TUI-06 | ⬜ |
+| t4-artifacts | P4 | Scoped evidence explorer, bounded previews/diffs, provenance/version metadata, explicit upload/download/export consent | t3-inspector, p4-artifact-service | TUI-02, TUI-05 | ⬜ |
+| t4-access | P4 | Secret-binding references without readback, capability/egress explanations, sandbox status and policy-denial diagnostics | t1-administration, p4-credential-broker, p4-egress-proxy, p4-sandbox-runtime | SEC-09, TUI-02, TUI-05 | ⬜ |
+| t5-operations | P5 | Usage/quotas, authorized service health/audit, signed webhook delivery and safe replay, retention workflows; confirmation and audit for operator actions | t3-budgets, t4-access, t4-artifacts, p5-telemetry, p5-signed-webhooks, p5-retention | TUI-01, TUI-02, TUI-03 | ⬜ |
+| t5-performance | P5 | Virtualized/paged views, bounded buffers/render batching, large-session and reconnect-storm benchmarks, real-terminal usability and assistive-workflow checks | t5-operations, t2-agents, t3-approvals | TUI-04, TUI-06, TUI-07 | ⬜ |
+| t-d-onboarding | D, from P1 | Five-minute mock-run wizard, dev-stack readiness/doctor, example requests, shared CLI navigation; no provider key required | t0-qualification, d-local-dev, d-cli | TUI-01, TUI-07 | ⬜ |
+| t-d-integrations | D, with adapters | Connector configuration/validation, redacted HTTP/MCP diagnostics, schema/version drift, SDK examples and signed webhook listener | t-d-onboarding, m-format-adapters, p4-egress-proxy, p5-signed-webhooks | TUI-01, TUI-05, TUI-07 | ⬜ |
+| t-m-catalog | M, discovery | Public/private search, publisher/trust/provenance/advisory evidence, compatibility and declared permissions; browsing never executes code | t1-administration, m-registry-service, m-trust-tiers | FR-16, TUI-02, TUI-05 | ⬜ |
+| t-m-consent | M, installs | Digest-pinned install/update/disable/revoke, permission expansion diff and re-consent, affected-agent/run impact | t-m-catalog, m-install-grants | SEC-18, SEC-19, TUI-02 | ⬜ |
+| t-m-publisher | M, tooling | Guided scaffold/test/pack/sign/publish using shared tooling, validation/review reports, version/yank/advisory workflows subject to publisher authorization | t-m-catalog, m-dev-tooling, m-review-pipeline, m-ecosystem-ops | TUI-01, TUI-02, TUI-05 | ⬜ |
+| t-a-run-tree | A, observation | Collapsible live run tree/agent lanes, plans, messages, handoffs, joins, lineage, failure policies and per-agent costs without double counting | t3-inspector, a-observability, a-attenuation-budget | TUI-01, TUI-03, TUI-06 | ⬜ |
+| t-a-team-control | A, control | Validated topology selection/configuration, root approval queue, scoped human messages/handoff actions, descendant scope preview, authorized cancel/suspend cascade | t-a-run-tree, a-topologies, a-hitl-cancel-cascade | SEC-20, SEC-25, TUI-02 | ⬜ |
+| t-a-workspace | A, workspace | Agent-scoped workspace tree/watch, version/provenance diff, CAS conflict resolution and untrusted-message labelling | t-a-run-tree, t4-artifacts, a-primitives | SEC-22, TUI-03, TUI-05 | ⬜ |
+| t-a-evals | A, evaluation | Inspect eval results, compare agent revisions/run evidence/cost, deterministic mock scenarios and explicit new-run submission; no side-effect replay | t-a-team-control, a-evals | TUI-01, TUI-03 | ⬜ |
+| t-a-interop | A, interop | Published agent cards, authenticated A2A/MCP/OpenAI connection examples, protocol readiness, remote-run provenance and explicit cross-system cancellation limits | t-a-team-control, a-a2a, a-mcp-server, a-openai-facade-agents | SEC-23, SEC-24, TUI-01, TUI-05 | ⬜ |
+| t6-cell-operations | P6 | Authorized placement/residency and cell-health views, backup/restore drill evidence and failover status; no ad hoc production shell or unqualified recovery action | t5-operations, p6-cells, p5-backup-dr | TUI-01, TUI-02, TUI-03 | ⬜ |
+| t6-qualification | Before GA | Cross-role feature-parity matrix, supported server/client versions, sanitized support bundle, usability/terminal/performance report; optional surfaces tested when enabled | t5-performance, t-d-integrations, t-m-consent, t-m-publisher, t-a-workspace, t-a-evals, t-a-interop, t6-cell-operations, p6-security-qualification | FR-25, TUI-01..07 | ⬜ |
 
 ## Track M — Open plugin marketplace
 
@@ -189,7 +256,7 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 | a-topologies | Supervisor, hierarchical, swarm, graph, map-reduce, debate; publish-time validation | a-primitives, p2-agent-revisions | FR-19 | ⬜ |
 | a-attenuation-budget | Delegation tokens (ADR-15), child ⊆ parent, ledger sub-reservations, spawn caps | a-primitives, p3-budget-ledger | SEC-20, SEC-21 | ⬜ |
 | a-hitl-cancel-cascade | Descendant approvals at root, cascade cancel/suspend, failure policies | a-primitives, p3-approvals-v2 | SEC-25 | ⬜ |
-| a-observability | `/v1/runs/{id}/tree`, aggregated stream, per-agent cost, trace links, TUI tree | a-primitives, p3-durable-events | — | ⬜ |
+| a-observability | `/v1/runs/{id}/tree`, aggregated stream, per-agent cost, trace links; terminal delivery owned by `t-a-run-tree` | a-primitives, p3-durable-events | — | ⬜ |
 | a-a2a | A2A server (agent cards) and egress-mediated A2A client tool | a-topologies, p1-authn, p4-egress-proxy | SEC-23 | ⬜ |
 | a-mcp-server | Published agents exposed via tenant MCP endpoint (Streamable HTTP, OAuth) | a-topologies, p1-authn | SEC-23 | ⬜ |
 | a-openai-facade-agents | OpenAI facade targeting multi-agent revisions | a-topologies, d-openai-compat | SEC-24 | ⬜ |
@@ -198,11 +265,20 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 
 ---
 
-## Suggested first wave
+## Current Phase 0 execution
 
-These have no unmet dependencies and can proceed in parallel: `p0-ci`, `p0-migrations`,
-`p0-profiles`, `p0-observability-base`. They unblock `p0-quick-wins`, `p0-baseline-tests`,
-`p1-authn`, `p1-tenant-registry`, `d-api-contract` and `d-local-dev`.
+Unit/static checks, live PostgreSQL migration qualification, and the full Compose E2E
+suite have passed locally. `p0-ci` and `p0-baseline-tests` remain 🚧 until the GitHub
+workflow is green on `main`. The `prod` profile intentionally refuses to serve requests
+until Phase 1 replaces header-derived tenant identity.
+
+## Next execution wave — Terminal bridge, then identity
+
+Complete `t0-foundation` → `t0-run-control` → `t0-qualification` before beginning
+Phase 1 implementation. These are new planned items, not retroactive claims that the
+Phase 0 API changes already upgraded the terminal. Then deliver `t1-identity` and
+`t1-administration` alongside their Phase 1 APIs. The remaining T waves follow the
+capability milestones above; preserve a working, releasable chat experience at every step.
 
 ## Open decisions
 

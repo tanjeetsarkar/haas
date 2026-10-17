@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import uuid
+import asyncio
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -78,6 +79,11 @@ def decide(messages: list[dict[str, Any]]) -> dict[str, Any]:
 @app.post("/v1/chat/completions")
 async def chat(request: Request) -> JSONResponse:
     body = await request.json()
+    if any(
+        message.get("role") == "user" and "CANCEL" in message.get("content", "")
+        for message in body["messages"]
+    ):
+        await asyncio.sleep(1)
     CALLS.append(
         {
             "model": body["model"],
@@ -85,6 +91,7 @@ async def chat(request: Request) -> JSONResponse:
             "n_messages": len(body["messages"]),
             "tool_names": [t["function"]["name"] for t in body.get("tools", [])],
             "last_role": body["messages"][-1]["role"],
+            "traceparent": request.headers.get("traceparent"),
         }
     )
     message = decide(body["messages"])

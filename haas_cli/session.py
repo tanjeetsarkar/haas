@@ -33,14 +33,14 @@ class Decision:
 
 @dataclass
 class TurnResult:
-    status: str  # completed | failed | detached
+    status: str  # completed | failed | paused | cancelled
     output: str = ""
     cost_usd: float = 0.0
     run_id: str | None = None
 
 
 EventHandler = Callable[[SSEEvent], Awaitable[None] | None]
-ApprovalHandler = Callable[[list[PendingCall]], Awaitable[Decision]]
+ApprovalHandler = Callable[[list[PendingCall]], Awaitable[Decision | None]]
 
 
 @dataclass
@@ -52,6 +52,7 @@ class ChatSession:
     turns: int = 0
     active_skills: list[str] = field(default_factory=list)
     skill_names: list[str] = field(default_factory=list)  # cached for completion
+    _costed_runs: set[str] = field(default_factory=set, repr=False)
 
     async def plugins(self) -> dict[str, Any]:
         data = await self.client.plugins()
@@ -64,6 +65,7 @@ class ChatSession:
         self.turns = 0
         self.last_run_id = None
         self.active_skills = []
+        self._costed_runs.clear()
 
     async def run_turn(
         self,
@@ -90,7 +92,31 @@ class ChatSession:
         s.thread_id = started["thread_id"]
         self.last_run_id = run_id
         self.turns += 1
+        return await self._follow_run(run_id, on_event, on_approval)
 
+    async def attach_run(
+        self,
+        run_id: str,
+        on_event: EventHandler,
+        on_approval: ApprovalHandler,
+    ) -> TurnResult:
+        run = await self.client.get_run(run_id)
+        self.settings.thread_id = run["thread_id"]
+        self.last_run_id = run_id
+        self.active_skills = list(run.get("active_skills") or [])
+        return await self._follow_run(run_id, on_event, on_approval)
+
+    def _record_cost(self, run_id: str, cost: float) -> None:
+        if run_id not in self._costed_runs:
+            self.total_cost_usd += cost
+            self._costed_runs.add(run_id)
+
+    async def _follow_run(
+        self,
+        run_id: str,
+        on_event: EventHandler,
+        on_approval: ApprovalHandler,
+    ) -> TurnResult:
         async def emit(ev: SSEEvent) -> None:
             res = on_event(ev)
             if res is not None:
@@ -107,7 +133,7 @@ class ChatSession:
                 await emit(ev)
                 if ev.event == "run_completed":
                     cost = float(ev.data.get("total_cost_usd", 0.0))
-                    self.total_cost_usd += cost
+                    self._record_cost(run_id, cost)
                     return TurnResult(
                         "completed", str(ev.data.get("output", "")), cost, run_id
                     )
@@ -115,26 +141,70 @@ class ChatSession:
                     return TurnResult(
                         "failed", str(ev.data.get("error", "")), 0.0, run_id
                     )
+                if ev.event == "run_cancelled":
+                    run = await self.client.get_run(run_id)
+                    cost = float(run.get("total_cost_usd") or 0.0)
+                    self._record_cost(run_id, cost)
+                    return TurnResult("cancelled", "Run cancelled.", cost, run_id)
                 if ev.event == "input_required":
                     paused = ev
             if paused is None:
                 run = await self.client.get_run(run_id)
-                self.total_cost_usd += float(run.get("total_cost_usd") or 0.0)
-                return TurnResult(
-                    "completed" if run["status"] == "completed" else "failed",
-                    run.get("result") or "",
-                    float(run.get("total_cost_usd") or 0.0),
-                    run_id,
-                )
+                if run["status"] == "input_required":
+                    pending_calls: list[dict[str, Any]] = []
+                    for call in run.get("pending_tool_calls") or []:
+                        function = call.get("function") or {}
+                        pending_calls.append(
+                            {
+                                "id": call["id"],
+                                "name": function.get("name", call.get("name", "tool")),
+                                "arguments": function.get(
+                                    "arguments", call.get("arguments")
+                                ),
+                            }
+                        )
+                    paused = SSEEvent(
+                        "input_required", {"pending_tool_calls": pending_calls}
+                    )
+                else:
+                    cost = float(run.get("total_cost_usd") or 0.0)
+                    self._record_cost(run_id, cost)
+                    if run["status"] == "completed":
+                        output = str(run.get("result") or "")
+                        await emit(
+                            SSEEvent(
+                                "run_completed",
+                                {
+                                    "output": output,
+                                    "steps_used": run.get("step_count", 0),
+                                    "total_cost_usd": cost,
+                                },
+                            )
+                        )
+                        return TurnResult("completed", output, cost, run_id)
+                    if run["status"] == "cancelled":
+                        message = str(run.get("result") or "Run cancelled.")
+                        await emit(SSEEvent("run_cancelled", {"run_id": run_id}))
+                        return TurnResult("cancelled", message, cost, run_id)
+                    error = str(
+                        run.get("result") or f"Run ended with status '{run['status']}'."
+                    )
+                    await emit(SSEEvent("run_error", {"error": error}))
+                    return TurnResult("failed", error, cost, run_id)
 
             calls = [
                 PendingCall(c["id"], c["name"], c.get("arguments"))
                 for c in paused.data.get("pending_tool_calls", [])
             ]
             decision = await on_approval(calls)
+            if decision is None:
+                return TurnResult("paused", run_id=run_id)
             try:
                 await self.client.resume(
-                    run_id, decision.approved, decision.reason, secrets=s.secrets
+                    run_id,
+                    decision.approved,
+                    decision.reason,
+                    secrets=self.settings.secrets,
                 )
             except HaasAPIError as exc:
                 if exc.status != 409:  # 409: another operator already resumed it

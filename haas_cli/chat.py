@@ -37,6 +37,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --once: approve every human-approval gate automatically (use with care)",
     )
+    p.add_argument(
+        "--theme",
+        choices=("auto", "dark", "light"),
+        help="TUI theme (env HAAS_TUI_THEME, default auto)",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        default=None,
+        help="Disable terminal colors (also honored from NO_COLOR)",
+    )
+    p.add_argument(
+        "--ascii",
+        action="store_true",
+        default=None,
+        help="Use ASCII-friendly symbols (env HAAS_TUI_ASCII)",
+    )
     return p
 
 
@@ -58,6 +75,12 @@ def settings_from_args(args: argparse.Namespace) -> ChatSettings:
         s.max_steps = args.max_steps
     if args.budget:
         s.max_cost_usd = args.budget
+    if args.theme:
+        s.theme = args.theme
+    if args.no_color is not None:
+        s.no_color = args.no_color
+    if args.ascii is not None:
+        s.ascii = args.ascii
     return s
 
 

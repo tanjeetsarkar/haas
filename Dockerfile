@@ -12,8 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10001 haas && useradd -u 10001 -g haas -m -s /bin/bash haas
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md alembic.ini ./
 COPY app ./app
+COPY migrations ./migrations
 COPY plugins ./plugins
 
 RUN pip install --upgrade pip && pip install . \

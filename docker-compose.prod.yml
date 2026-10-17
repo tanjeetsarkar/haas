@@ -1,0 +1,13 @@
+services:
+  haas-api:
+    environment:
+      HAAS_PROFILE: prod
+  worker-orchestrator:
+    environment:
+      HAAS_PROFILE: prod
+  worker-tools:
+    environment:
+      HAAS_PROFILE: prod
+  migrate:
+    environment:
+      HAAS_PROFILE: prod

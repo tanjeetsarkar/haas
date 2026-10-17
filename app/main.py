@@ -1,19 +1,35 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
+import math
 import re
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, cast
 
-from celery import chord, group
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+import asyncpg
+from celery import Task, chord, group
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
 
-from app.core.config import settings
+from app.core.config import settings, validate_profile_settings
 from app.core.context import SecurityViolationError, validate_safe_outbound_url
+from app.core.http import (
+    RequestSizeLimitMiddleware,
+    http_exception_problem,
+    unexpected_problem,
+    validation_problem,
+)
+from app.core.maintenance import maintenance_loop
+from app.core.observability import configure_logging, configure_observability
 from app.core.plugins import registry, resolve_run_allowlist
 from app.core.store import DistributedStore, ThreadOwnershipError
+from app.worker.dispatch import signature_for
 from app.worker.tasks import aggregate_step_task, execute_tool_task, llm_step_task
 
 store = DistributedStore()
@@ -38,18 +54,35 @@ def build_tier1_system_prompt(allowed_skills: list[str] | None = None) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
+    validate_profile_settings(settings, role="api")
     settings.plugins_dir.mkdir(parents=True, exist_ok=True)
     registry.discover_from_settings(settings)
-    await store.init(ensure_schema=True)
-    yield
-    await store.close()
+    await store.init()
+    maintenance = asyncio.create_task(maintenance_loop(store), name="haas-maintenance")
+    try:
+        yield
+    finally:
+        maintenance.cancel()
+        try:
+            await maintenance
+        except asyncio.CancelledError:
+            pass
+        await store.close()
 
 
 app = FastAPI(title=settings.app_name, version="3.0.0", lifespan=lifespan)
+configure_observability(app)
+app.add_middleware(
+    RequestSizeLimitMiddleware, max_bytes=settings.max_request_body_bytes
+)
+app.add_exception_handler(HTTPException, http_exception_problem)
+app.add_exception_handler(RequestValidationError, validation_problem)
+app.add_exception_handler(Exception, unexpected_problem)
 
 
 class CreateRunRequest(BaseModel):
-    prompt: str = Field(..., min_length=1)
+    prompt: str = Field(..., min_length=1, max_length=settings.max_prompt_chars)
     thread_id: str | None = None
     preload_skills: list[str] = Field(default_factory=list)
     # Optional allowlist for this run; can only narrow the tenant's allowed skills.
@@ -76,12 +109,71 @@ async def _get_owned_run(run_id: str, tenant_id: str) -> dict[str, Any]:
     return run
 
 
-@app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    async with store.pool.acquire() as conn:
-        await conn.fetchval("SELECT 1")
-    await store.rds.ping()
+@app.get("/livez")
+async def livez() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> Any:
+    checks = {"postgres": "ok", "redis": "ok"}
+    try:
+        async with store.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError):
+        checks["postgres"] = "error"
+    try:
+        await store.rds.ping()
+    except (RedisError, OSError, TimeoutError):
+        checks["redis"] = "error"
+    if "error" in checks.values():
+        return JSONResponse({"status": "not_ready", "checks": checks}, status_code=503)
+    return {"status": "ok", "checks": checks}
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz() -> Any:
+    return await readyz()
+
+
+def _encode_cursor(created_at: float, run_id: str) -> str:
+    raw = json.dumps(
+        {"created_at": created_at, "run_id": run_id}, separators=(",", ":")
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[float, str]:
+    try:
+        raw = base64.b64decode(
+            cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+        )
+        value = json.loads(raw)
+        created_at = float(value["created_at"])
+        run_id = value["run_id"]
+        if not math.isfinite(created_at) or not isinstance(run_id, str) or not run_id:
+            raise ValueError
+        return created_at, run_id
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid run-list cursor.") from exc
+
+
+@app.get("/v1/runs")
+async def list_runs(
+    x_tenant_id: str = Header(default="default-tenant"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    before = _decode_cursor(cursor) if cursor else None
+    rows = await store.list_runs(x_tenant_id, limit=limit + 1, before=before)
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = (
+        _encode_cursor(float(items[-1]["created_at"]), items[-1]["run_id"])
+        if has_more and items
+        else None
+    )
+    return {"items": items, "next_cursor": next_cursor}
 
 
 @app.post("/v1/runs", status_code=202)
@@ -151,7 +243,7 @@ async def create_run(
     )
 
     # Dispatch step 1 to the orchestrator queue
-    llm_step_task.apply_async(args=[run_id], queue="q_orchestrator")
+    cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
 
     return {
         "run_id": run_id,
@@ -159,6 +251,18 @@ async def create_run(
         "status": "running",
         "stream_url": f"/v1/runs/{run_id}/stream",
     }
+
+
+@app.post("/v1/runs/{run_id}/cancel", status_code=202)
+async def cancel_run(
+    run_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, str]:
+    await _get_owned_run(run_id, x_tenant_id)
+    if not await store.cancel_run(run_id, x_tenant_id):
+        raise HTTPException(status_code=409, detail="Run is already terminal.")
+    await store.publish_event(run_id, "run_cancelled", {"run_id": run_id})
+    return {"run_id": run_id, "status": "cancelled"}
 
 
 @app.post("/v1/runs/{run_id}/resume", status_code=202)
@@ -211,7 +315,7 @@ async def resume_run(
             pending_tool_calls=None,
         )
         await store.publish_event(run_id, "hitl_rejected", {"reason": reason})
-        llm_step_task.apply_async(args=[run_id], queue="q_orchestrator")
+        cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
         return {"run_id": run_id, "status": "running", "action": "rejected_and_resumed"}
 
     # Operator approved: fan out the pending tools via Celery Canvas `chord`
@@ -232,7 +336,8 @@ async def resume_run(
     for tc in pending_calls:
         tool = registry.tools.get(tc["function"]["name"])
         sigs.append(
-            execute_tool_task.s(
+            signature_for(
+                cast(Task, execute_tool_task),
                 run_id=run_id,
                 thread_id=run["thread_id"],
                 tenant_id=run["tenant_id"],
@@ -244,7 +349,9 @@ async def resume_run(
                 tool_call=tc,
             ).set(queue=tool.queue if tool else "q_tools_fast")
         )
-    callback = aggregate_step_task.s(run_id=run_id).set(queue="q_orchestrator")
+    callback = signature_for(cast(Task, aggregate_step_task), run_id=run_id).set(
+        queue="q_orchestrator"
+    )
     chord(group(sigs))(callback)
 
     await store.publish_event(run_id, "hitl_approved", {"dispatched_tools": len(sigs)})

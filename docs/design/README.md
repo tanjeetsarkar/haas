@@ -26,6 +26,7 @@ These are design decisions, not capabilities already supplied by Docker Compose.
 | [Plugin marketplace](marketplace.md) | TARGET open marketplace: publishers, manifest v2 permissions, signing, review, trust tiers, installs |
 | [Multi-agent collaboration (HACP)](multi-agent.md) | TARGET distributed sub-agents, delegation attenuation, workspace, topologies, A2A/MCP interop |
 | [Developer platform](developer-platform.md) | TARGET API conventions, Python/TypeScript SDKs, unified CLI, docs and examples |
+| [Terminal experience](tui-experience.md) | TARGET keyboard-first mission control; phased TUI parity, run/agent/marketplace/team workflows and UX qualification |
 | [Roadmap](../roadmap.md) | Living, dependency-ordered production-readiness checklist mapped to FR/TM/SEC gates |
 
 Diagrams are embedded as Mermaid source so GitHub and Mermaid-enabled Markdown

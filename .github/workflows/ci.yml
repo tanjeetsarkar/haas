@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check app haas_cli migrations scripts tests
+      - name: Pyright
+        run: pyright
+      - name: Unit tests and coverage
+        run: pytest --cov=app --cov=haas_cli --cov-report=term-missing --cov-report=xml --cov-fail-under=75
+      - name: Dependency audit
+        run: pip-audit --skip-editable
+      - name: Verify OpenAPI snapshot
+        run: python -m scripts.update_openapi_snapshot && git diff --exit-code -- docs/openapi-v1.json
+
+  compose-e2e:
+    name: Compose E2E and migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install E2E driver dependency
+        run: python -m pip install httpx
+      - name: Start stack
+        run: docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml up --build -d
+      - name: Verify migration downgrade and upgrade
+        run: |
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade base
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head &
+          first=$!
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head &
+          second=$!
+          wait "$first"
+          wait "$second"
+      - name: Verify legacy-schema adoption is non-destructive
+        run: |
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at) VALUES ('migration-probe', 'ci', '[]'::jsonb, 1)"
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "DROP TABLE haas_baseline_ownership; DROP TABLE alembic_version"
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade base
+          test "$(docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -Atqc "SELECT count(*) FROM threads WHERE thread_id = 'migration-probe'")" = "1"
+      - name: Run E2E scenarios
+        run: python tests/e2e/run_e2e.py
+      - name: Stop stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml down -v
+
+  supply-chain:
+    name: Secrets, vulnerabilities and SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: haas-sbom.cdx.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: haas-sbom
+          path: haas-sbom.cdx.json
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3

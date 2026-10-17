@@ -1,8 +1,10 @@
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import setup_logging, worker_process_init
 from kombu import Queue
 
 from app.core.config import settings
+from app.core.config import validate_profile_settings
+from app.core.observability import configure_logging, configure_observability
 from app.core.plugins import registry
 
 celery_app = Celery(
@@ -37,9 +39,17 @@ celery_app.conf.update(
 )
 
 
+@setup_logging.connect
+def configure_celery_logging(**kwargs) -> None:
+    configure_logging()
+
+
 @worker_process_init.connect
 def init_worker_plugins(**kwargs) -> None:
     """Loads every enabled plugin pack (skills, Python tools, endpoint manifests) when each worker process forks."""
+    validate_profile_settings(settings, role=settings.haas_worker_role)
+    configure_logging()
+    configure_observability()
     settings.plugins_dir.mkdir(parents=True, exist_ok=True)
     settings.scratchpad_dir.mkdir(parents=True, exist_ok=True)
     registry.discover_from_settings(settings)

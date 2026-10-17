@@ -38,6 +38,8 @@ extension. It does not add runtime functionality.
   ([marketplace](marketplace.md)), the HaaS Agent Collaboration Protocol for distributed
   multi-agent work with A2A/MCP/OpenAI-compatible interoperability ([multi-agent](multi-agent.md)),
   and a contract-first developer platform with SDKs and CLI ([developer platform](developer-platform.md)).
+  A first-class [terminal workbench](tui-experience.md) delivers these user-facing
+  capabilities incrementally, with role-aware journeys and terminal UX acceptance gates.
   Delivery order is in the [roadmap](../roadmap.md).
 * NON-GOALS for this design: arbitrary customer or marketplace code in the control plane
   (API, orchestrator, relay, policy) — such code runs only in qualified per-run sandboxes;
@@ -60,7 +62,7 @@ extension. It does not add runtime functionality.
 | FR-10 | Minimize secret exposure | Run Redis value; union of active-skill secrets copied to task | Invocation-specific credential broker tests |
 | FR-11 | Deliver terminal callbacks reliably and verifiably | Unsigned callback task with retries | Signed delivery, replay protection, DLQ and replay tests |
 | FR-12 | Meter usage per tenant and export an audit trail | Floating-point run cost and basic logs | Unique ledger charges and immutable audit tests |
-| FR-13 | Cancel work and enforce tenant suspension | `cancelled` recognized, no cancel endpoint | Fenced cancellation and revocation tests |
+| FR-13 | Cancel work and enforce tenant suspension | Cooperative cancel endpoint; no fenced suspension/cascade | Fenced cancellation and revocation tests |
 | FR-14 | Select approved agent configuration reproducibly | Request model overrides; fingerprint drift warning | Agent/policy/plugin revision pinning tests |
 | FR-15 | Publish signed, versioned plugin revisions with declared permissions | Local packs, no signing or permission manifest | Signature/provenance and manifest validation tests (SEC-16) |
 | FR-16 | Let tenants discover and install marketplace plugins under consent and tier policy | Operator allow/deny env only | Consent, tier and re-consent-on-expansion tests (SEC-18) |
@@ -72,6 +74,7 @@ extension. It does not add runtime functionality.
 | FR-22 | Interoperate via A2A, MCP server and an OpenAI-compatible facade with policy parity | Not present | Authn/authz matrix and facade parity tests (SEC-23, SEC-24) |
 | FR-23 | Provide a versioned machine-readable contract for API, events and webhooks | FastAPI-generated OpenAPI only | Spectral lint, breaking-change diff, schema conformance tests |
 | FR-24 | Provide Python and TypeScript SDKs and a unified CLI with safe defaults | Internal Python client, TUI, `haas-plugin` | SDK conformance suite against mock server; credential hygiene (SEC-26) |
+| FR-25 | Deliver user-facing platform capabilities through a keyboard-first, authorized, recoverable terminal workbench alongside backend milestones | Chat/approval TUI only; Phase 0 listing/cancel not wired to it | Track T journey parity, auth/recovery, safe rendering, terminal/accessibility, performance and compatibility gates (TUI-01..07) |
 
 Proposed availability, latency, recovery and retention objectives are specified in
 [operations](operations-migration.md). They are acceptance targets, not measured results.

@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-TERMINAL_EVENTS = ("run_completed", "run_error")
+TERMINAL_EVENTS = ("run_completed", "run_error", "run_cancelled")
 STREAM_ID_RE = re.compile(r"\d+-\d+")
 
 
@@ -119,6 +119,17 @@ class HaasClient:
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/runs/{run_id}")
+
+    async def list_runs(
+        self, *, limit: int = 20, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, int | str] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/v1/runs", params=params)
+
+    async def cancel_run(self, run_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/v1/runs/{run_id}/cancel")
 
     async def create_run(
         self,

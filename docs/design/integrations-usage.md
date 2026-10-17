@@ -11,7 +11,11 @@ to mutually untrusted customers.
 
 | Method / path | Request | Success | Important behavior |
 |---|---|---|---|
-| `GET /healthz` | None | 200 `{"status":"ok"}` | Checks PostgreSQL and Redis; not provider, queue or worker health |
+| `GET /livez` | None | 200 `{"status":"ok"}` | Process liveness only |
+| `GET /readyz` | None | 200/503 with dependency checks | Checks PostgreSQL and Redis; not provider, queue or worker health |
+| `GET /healthz` | None | 200/503 with dependency checks | Backward-compatible alias for `/readyz` |
+| `GET /v1/runs?limit=20&cursor=…` | Tenant | 200 `items` + opaque `next_cursor` | Descending keyset pagination, tenant scoped |
+| `POST /v1/runs/{run_id}/cancel` | Tenant | 202 cancelled / 409 terminal | Cancellation is durable; in-flight external side effects may not be interruptible |
 | `POST /v1/runs` | Create body below | 202 run/thread/status/stream URL | Writes `running`, publishes queued event, schedules work |
 | `GET /v1/runs/{id}` | Tenant header | 200 run projection | Foreign/absent run → 404; no full conversation returned |
 | `GET /v1/runs/{id}/stream` | Tenant header; optional `Last-Event-ID` | 200 `text/event-stream` | Ownership before stream; no per-event reauthorization |
@@ -85,8 +89,8 @@ file locally, configure the model API key, then start Compose. Never commit that
 environment file or put real tokens in examples.
 
 ```bash
-docker compose up --build -d
-curl --fail-with-body http://localhost:8000/healthz
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
+curl --fail-with-body http://localhost:8000/readyz
 ```
 
 The API binds port 8000 on the host, while Redis, PostgreSQL and Flower ports are

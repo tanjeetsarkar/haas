@@ -14,6 +14,12 @@
 No Kubernetes manifests, managed-service provisioning or production gateway are
 provided by this documentation. Infrastructure must implement the diagrammed boundaries.
 
+The base Compose stack keeps Redis and PostgreSQL unpublished and omits Flower.
+`docker-compose.dev.yml` adds loopback-only developer ports and Flower. The
+`docker-compose.prod.yml` selector activates fail-closed settings; today the API
+intentionally refuses to start in that profile because `X-Tenant-ID` is not an
+authenticated identity. Complete Phase 1 before using a production deployment.
+
 ## 2. Proposed SLOs and measurement
 
 These are initial engineering targets, **not current benchmarks or commitments**.

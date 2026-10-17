@@ -11,13 +11,14 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from uuid import uuid4
 
 import httpx
 
 API = "http://localhost:8000"
 MOCK = "http://localhost:9000"
 SECRETS = {
-    "ANALYTICS_DB_PATH": "/tmp/analytics.db",
+    "ANALYTICS_DB_PATH": f"/tmp/haas-e2e-{uuid4().hex}.db",
     "BILLING_WEBHOOK_SECRET": "whsec_live_123",
 }
 TENANT = {"X-Tenant-ID": "fin-ops"}
@@ -30,10 +31,13 @@ def check(cond: bool, label: str) -> None:
         FAILED.append(label)
 
 
-def start(prompt: str, **extra) -> str:
+def start(prompt: str, *, traceparent: str | None = None, **extra) -> str:
+    headers = dict(TENANT)
+    if traceparent:
+        headers["traceparent"] = traceparent
     r = httpx.post(
         f"{API}/v1/runs",
-        headers=TENANT,
+        headers=headers,
         json={"prompt": prompt, "secrets": SECRETS, **extra},
     )
     assert r.status_code == 202, r.text
@@ -264,8 +268,60 @@ def scenario_validation_and_webhook() -> None:
     )
 
 
+def scenario_cancel_and_cursor_listing() -> None:
+    print("\n[7] Cancellation and tenant-scoped run listing")
+    expected_trace_id = "a" * 32
+    run_id = start(
+        "CANCEL this run",
+        traceparent=f"00-{expected_trace_id}-{'b' * 16}-01",
+    )
+    cancelled = httpx.post(f"{API}/v1/runs/{run_id}/cancel", headers=TENANT)
+    check(
+        cancelled.status_code == 202 and cancelled.json()["status"] == "cancelled",
+        "active run cancellation accepted",
+    )
+    check(
+        run_status(run_id)["status"] == "cancelled",
+        "in-flight model completion cannot overwrite cancellation",
+    )
+    time.sleep(1.2)
+    calls = httpx.get(f"{MOCK}/_calls").json()["llm"]
+    traceparents = [call["traceparent"] for call in calls if call["traceparent"]]
+    check(
+        any(
+            traceparent.split("-")[1] == expected_trace_id
+            for traceparent in traceparents
+        ),
+        "trace context crosses API, Celery and the worker HTTP call",
+    )
+    check(
+        httpx.post(f"{API}/v1/runs/{run_id}/cancel", headers=TENANT).status_code == 409,
+        "terminal run cannot be cancelled twice",
+    )
+    first = httpx.get(f"{API}/v1/runs?limit=1", headers=TENANT)
+    check(
+        first.status_code == 200 and len(first.json()["items"]) == 1,
+        "run list page",
+    )
+    cursor = first.json()["next_cursor"]
+    check(cursor is not None, "run list provides a continuation cursor")
+    second = httpx.get(f"{API}/v1/runs?limit=1&cursor={cursor}", headers=TENANT)
+    check(
+        second.status_code == 200
+        and second.json()["items"][0]["run_id"] != first.json()["items"][0]["run_id"],
+        "cursor advances without repeating a run",
+    )
+    other_tenant = httpx.get(
+        f"{API}/v1/runs?limit=1", headers={"X-Tenant-ID": "someone-else"}
+    )
+    check(
+        other_tenant.status_code == 200 and other_tenant.json()["items"] == [],
+        "run list is tenant-scoped",
+    )
+
+
 def scenario_concurrency() -> None:
-    print("\n[7] 6 concurrent runs reach their approval gate")
+    print("\n[8] 6 concurrent runs reach their approval gate")
     ids = [start("Investigate Q3 revenue anomalies") for _ in range(6)]
     with ThreadPoolExecutor(6) as pool:
         results = list(pool.map(stream, ids))
@@ -282,7 +338,7 @@ def scenario_concurrency() -> None:
 
 
 def scenario_infra() -> None:
-    print("\n[8] Isolation & wire-level checks")
+    print("\n[9] Isolation & wire-level checks")
     env = subprocess.run(
         ["docker", "compose", "exec", "-T", "worker-tools", "env"],
         capture_output=True,
@@ -380,13 +436,32 @@ def scenario_infra() -> None:
         text=True,
     ).stdout
     check(
-        "analytics.db" in ledger,
+        any(
+            name.startswith("haas-e2e-") and name.endswith(".db")
+            for name in ledger.splitlines()
+        ),
         "sandbox tool created analytics DB on tool worker tmpfs",
     )
 
 
 def main() -> int:
-    httpx.get(f"{API}/healthz").raise_for_status()
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            response = httpx.get(f"{API}/readyz", timeout=2)
+            if response.status_code == 200:
+                break
+        except httpx.HTTPError:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError("API did not become ready within 90 seconds")
+
+    check(httpx.get(f"{API}/livez").json()["status"] == "ok", "liveness endpoint")
+    check(
+        httpx.get(f"{API}/readyz").json()["status"] == "ok",
+        "readiness checks PostgreSQL and Redis",
+    )
     for fn in (
         scenario_happy_path,
         scenario_reject,
@@ -394,6 +469,7 @@ def main() -> int:
         scenario_loop_guard,
         scenario_budget,
         scenario_validation_and_webhook,
+        scenario_cancel_and_cursor_listing,
         scenario_concurrency,
         scenario_infra,
     ):

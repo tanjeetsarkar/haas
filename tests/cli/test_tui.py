@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import Markdown, Static
+from textual.widgets import Button, DataTable, Markdown, Static
 
 from haas_cli.client import HaasClient
 from haas_cli.config import ChatSettings
 from haas_cli.session import ChatSession
-from haas_cli.tui.app import ApprovalScreen, ChatApp, PromptInput
+from haas_cli.tui.app import ApprovalScreen, CancelRunScreen, ChatApp, PromptInput
 
 from fake_haas import FakeHaas
 
 
-def make_app(fake: FakeHaas) -> ChatApp:
+def make_app(fake: FakeHaas, *, ascii: bool = False, no_color: bool = False) -> ChatApp:
     session = ChatSession(
         HaasClient("http://api", "t1", transport=fake.transport(), reconnect_delay=0),
         ChatSettings(
-            base_url="http://api", tenant="t1", secrets={"TOK": "supersecretvalue"}
+            base_url="http://api",
+            tenant="t1",
+            secrets={"TOK": "supersecretvalue"},
+            ascii=ascii,
+            no_color=no_color,
         ),
     )
     return ChatApp(session)
@@ -44,6 +48,7 @@ def chat_text(app: ChatApp) -> str:
 
 async def send(pilot, app: ChatApp, text: str) -> None:
     app.query_one("#prompt", PromptInput).load_text(text)
+    await pilot.pause()
     await pilot.press("enter")
 
 
@@ -103,7 +108,7 @@ async def test_approval_flow_reject_with_reason():
             ),
         )
         app.screen.query_one("#reason").value = "not today"
-        await pilot.press("escape")
+        await pilot.click("#reject")
         await wait_for(
             pilot, lambda: "Refund was rejected" in chat_text(app) and not app.busy
         )
@@ -112,6 +117,112 @@ async def test_approval_flow_reject_with_reason():
             "secrets": {"TOK": "supersecretvalue"},
             "rejection_reason": "not today",
         }
+
+
+async def test_approval_escape_leaves_run_pending():
+    fake = FakeHaas()
+    app = make_app(fake)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await send(pilot, app, "refund please")
+        await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen))
+        await pilot.press("escape")
+        await wait_for(
+            pilot,
+            lambda: "left pending on the server" in chat_text(app) and not app.busy,
+        )
+        assert fake.resumes == []
+
+
+async def test_runs_pagination_and_attach_pending_approval():
+    fake = FakeHaas()
+    app = make_app(fake)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.action_show_runs()
+        table = app.query_one("#runs-table", DataTable)
+        assert table.row_count == 1
+        assert not app.query_one("#runs-more", Button).disabled
+        await pilot.pause()
+        await pilot.click("#runs-more")
+        await wait_for(pilot, lambda: table.row_count == 2)
+        assert table.row_count == 2
+        await app.action_attach_selected()
+        await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen))
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: not app.busy and "left pending" in chat_text(app))
+        assert fake.resumes == []
+
+
+async def test_run_cancellation_requires_confirmation():
+    fake = FakeHaas()
+    app = make_app(fake)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.action_show_runs()
+        app.run_worker(app.action_cancel_selected(), group="cancel")
+        await wait_for(pilot, lambda: isinstance(app.screen, CancelRunScreen))
+        await pilot.press("escape")
+        assert fake.cancelled == []
+        app.run_worker(app.action_cancel_selected(), group="cancel")
+        await wait_for(pilot, lambda: isinstance(app.screen, CancelRunScreen))
+        await pilot.click("#confirm-cancel")
+        await wait_for(pilot, lambda: fake.cancelled == ["run_1"])
+        assert fake.run_status == "cancelled"
+
+
+async def test_run_browser_surfaces_api_failures():
+    fake = FakeHaas()
+    fake.list_error = "run listing unavailable"
+    app = make_app(fake)
+    async with app.run_test(size=(120, 40)):
+        await app.action_show_runs()
+        assert "run listing unavailable" in str(
+            app.query_one("#run-detail", Static).render()
+        )
+
+
+async def test_cancel_failure_is_visible_and_does_not_claim_success():
+    fake = FakeHaas()
+    fake.cancel_error = "Run is already terminal."
+    app = make_app(fake)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.action_show_runs()
+        app.run_worker(app.action_cancel_selected(), group="cancel")
+        await wait_for(pilot, lambda: isinstance(app.screen, CancelRunScreen))
+        await pilot.click("#confirm-cancel")
+        await pilot.pause(0.2)
+        await wait_for(
+            pilot,
+            lambda: (
+                "Run is already terminal"
+                in str(app.query_one("#run-detail", Static).render())
+            ),
+        )
+        assert fake.cancelled == []
+
+
+async def test_tui_renders_ascii_mode_at_supported_sizes():
+    for size in ((80, 24), (120, 40), (160, 50)):
+        app = make_app(FakeHaas("simple"), ascii=True, no_color=True)
+        async with app.run_test(size=size) as pilot:
+            assert app.query_one("#prompt", PromptInput).region.width > 0
+            await app.action_show_runs()
+            await pilot.pause()
+            assert app.query_one("#runs-table", DataTable).region.width > 0
+            assert "UP" in str(app.query_one("#topbar", Static).render())
+            assert app.console.no_color
+
+
+async def test_theme_cycle_and_navigation():
+    app = make_app(FakeHaas("simple"))
+    async with app.run_test(size=(120, 40)) as pilot:
+        assert app.session.settings.theme == "auto"
+        await app.action_cycle_theme()
+        assert app.session.settings.theme == "dark"
+        await pilot.press("ctrl+2")
+        await pilot.pause()
+        assert app.query_one("#workspaces").current == "runs-workspace"
+        await pilot.press("ctrl+1")
+        await pilot.pause()
+        assert app.query_one("#workspaces").current == "chat-workspace"
 
 
 async def test_slash_commands_and_secret_masking():

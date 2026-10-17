@@ -1,12 +1,18 @@
+import base64
+import binascii
 import json
 from pathlib import Path
+from typing import Literal
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    haas_profile: Literal["dev", "prod"] = "dev"
+    haas_worker_role: Literal["orchestrator", "tools"] = "tools"
     app_name: str = "Distributed HaaS Platform"
     postgres_dsn: str = "postgresql://haas:haas_dev_password@localhost:5432/haas_db"
     redis_url: str = "redis://localhost:6379/0"
@@ -15,6 +21,20 @@ class Settings(BaseSettings):
 
     plugins_dir: Path = Path("./plugins")
     scratchpad_dir: Path = Path("/tmp/haas_scratchpad")
+    secret_encryption_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_SECRET_ENCRYPTION_KEY", "secret_encryption_key"
+        ),
+    )
+    max_request_body_bytes: int = Field(default=1_048_576, gt=0)
+    max_prompt_chars: int = Field(default=32_000, gt=0)
+    orphan_run_timeout_sec: int = Field(default=900, gt=0)
+    scratchpad_ttl_sec: int = Field(default=86_400, gt=0)
+    maintenance_interval_sec: int = Field(default=60, gt=0)
+    flower_enabled: bool = False
+    flower_basic_auth: str = ""
+    otel_exporter_otlp_endpoint: str | None = None
 
     # Plugin policy (comma-separated plugin ids). `deny` always wins; a non-empty `allow` is
     # exclusive. Extra roots rank below `plugins_dir` when the same plugin id appears twice.
@@ -88,3 +108,50 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_profile_settings(
+    config: Settings,
+    *,
+    role: Literal["api", "orchestrator", "tools"] = "api",
+) -> None:
+    if config.haas_profile == "dev":
+        return
+
+    errors: list[str] = []
+    if role == "api":
+        errors.append(
+            "production tenancy authentication is not implemented; "
+            "the current API trusts X-Tenant-ID (complete Phase 1 first)"
+        )
+    encryption_key = config.secret_encryption_key
+    if role != "tools" and not encryption_key:
+        errors.append("HAAS_SECRET_ENCRYPTION_KEY is required in production")
+    elif encryption_key == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=":
+        errors.append("HAAS_SECRET_ENCRYPTION_KEY must not use the development key")
+    elif role != "tools" and encryption_key is not None:
+        try:
+            key = base64.b64decode(encryption_key, validate=True)
+        except (ValueError, binascii.Error):
+            errors.append("HAAS_SECRET_ENCRYPTION_KEY must be base64-encoded AES-256")
+        else:
+            if len(key) != 32:
+                errors.append(
+                    "HAAS_SECRET_ENCRYPTION_KEY must be base64-encoded AES-256"
+                )
+    if role == "orchestrator" and config.openrouter_api_key in (
+        "",
+        "sk-or-v1-missing",
+        "sk-or-v1-replace-me",
+    ):
+        errors.append("OPENROUTER_API_KEY must be configured in production")
+    if config.flower_enabled and (
+        ":" not in config.flower_basic_auth
+        or config.flower_basic_auth == "admin:change-me"
+    ):
+        errors.append(
+            "Flower must be disabled or protected with a non-placeholder FLOWER_BASIC_AUTH"
+        )
+
+    if errors:
+        raise ValueError("Invalid production profile: " + "; ".join(errors))

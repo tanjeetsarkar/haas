@@ -5,10 +5,11 @@ import hashlib
 import inspect
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 import httpx
-from celery import chord, group
+import redis.asyncio as aioredis
+from celery import Task, chord, group
 from pydantic import ValidationError
 
 from app.core.config import settings
@@ -22,6 +23,7 @@ from app.core.llm import OpenRouterGateway, repair_tool_json
 from app.core.plugins import registry
 from app.core.store import DistributedStore
 from app.worker.celery_app import celery_app
+from app.worker.dispatch import signature_for
 
 log = logging.getLogger("haas.tasks")
 
@@ -34,6 +36,14 @@ TASK_POOL_MAX = 3
 def _run_async(coro: Any) -> Any:
     """Executes an async coroutine cleanly inside a Celery worker process."""
     return asyncio.run(coro)
+
+
+async def _is_cancelled(run_id: str) -> bool:
+    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        return bool(await redis.exists(f"haas:cancelled:{run_id}"))
+    finally:
+        await redis.aclose()
 
 
 def _bound_observation(tool_name: str, call_id: str, raw_text: str) -> str:
@@ -79,7 +89,7 @@ async def _fail_run(run_id: str, message: str) -> None:
         )
         await store.publish_event(run_id, "run_error", {"error": message})
         if run["webhook_url"]:
-            deliver_webhook_task.apply_async(
+            cast(Task, deliver_webhook_task).apply_async(
                 args=[
                     run["webhook_url"],
                     {"run_id": run_id, "status": "failed", "error": message},
@@ -198,6 +208,10 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 else:
                     raise
 
+        current_run = await store.get_run(run_id)
+        if not current_run or current_run["status"] != "running":
+            return {"status": "aborted", "reason": "Run is no longer active"}
+
         assistant_msg = completion.assistant_message
         messages.append(assistant_msg)
         new_total_cost = float(run["total_cost_usd"]) + completion.cost_usd
@@ -309,7 +323,8 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 {"tool_call_id": tc["id"], "tool": fn_name, "queue": target_queue},
             )
             tool_signatures.append(
-                execute_tool_task.s(
+                signature_for(
+                    cast(Task, execute_tool_task),
                     run_id=run_id,
                     thread_id=run["thread_id"],
                     tenant_id=run["tenant_id"],
@@ -322,7 +337,9 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 ).set(queue=target_queue)
             )
 
-        callback_sig = aggregate_step_task.s(run_id=run_id).set(queue="q_orchestrator")
+        callback_sig = signature_for(
+            cast(Task, aggregate_step_task), run_id=run_id
+        ).set(queue="q_orchestrator")
         chord(group(tool_signatures))(callback_sig)
         return {"status": "dispatched_chord", "tool_count": len(tool_signatures)}
     finally:
@@ -331,7 +348,7 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
 
 async def _maybe_webhook(run: dict[str, Any], payload: dict[str, Any]) -> None:
     if run.get("webhook_url"):
-        deliver_webhook_task.apply_async(
+        cast(Task, deliver_webhook_task).apply_async(
             args=[run["webhook_url"], payload], queue="q_orchestrator"
         )
 
@@ -354,6 +371,18 @@ def execute_tool_task(
     Runs on `worker-tools` (`q_tools_fast` or `q_tools_sandbox`).
     Has no OpenRouter credentials and no PostgreSQL access.
     """
+    cancelled = _run_async(_is_cancelled(run_id))
+    if cancelled:
+        tc = tool_call
+        name = tc["function"]["name"]
+        return _outcome(
+            tc["id"],
+            name,
+            _fingerprint(name, tc["function"].get("arguments", "{}")),
+            set(active_skills),
+            "Run was cancelled before tool execution.",
+            True,
+        )
     return _run_async(
         _async_execute_tool(
             run_id=run_id,
@@ -562,7 +591,7 @@ async def _async_aggregate_step(
             status="running",
         )
 
-        llm_step_task.apply_async(args=[run_id], queue="q_orchestrator")
+        cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
         return {"status": "continued", "run_id": run_id}
     finally:
         await store.close()

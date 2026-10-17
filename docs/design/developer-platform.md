@@ -68,6 +68,24 @@ errors, OpenTelemetry context propagation, agents-as-code builders (see [multi-a
 `plugins new|test|pack|sign|publish|install`, `dev`, `logs`, `webhooks listen` (forwards signed
 deliveries to localhost), `chat` (the TUI).
 
+### Terminal product and capability parity
+
+The [terminal experience design](tui-experience.md) makes `haas chat` a full Textual
+workbench, not only a chat window. [Roadmap Track T](../roadmap.md#track-t--terminal-experience)
+ships a T0 bridge before Phase 1, then identity, agent revisions, durable run inspection,
+approval/budget workflows, artifacts, marketplace, multi-agent collaboration and operations
+with their backend milestones.
+
+CLI, SDK and TUI share auth, transport, event types and safe mutation behavior. The API
+advertises versioned, identity-scoped capabilities/actions and event-schema compatibility
+(`d-capabilities`); every operation is still authorized server-side. Missing browsing,
+diagnostic or action endpoints are part of the corresponding delivery item, not a reason
+for the terminal to access stores or run privileged remote shell commands.
+
+User-facing features need a tested TUI journey and a line-oriented/JSON command alternative,
+with explicit unsupported/forbidden/stale/error states. TUI-01..07 cover keyboard/accessibility,
+secret/content safety, truthful recovery, responsiveness, onboarding and compatibility.
+
 ## 5. Integration surfaces
 
 | Surface | Use |

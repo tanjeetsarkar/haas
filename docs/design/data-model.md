@@ -4,7 +4,8 @@
 
 ## 1. Physical relational model (CURRENT)
 
-Authoritative DDL is [SCHEMA_SQL](../../app/core/store.py). There are exactly two
+The current schema is established by [Alembic migrations](../../migrations/versions/).
+There are exactly two
 application tables. JSON arrays do not imply separate normalized entities.
 
 ```mermaid

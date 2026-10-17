@@ -16,6 +16,8 @@ the proposed production multi-tenant service:
 * [Operations, reliability and migration plan](docs/design/operations-migration.md)
 * [Plugin marketplace](docs/design/marketplace.md), [multi-agent collaboration (HACP)](docs/design/multi-agent.md)
   and [developer platform](docs/design/developer-platform.md) (TARGET product extensions)
+* [Terminal experience](docs/design/tui-experience.md) (TARGET phased TUI workbench,
+  marketplace, multi-agent and operator journeys)
 
 The **[production-readiness roadmap](docs/roadmap.md)** is the living, dependency-ordered checklist
 that tracks progress toward these targets; decisions are indexed in [docs/adr/](docs/adr/README.md).
@@ -36,7 +38,8 @@ design requirements, not implemented guarantees of the current Compose stack.
 
 ```bash
 cp .env.example .env            # set OPENROUTER_API_KEY
-docker compose up --build -d    # API :8000, Flower :5555 (localhost only)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
+# API :8000, Flower :5555, Redis :6379 and PostgreSQL :5432 (localhost only)
 
 RUN_ID=$(curl -s -X POST localhost:8000/v1/runs -H 'Content-Type: application/json' -H 'X-Tenant-ID: fin-ops' -d '{
   "prompt": "Investigate Q3 revenue anomalies and prepare a refund batch if needed.",
@@ -49,7 +52,9 @@ curl -X POST -H 'X-Tenant-ID: fin-ops' -H 'Content-Type: application/json' \
 ```
 
 All endpoints take `X-Tenant-ID` (default `default-tenant`). Tenant identity is **trusted from the header**;
-run the API behind an authenticating gateway.
+this is development/demo behavior only. `HAAS_PROFILE=prod` fails startup until authenticated tenancy
+lands in Phase 1. The base Compose file does not publish Redis/PostgreSQL ports or start Flower;
+the dev overlay adds loopback-only ports and Flower. Do not combine the dev overlay with production.
 
 ## Chat TUI
 
@@ -109,7 +114,7 @@ Local development uses Python 3.12, matching the Docker image.
 ```bash
 uv venv && uv pip install -e ".[dev]" && .venv/bin/pytest          # unit tests (no services needed)
 
-# End-to-end against a deterministic mock OpenRouter + billing MCP/webhook server:
+# End-to-end against deterministic mock OpenRouter + billing MCP/webhook services:
 docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml up --build -d
 .venv/bin/python tests/e2e/run_e2e.py
 
@@ -118,8 +123,11 @@ docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml down
 ```
 
 `pytest` also covers the CLI/TUI (`tests/cli`, Textual pilot tests against an in-memory API) and every sample
-plugin (`tests/plugins`, HTTP mocked). Rebuild the images (`docker compose up --build -d`) after changing `app/`;
+plugin (`tests/plugins`, HTTP mocked). Rebuild the images using the same Compose file list after changing `app/`;
 `plugins/` is bind-mounted, so plugin changes only need a restart.
+
+`python -m scripts.update_openapi_snapshot` deliberately refreshes the checked-in
+[/v1 OpenAPI snapshot](docs/openapi-v1.json). CI fails if the snapshot is stale.
 
 Local environment files, editor settings, generated packages, caches, and runtime databases
 are ignored by Git. Keep real API keys and per-run secrets out of committed files.

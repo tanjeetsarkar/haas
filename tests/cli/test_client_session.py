@@ -37,6 +37,9 @@ def test_secrets_from_env_and_settings():
         "HAAS_URL": "http://h:1/",
         "HAAS_MAX_STEPS": "7",
         "HAAS_PRELOAD_SKILLS": "a,b c",
+        "HAAS_TUI_THEME": "light",
+        "HAAS_TUI_ASCII": "true",
+        "NO_COLOR": "",
     }
     assert secrets_from_env(env) == {"GITHUB_TOKEN": "t"}
     s = ChatSettings.from_env(env)
@@ -45,6 +48,10 @@ def test_secrets_from_env_and_settings():
         7,
         ["a", "b", "c"],
     )
+    assert s.theme == "light" and s.ascii and s.no_color
+
+    with pytest.raises(ValueError, match="HAAS_TUI_THEME"):
+        ChatSettings.from_env({"HAAS_TUI_THEME": "solarized"})
 
 
 async def test_client_errors_are_mapped():
@@ -105,6 +112,19 @@ async def test_stream_gives_up_after_max_reconnects():
             pass
 
 
+async def test_run_listing_and_cooperative_cancel_api_calls():
+    fake = FakeHaas()
+    client = HaasClient("http://api", "tenant-a", transport=fake.transport())
+    first = await client.list_runs()
+    second = await client.list_runs(cursor=first["next_cursor"])
+    cancelled = await client.cancel_run("run_1")
+
+    assert first["items"][0]["run_id"] == "run_1"
+    assert second["items"][0]["run_id"] == "run_2"
+    assert cancelled["status"] == "cancelled"
+    assert fake.cancelled == ["run_1"]
+
+
 async def make_session(fake: FakeHaas) -> ChatSession:
     return ChatSession(
         HaasClient("http://api", "t1", transport=fake.transport()),
@@ -148,6 +168,51 @@ async def test_turn_rejection_sends_reason_and_reuses_thread():
     fake.script = "simple"
     await session.run_turn("again", lambda e: None, reject)
     assert fake.created[1]["thread_id"] == "thd_1"
+
+
+async def test_attach_run_can_leave_approval_pending():
+    fake = FakeHaas()
+    session = await make_session(fake)
+
+    async def leave_pending(calls):
+        assert calls[0].name == "prepare_refund_batch"
+        return None
+
+    result = await session.attach_run("run_1", lambda _event: None, leave_pending)
+
+    assert result.status == "paused"
+    assert result.run_id == "run_1"
+    assert fake.resumes == []
+
+
+async def test_attach_completed_run_uses_status_when_event_replay_is_empty():
+    fake = FakeHaas("no_events")
+    fake.run_status = "completed"
+    session = await make_session(fake)
+    seen = []
+
+    result = await session.attach_run(
+        "run_1", lambda event: seen.append(event.event), lambda _calls: None
+    )
+
+    assert result.status == "completed"
+    assert result.output == "done"
+    assert seen == ["run_completed"]
+
+
+async def test_attach_cancelled_run_preserves_cancelled_state():
+    fake = FakeHaas("no_events")
+    fake.run_status = "cancelled"
+    session = await make_session(fake)
+    seen = []
+
+    result = await session.attach_run(
+        "run_1", lambda event: seen.append(event.event), lambda _calls: None
+    )
+
+    assert result.status == "cancelled"
+    assert result.output == "Run cancelled."
+    assert seen == ["run_cancelled"]
 
 
 async def test_commands():

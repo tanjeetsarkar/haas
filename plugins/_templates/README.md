@@ -5,7 +5,7 @@ A **plugin pack** extends the harness with **skills** (instructions the model lo
 containers (`./plugins:/app/plugins:ro`), so **restart the API and workers to pick up changes**:
 
 ```bash
-docker compose restart haas-api worker-orchestrator worker-tools
+docker compose -f docker-compose.yml -f docker-compose.dev.yml restart haas-api worker-orchestrator worker-tools
 ```
 
 ```
@@ -101,7 +101,7 @@ Callers supply secrets **per run** (`secrets` in `POST /v1/runs`; in `haas-chat`
 
 ```bash
 haas-plugin doctor
-docker compose restart haas-api worker-orchestrator worker-tools
+docker compose -f docker-compose.yml -f docker-compose.dev.yml restart haas-api worker-orchestrator worker-tools
 curl -s localhost:8000/v1/plugins | jq '.skills[].name'
 HAAS_SECRET_GITHUB_TOKEN=... haas-chat --preload github-ops     # preloading guarantees the skill is active
 ```

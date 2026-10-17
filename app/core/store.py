@@ -8,45 +8,7 @@ import asyncpg
 import redis.asyncio as aioredis
 
 from app.core.config import settings
-
-SCHEMA_LOCK_ID = 7_300_001
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS threads (
-    thread_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    messages_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-    updated_at DOUBLE PRECISION NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    thread_id TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    traceparent TEXT NOT NULL,
-    status TEXT NOT NULL,
-    primary_model TEXT NOT NULL,
-    planner_model TEXT NOT NULL,
-    active_skills_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-    pending_tool_calls_json JSONB,
-    messages_checkpoint_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-    last_step_had_error BOOLEAN NOT NULL DEFAULT FALSE,
-    result_text TEXT,
-    total_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    max_steps INTEGER NOT NULL DEFAULT 15,
-    max_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.30,
-    step_count INTEGER NOT NULL DEFAULT 0,
-    fingerprints_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-    webhook_url TEXT,
-    created_at DOUBLE PRECISION NOT NULL,
-    updated_at DOUBLE PRECISION NOT NULL
-);
-
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS skill_allowlist_json JSONB;
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS registry_fingerprint TEXT;
-
-CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs (thread_id);
-"""
+from app.core.secret_vault import decrypt_secrets, encrypt_secrets
 
 
 class ThreadOwnershipError(Exception):
@@ -63,21 +25,11 @@ class DistributedStore:
         self.pg_pool: asyncpg.Pool | None = None
         self.redis: aioredis.Redis | None = None
 
-    async def init(self, *, ensure_schema: bool = False, pool_max: int = 15) -> None:
+    async def init(self, *, pool_max: int = 15) -> None:
         self.pg_pool = await asyncpg.create_pool(
             dsn=settings.postgres_dsn, min_size=1, max_size=pool_max
         )
         self.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
-
-        if ensure_schema:
-            # Several API replicas boot concurrently; CREATE TABLE IF NOT EXISTS is not
-            # race-free in PostgreSQL, so serialise DDL with an advisory lock.
-            async with self.pg_pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT pg_advisory_xact_lock($1)", SCHEMA_LOCK_ID
-                    )
-                    await conn.execute(SCHEMA_SQL)
 
     async def close(self) -> None:
         if self.pg_pool:
@@ -101,7 +53,9 @@ class DistributedStore:
         self, run_id: str, secrets: dict[str, str], ttl_sec: int = 3600
     ) -> None:
         if secrets:
-            await self.rds.setex(f"haas:secrets:{run_id}", ttl_sec, json.dumps(secrets))
+            await self.rds.setex(
+                f"haas:secrets:{run_id}", ttl_sec, encrypt_secrets(run_id, secrets)
+            )
 
     async def get_scoped_secrets(
         self, run_id: str, allowed_keys: set[str]
@@ -109,7 +63,7 @@ class DistributedStore:
         raw = await self.rds.get(f"haas:secrets:{run_id}")
         if not raw:
             return {}
-        full: dict[str, str] = json.loads(raw)
+        full = decrypt_secrets(run_id, raw)
         return {k: v for k, v in full.items() if k in allowed_keys}
 
     async def clear_ephemeral_secrets(self, run_id: str) -> None:
@@ -234,6 +188,69 @@ class DistributedStore:
         )
         return d
 
+    async def list_runs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int,
+        before: tuple[float, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT run_id, thread_id, status, step_count, total_cost_usd,
+                       created_at, updated_at
+                FROM runs
+                WHERE tenant_id = $1
+                  AND ($2::DOUBLE PRECISION IS NULL OR (created_at, run_id) < ($2, $3))
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT $4
+                """,
+                tenant_id,
+                before[0] if before else None,
+                before[1] if before else None,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def cancel_run(self, run_id: str, tenant_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE runs
+                SET status = 'cancelled', result_text = 'Run cancelled.',
+                    pending_tool_calls_json = NULL, updated_at = $3
+                WHERE run_id = $1 AND tenant_id = $2
+                  AND status IN ('running', 'input_required')
+                RETURNING run_id
+                """,
+                run_id,
+                tenant_id,
+                time.time(),
+            )
+        if row is None:
+            return False
+        await self.rds.setex(f"haas:cancelled:{run_id}", 604_800, "1")
+        await self.clear_ephemeral_secrets(run_id)
+        return True
+
+    async def reap_orphaned_runs(self, stale_before: float) -> list[dict[str, str]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE runs
+                SET status = 'failed', result_text = 'Run expired by orphan reaper.',
+                    pending_tool_calls_json = NULL, updated_at = $2
+                WHERE status = 'running' AND updated_at < $1
+                RETURNING run_id, thread_id
+                """,
+                stale_before,
+                time.time(),
+            )
+        return [
+            {"run_id": row["run_id"], "thread_id": row["thread_id"]} for row in rows
+        ]
+
     async def claim_resume(self, run_id: str, tenant_id: str) -> bool:
         """Atomically flips `input_required` -> `running`; exactly one caller can win."""
         async with self.pool.acquire() as conn:
@@ -274,6 +291,7 @@ class DistributedStore:
                     pending_tool_calls_json = $9::jsonb,
                     updated_at = $10
                 WHERE run_id = $1
+                  AND status NOT IN ('completed', 'failed', 'cancelled')
                 """,
                 run_id,
                 step_count,
@@ -300,7 +318,7 @@ class DistributedStore:
     ) -> None:
         now = time.time()
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE runs
                 SET status = $2,
@@ -310,6 +328,7 @@ class DistributedStore:
                     pending_tool_calls_json = NULL,
                     updated_at = $6
                 WHERE run_id = $1
+                  AND status NOT IN ('completed', 'failed', 'cancelled')
                 """,
                 run_id,
                 status,
@@ -318,7 +337,7 @@ class DistributedStore:
                 cost_delta_usd,
                 now,
             )
-            if status == "completed":
+            if status == "completed" and result.endswith(" 1"):
                 await conn.execute(
                     "UPDATE threads SET messages_json = $2::jsonb, updated_at = $3 WHERE thread_id = $1",
                     thread_id,

@@ -1,7 +1,11 @@
 # `haas-chat` — TUI usage guide
 
-An interactive terminal chat for the running HaaS stack. Type a task, watch the agent work
-(steps, tool calls, costs), approve risky actions, and keep chatting in the same conversation.
+An interactive terminal workbench for the running HaaS stack. Chat, browse tenant-scoped
+runs, reattach to their event stream, review approvals, and request cooperative cancellation.
+
+The current Chat/Runs/Help shell is the first increment of the
+[terminal experience design](design/tui-experience.md). Identity administration,
+marketplace operations and multi-agent controls remain future roadmap work.
 
 * [1. Start it](#1-start-it)
 * [2. The screen](#2-the-screen)
@@ -21,7 +25,7 @@ An interactive terminal chat for the running HaaS stack. Type a task, watch the 
 ## 1. Start it
 
 ```bash
-docker compose up -d                       # the API must be running (default http://localhost:8000)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 uv pip install -e ".[tui]"                 # once; installs Textual + the `haas-chat` / `haas-plugin` commands
 haas-chat                                  # or: python -m haas_cli.chat
 ```
@@ -42,7 +46,8 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 
 ```
 ● http://localhost:8000  tenant default-tenant              ← (1) connection dot (green ok / red down) + tenant
-   ◆ HaaS Chat  distributed agent harness
+   Chat                         Runs                         Help
+   ◆ HaaS Workbench  distributed agent harness
    Connected … — 7 skills, 23 tools.
                                                             ← (2) chat log (scrolls; mouse wheel / PgUp / PgDn)
   ❯ Weather in Tokyo today? one line                           your message
@@ -55,8 +60,8 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 ╭───────────────────────────────────────────────────────╮
 │ type here…                                            │   ← (5) prompt box (grows up to 10 lines)
 ╰───────────────────────────────────────────────────────╯
- thread thd_3412… │ idle │ $0.0006 │ skills: weather │ preload: weather │ secrets: 2     ← (6) status bar
- ^q Quit  esc Detach run  ^l Clear  ^n New chat                                           ← (7) key help
+ thread thd_3412… │ idle │ $0.0006 │ skills: weather │ preload: weather │ secrets: 2     ← status bar
+ ^1 Chat  ^2 Runs  F6 Next focus  ^q Quit  Esc Detach
 ```
 
 | Area | What it tells you |
@@ -65,6 +70,7 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 | **Tool cards** | `⏺` dispatched/running, `✔` succeeded, `✘` failed (red). The preview is the first ~140 chars of the tool output. A failed tool is normal: the agent reads the error and usually retries |
 | **Dim `· step N` lines** | One per LLM step: which model ran and which skills were active |
 | **Run footer `✓ done`** | Steps used, USD cost of that run, cached prompt tokens |
+| **Runs** | Tenant-scoped cursor-paginated run list with status, thread, steps and cost. Select a run to attach or, for running/paused runs, request cancellation |
 
 ## 3. Keyboard
 
@@ -74,11 +80,16 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 | `Ctrl+J` (or `Shift+Enter` where the terminal supports it) | New line inside the message (for pasting logs/CSV, type or paste directly) |
 | `Tab` | Complete the `/command` or argument being typed (accepts the highlighted suggestion; never leaves the prompt) |
 | `↑` / `↓` | While several suggestions are shown: choose one. Otherwise browse sent messages (when the cursor is on the first/last line). `/secret …` lines are never stored |
-| `Esc` | **Detach** from the running task (see [§12](#12-behaviour-to-know-about)); inside an approval dialog it means *Reject* |
+| `Esc` | **Detach** from the running task; inside an approval dialog it leaves the run pending |
+| `Ctrl+1` / `Ctrl+2` | Switch to Chat / Runs |
+| `F6` | Move keyboard focus to the next control |
+| `Ctrl+R` | Refresh the current run list |
+| `Ctrl+T` | Cycle the dark/light/auto theme |
+| `F1` | Show contextual help |
 | `Ctrl+L` | Clear the screen (conversation continues) |
 | `Ctrl+N` | Start a new conversation (same as `/new`) |
 | `Ctrl+Q` | Quit |
-| `Ctrl+P` | Textual command palette (theme switch, screenshot, …) |
+| `Ctrl+P` | Open the command palette for navigation, run actions, help and theme |
 | Mouse | Scroll the log; click buttons in dialogs; select text with the mouse to copy (terminal-dependent) |
 
 While a task runs you can still use `/commands`; plain messages are held back with a notice.
@@ -132,9 +143,10 @@ their own. The run pauses and a dialog opens:
 ```
 
 * **`y`** or the *Approve* button: the tools run and the agent continues.
-* **`n`**, **`Esc`** or the *Reject* button: nothing runs; the optional reason is passed to the agent, which then
+* **`n`** or the *Reject* button: nothing runs; the optional reason is passed to the agent, which then
   explains/adapts. Type the reason first (click the field) if you want one.
-* The *Reject* button has initial focus, so an accidental `Enter` rejects instead of approving.
+* **`Esc`** or *Leave pending*: close review without approving or rejecting. The run remains paused on the server.
+  Reattach from Runs to review it again.
 * Read the JSON arguments: they are exactly what will be executed. Several tools in one batch are approved or
   rejected together.
 
@@ -199,28 +211,35 @@ Without `--auto-approve` it asks `approve? [y/N]` on the terminal at each gate.
 | `HAAS_MAX_COST_USD` | `--budget` | server (0.30) | USD per run |
 | `HAAS_PRELOAD_SKILLS` | `--preload` | none | Comma/space separated skills |
 | `HAAS_SECRET_<NAME>` | – | none | Run secret `<NAME>` |
+| `HAAS_TUI_THEME` | `--theme` | `auto` | `auto`, `dark` or `light`; cycle at runtime with `Ctrl+T` |
+| `HAAS_TUI_ASCII` | `--ascii` | false | Use ASCII-friendly status and activity symbols |
+| `NO_COLOR` / `HAAS_TUI_NO_COLOR` | `--no-color` | false | Disable terminal colors |
 
 ## 11. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Red `Cannot reach http://localhost:8000` | Stack not running: `docker compose up -d`; check `curl localhost:8000/healthz`; wrong `--url` |
+| Red `Cannot reach http://localhost:8000` | Stack not running: `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d`; check `curl localhost:8000/readyz`; wrong `--url` |
 | `Unknown preload_skills` | Typo or plugin not loaded: `/skills`; after adding plugins `docker compose restart haas-api worker-orchestrator worker-tools` |
 | Tool card `✘ … Secret 'X' was not supplied` | `/secret set X …` (or `HAAS_SECRET_X`) and ask again |
 | `✘ … Access denied: Secret … not declared` | The skill that owns the tool is not active: `/preload <skill>` |
 | Answer contains odd tokens like `<｜tool▁calls▁begin｜>` | Step 1 used `deepseek-r1` which doesn't do tool calls on your provider: `/planner deepseek/deepseek-chat-v3-0324` |
 | Agent talks instead of using tools | Use `/preload <skill>` and name the task/tool explicitly |
 | `Run failed: … budget` / `max_steps` | `/budget 1` or `/steps 25` and retry |
-| `Run failed: … 401` from OpenRouter | `OPENROUTER_API_KEY` in `.env` is invalid; fix and `docker compose up -d` |
+| `Run failed: … 401` from OpenRouter | `OPENROUTER_API_KEY` in `.env` is invalid; fix and restart the development Compose stack |
 | `409 Resume already in progress` | Another operator answered the same approval; nothing to do |
 | Broken characters/boxes | Use a UTF-8 terminal with a modern font; `export TERM=xterm-256color` |
 
 ## 12. Behaviour to know about
 
-* **Esc detaches, it does not cancel.** The API has no cancel endpoint; the run keeps going server-side and still
-  costs money until it finishes or hits its limits. (Inside an approval dialog `Esc` means *Reject* instead.) If you
-  quit the TUI while a dialog is open, the run stays paused until someone answers via the approval API
-  (`POST /v1/runs/{id}/resume`).
+* **Esc detaches, it does not cancel.** The worker continues on the server and may still cost money.
+  Use Runs → select a running/paused run → Cancel, then confirm to request cooperative cancellation.
+  A tool or external request already in progress may still finish; the UI does not claim a hard kill.
+* **Approval Esc leaves the run pending.** Approve and Reject are explicit actions. Closing the dialog
+  does not make a decision; reattach from Runs to review the pending batch again.
+* **Run history is tenant-scoped and cursor-paginated.** Attached runs replay the event stream from its
+  earliest retained entry; retention is finite, so an old run may not replay its complete history.
+  The run status/result endpoint is used when the stream no longer contains terminal state.
 * **Conversation = thread.** Each message is a new run on the same thread; the server keeps the history. `/new`
   starts a fresh thread. Threads are tenant-scoped.
 * **Cost** in the status bar is the sum of the finished runs' `total_cost_usd` in this TUI session.

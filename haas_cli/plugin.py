@@ -10,6 +10,7 @@ import ast
 import importlib.util
 import json
 import re
+from collections.abc import Sequence
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -70,7 +71,7 @@ def _template(plugins_dir: Path, *parts: str) -> str:
 
 
 def _check_names(
-    *, tools: list[str] = (), secrets: list[str] = (), skill: str | None = None
+    *, tools: Sequence[str] = (), secrets: Sequence[str] = (), skill: str | None = None
 ) -> None:
     if skill is not None and (len(skill) > 64 or not SKILL_NAME_RE.match(skill)):
         raise ScaffoldError(

@@ -243,14 +243,16 @@ def _mcp_registry(handler) -> tuple[PluginRegistry, RunContext]:
 
 async def test_mcp_request_shape_and_json_response():
     seen = {}
+    request_ids: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["headers"], seen["body"] = request.headers, json.loads(request.content)
+        request_ids.append(seen["body"]["id"])
         return httpx.Response(
             200,
             json={
                 "jsonrpc": "2.0",
-                "id": "run_t",
+                "id": seen["body"]["id"],
                 "result": {"content": [{"type": "text", "text": "hello"}]},
             },
         )
@@ -260,6 +262,7 @@ async def test_mcp_request_shape_and_json_response():
     out = await tool.handler(ctx, tool.args_schema.model_validate({"customer": "acme"}))
     assert out == "hello"
     h, b = seen["headers"], seen["body"]
+    assert b["id"] != ctx.run_id and len(b["id"]) == 32
     assert (
         h["mcp-protocol-version"] == "2026-07-28"
         and h["mcp-method"] == "tools/call"
@@ -271,31 +274,39 @@ async def test_mcp_request_shape_and_json_response():
         b["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
     )
     assert b["params"]["arguments"] == {"customer": "acme"}
+    await tool.handler(ctx, tool.args_schema.model_validate({"customer": "other"}))
+    assert len(request_ids) == 2 and request_ids[0] != request_ids[1]
 
 
 async def test_mcp_sse_response_and_errors():
-    sse = 'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\ndata: {"jsonrpc":"2.0","id":"x","result":{"content":[{"type":"text","text":"via sse"}]}}\n\n'
-    reg, ctx = _mcp_registry(
-        lambda r: httpx.Response(
+    def sse_handler(request: httpx.Request) -> httpx.Response:
+        request_id = json.loads(request.content)["id"]
+        sse = (
+            'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+            f"data: {json.dumps({'jsonrpc': '2.0', 'id': request_id, 'result': {'content': [{'type': 'text', 'text': 'via sse'}]}})}\n\n"
+        )
+        return httpx.Response(
             200, text=sse, headers={"content-type": "text/event-stream"}
         )
-    )
+
+    reg, ctx = _mcp_registry(sse_handler)
     tool = reg.tools["lookup"]
     assert (
         await tool.handler(ctx, tool.args_schema.model_validate({"customer": "a"}))
         == "via sse"
     )
 
-    reg, ctx = _mcp_registry(
-        lambda r: httpx.Response(
+    def error_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
             200,
             json={
                 "jsonrpc": "2.0",
-                "id": "x",
+                "id": json.loads(request.content)["id"],
                 "error": {"code": -32602, "message": "bad"},
             },
         )
-    )
+
+    reg, ctx = _mcp_registry(error_handler)
     tool = reg.tools["lookup"]
     with pytest.raises(ToolRemediationError, match="MCP error"):
         await tool.handler(ctx, tool.args_schema.model_validate({"customer": "a"}))

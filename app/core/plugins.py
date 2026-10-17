@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Collection, Iterable
@@ -329,6 +330,7 @@ class PluginRegistry:
                 "Accept": "application/json, text/event-stream",
                 "traceparent": ctx.traceparent,
             }
+            request_id: str | None = None
             if secret_key:
                 secret_val = ctx.get_secret(secret_key)
                 sig = hmac.new(
@@ -343,9 +345,10 @@ class PluginRegistry:
                 headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
                 headers["Mcp-Method"] = "tools/call"
                 headers["Mcp-Name"] = name
+                request_id = uuid.uuid4().hex
                 body: dict[str, Any] = {
                     "jsonrpc": "2.0",
-                    "id": ctx.run_id,
+                    "id": request_id,
                     "method": "tools/call",
                     "params": {
                         "name": name,
@@ -376,6 +379,10 @@ class PluginRegistry:
                 return resp.text
 
             msg = _parse_mcp_response(resp.text, resp.headers.get("content-type", ""))
+            if request_id is None or msg.get("id") != request_id:
+                raise ToolRemediationError(
+                    f"MCP server returned a response with an unexpected id for '{name}'."
+                )
             if "error" in msg:
                 raise ToolRemediationError(f"MCP error from '{name}': {msg['error']}")
             result = msg.get("result", {})
