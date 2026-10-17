@@ -5,12 +5,21 @@
 ## 1. Physical relational model (CURRENT)
 
 The current schema is established by [Alembic migrations](../../migrations/versions/).
-There are exactly two
-application tables. JSON arrays do not imply separate normalized entities.
+It includes the initial run store and the Phase 1 tenant identity and policy registry.
+JSON arrays do not imply separate normalized entities.
 
 ```mermaid
 erDiagram
     threads ||..o{ runs : "logical thread_id link; no FK"
+    tenants ||--o{ memberships : grants
+    principals ||--o{ memberships : receives
+    tenants ||--o{ tenant_api_keys : scopes
+    principals ||--o{ tenant_api_keys : owns
+    tenants ||--o{ audit_events : records
+    principals ||--o{ audit_events : acts
+    tenants ||--o{ tenant_policy_revisions : versions
+    tenant_policy_revisions ||--o{ runs : pins
+    tenant_policy_revisions ||--o| tenants : active_revision
     threads {
         TEXT thread_id PK
         TEXT tenant_id
@@ -40,12 +49,73 @@ erDiagram
         DOUBLE_PRECISION updated_at
         JSONB skill_allowlist_json "nullable"
         TEXT registry_fingerprint "nullable"
+        UUID submitted_by_principal_id "nullable"
+        UUID policy_revision_id "nullable"
+    }
+    tenants {
+        UUID tenant_id PK
+        TEXT slug UK
+        TEXT status
+        TEXT region
+        BIGINT revocation_epoch
+        TIMESTAMPTZ credential_valid_after
+        TEXT retention_class
+        UUID active_policy_revision_id "nullable"
+    }
+    principals {
+        UUID principal_id PK
+        TEXT issuer UK_part
+        TEXT subject UK_part
+        TEXT kind
+        TEXT status
+        TIMESTAMPTZ credential_valid_after
+    }
+    memberships {
+        UUID tenant_id PK,FK
+        UUID principal_id PK,FK
+        TEXT role PK
+        TEXT status
+    }
+    tenant_api_keys {
+        UUID key_id PK
+        UUID tenant_id FK
+        UUID principal_id FK
+        TEXT key_prefix UK
+        BYTEA key_hash UK
+        TEXT name
+        TIMESTAMPTZ expires_at
+        TIMESTAMPTZ revoked_at
+        TIMESTAMPTZ last_used_at
+    }
+    tenant_policy_revisions {
+        UUID policy_revision_id PK
+        UUID tenant_id FK
+        BIGINT version
+        TEXT digest
+        JSONB rules
+        UUID created_by_principal_id FK
+        TIMESTAMPTZ created_at
+    }
+    audit_events {
+        UUID event_id PK
+        UUID tenant_id FK
+        UUID actor_principal_id FK
+        TEXT action
+        TEXT target_type
+        TEXT target_id
+        UUID request_id
+        JSONB details
+        TIMESTAMPTZ created_at
     }
 ```
 
 The dashed relationship is logical only: the current database does **not** enforce a
-foreign key between runs and threads or tenant equality across those records.
-There is no tenants, users, approvals, events, invocations, artifacts or usage-ledger table.
+foreign key between runs and threads or tenant equality across runs, threads and registry
+records. `runs.policy_revision_id` references a globally unique revision ID; it is not
+yet a composite tenant-aware foreign key. The active policy pointer is tenant-aware.
+Policy revisions and audit events are protected from updates and deletes by database
+triggers. Agent, immutable approval-decision, run-event, invocation, artifact and
+usage-ledger tables do not yet exist.
 
 ### Current column semantics
 
@@ -53,12 +123,19 @@ There is no tenants, users, approvals, events, invocations, artifacts or usage-l
 |---|---|
 | IDs | Text primary keys; globally unique thread/run IDs, not composite tenant keys |
 | `tenant_id`, `thread_id` on runs | Required text; ownership checked by application paths |
-| `status` | Required free text; no database state enum/check constraint |
+| Registry statuses | Check constraints on tenant, principal and membership lifecycle; API roles are membership rows |
+| Tenant policy | Versioned JSONB rules with a SHA-256 digest; model providers/models, plugin digest+skill grants, exact webhook hosts, maximum budgets and retention class |
+| Active policy | Nullable tenant pointer with a composite FK preventing cross-tenant activation; absent policy denies authenticated run admission |
+| API credentials | Tenant-scoped key prefix and SHA-256 hash; raw key is never stored |
+| `status` on runs | Required free text; no database state enum/check constraint |
 | `messages_json`, `messages_checkpoint_json` | Required JSONB, default empty array; full message snapshots |
 | `active_skills_json`, `fingerprints_json` | Required JSONB arrays; stored fingerprint history limited to last 20 on checkpoint |
 | `pending_tool_calls_json` | Nullable JSONB containing entire paused batch |
-| `skill_allowlist_json` | Added by startup `ALTER`; NULL means unrestricted, empty array means no domain skills |
+| `skill_allowlist_json` | Added by startup `ALTER`; NULL is unrestricted only for legacy/development runs; authenticated runs persist the effective policy grant, including an empty array |
 | `registry_fingerprint` | Added by startup `ALTER`; drift diagnostic, not a pinned artifact or signature |
+| `submitted_by_principal_id` | Nullable FK added by migration 0003; null on legacy/development-header runs |
+| `policy_revision_id` | Nullable FK added by migration 0004; authenticated runs pin the immutable policy revision used at admission |
+| `audit_events` | Migration 0005 stores tenant-scoped actor, action, target, request ID and minimized JSON details; rows are append-only |
 | `total_cost_usd`, `max_cost_usd` | Double precision, defaults 0 and 0.30; not an exact monetary ledger |
 | `max_steps`, `step_count` | Defaults 15 and 0; persisted step count can lag terminal reported step |
 | `last_step_had_error` | Required boolean, default false |
@@ -66,8 +143,8 @@ There is no tenants, users, approvals, events, invocations, artifacts or usage-l
 | Optional text | `result_text`, `webhook_url`, `registry_fingerprint` |
 | Index | `runs_thread_idx(thread_id)`; no explicit tenant/status index or RLS |
 
-Startup serializes schema creation with a PostgreSQL advisory transaction lock.
-It is not a versioned migration framework. Finalization updates the run and, for
+The run schema still has legacy startup-created fields and no tenant RLS. The registry and
+policy revisions use versioned Alembic migrations. Finalization updates the run and, for
 completion, thread history using separate statements without an explicit surrounding
 transaction. Concurrent runs can overwrite whole thread histories.
 
@@ -97,6 +174,8 @@ Primary IDs are shown for readability; composite key requirements follow the dia
 erDiagram
     PRINCIPAL ||--o{ MEMBERSHIP : has
     TENANT ||--o{ MEMBERSHIP : grants
+    PRINCIPAL ||--o{ TENANT_API_KEY : authenticates
+    TENANT ||--o{ TENANT_API_KEY : scopes
     TENANT ||--o{ POLICY_REVISION : versions
     TENANT ||--o{ AGENT : owns
     AGENT ||--|{ AGENT_REVISION : versions
@@ -108,9 +187,11 @@ erDiagram
     TENANT ||--|{ TENANT_PLACEMENT : assigned
     TENANT {
         uuid tenant_id PK
+        string slug UK
         string status
         string region
         bigint revocation_epoch
+        timestamptz credential_valid_after
         string retention_class
         timestamptz created_at
     }
@@ -120,12 +201,24 @@ erDiagram
         string subject
         string kind
         string status
+        timestamptz credential_valid_after
     }
     MEMBERSHIP {
         uuid tenant_id PK,FK
         uuid principal_id PK,FK
         string role PK
         string status
+    }
+    TENANT_API_KEY {
+        uuid key_id PK
+        uuid tenant_id FK
+        uuid principal_id FK
+        string key_prefix UK
+        bytes key_hash UK
+        string name
+        timestamptz expires_at
+        timestamptz revoked_at
+        timestamptz last_used_at
     }
     POLICY_REVISION {
         uuid policy_revision_id PK
@@ -191,6 +284,23 @@ Tenant access to a plugin is conveyed by a grant, not by global catalog visibili
 Principal identity is unique on `(issuer, subject)`; a human may hold memberships in
 multiple tenants. Service credentials map to principals with tenant-scoped grants.
 Secret binding rows hold references only, never raw values.
+
+The initial registry slice is implemented by migration
+[`0002_identity_registry`](../../migrations/versions/0002_identity_registry.py):
+`tenants`, `principals`, `memberships`, and `tenant_api_keys`. Tenant suspension and
+offboarding advance `revocation_epoch`, set `credential_valid_after`, and revoke active
+API keys; reactivation requires explicit reauthorization and does not restore keys.
+The API validates active tenant membership for OIDC subjects and tenant-scoped API keys;
+only SHA-256 API-key digests are persisted. The one-time
+[`haas-bootstrap-tenant`](../../app/bootstrap_tenant.py)
+command creates a tenant and its first administrator from an exact configured OIDC
+issuer/subject pair and refuses to re-bootstrap an existing slug. Initial action-level
+RBAC is implemented in [`authorization.py`](../../app/core/authorization.py). Migration
+[`0003_run_submitter`](../../migrations/versions/0003_run_submitter.py) records the
+authenticated submitter for new runs; legacy rows remain unattributed and cannot be
+approved through an authenticated request. Tenant model/plugin/budget policy remains
+in `p1-tenant-policy`. Existing `runs` and `threads` still use text tenant IDs and are
+not yet protected by composite foreign keys or RLS.
 
 ## 4. Proposed execution and delivery ERD (TARGET)
 

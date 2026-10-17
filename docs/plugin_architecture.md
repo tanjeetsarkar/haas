@@ -78,8 +78,11 @@ Readiness: a skill is offered and activatable only if every tool in `required_to
 
 ## Visibility and enforcement
 
-The effective skill allowlist = tenant list (`TENANT_SKILL_ALLOWLISTS`, `"*"` default) narrowed by the run's `skills`.
-It is stored on the run and enforced at: catalog rendering, `preload_skills` validation, `activate_skill`,
+For authenticated tenants, the effective skill allowlist is derived from the active immutable
+policy revision's plugin ID, exact artifact digest, and explicit skill grants, then narrowed
+by the run's `skills`. The selected policy revision is pinned on the run. Development
+header-tenancy retains the legacy `TENANT_SKILL_ALLOWLISTS` (`"*"` default) behavior.
+The effective list is stored on the run and enforced at: catalog rendering, `preload_skills` validation, `activate_skill`,
 `read_skill_reference`, the tools offered to the model, the unlock check on the tool worker, and secret scoping.
 The catalog in a thread's first system message is only a hint; enforcement is authoritative.
 
@@ -87,5 +90,6 @@ The catalog in a thread's first system message is only a hint; enforcement is au
 
 * Fingerprint: `haas-plugin list` and `GET /v1/plugins` show it; runs store the API's value and workers flag a
   mismatch with `registry_drift: true` in `step_started` events (rolling restarts / stale mounts).
-* Restart is still the reload mechanism. Tenant identity is still trusted from `X-Tenant-ID`.
+* Restart is still the reload mechanism. Authenticated requests verify tenant membership;
+  `X-Tenant-ID` is only a tenant selector. The dev header bypass is not a production identity mechanism.
 * Migration from the flat layout: `haas-plugin migrate [--dry-run]` (skills sharing tool files are merged into one pack).

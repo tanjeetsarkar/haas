@@ -2,16 +2,20 @@
 
 [Design index](README.md) | [Integrations](integrations-usage.md) | [Roadmap](../roadmap.md)
 
-**Status:** TARGET. Today's developer surface is the `/v1` REST + SSE API, the `haas-chat` TUI,
-`haas-plugin` and a Python client internal to the CLI ([integrations](integrations-usage.md)).
+**Status:** PARTIALLY IMPLEMENTED. The current surface includes `/v1` REST + SSE, the
+`haas-chat` / `haas chat` TUI, `haas-plugin`, profile and tenant-admin CLI commands, and an
+isolated `haas dev` mock stack. The broader SDK, contract tooling and integration surfaces
+remain targets ([integrations](integrations-usage.md), [roadmap](../roadmap.md)).
 
 ## 1. Principles
 
 * **Contract first.** OpenAPI 3.1 for REST, JSON Schema for every event and webhook payload,
   AsyncAPI for SSE/webhook channels. SDKs, docs and mocks are generated from the contract.
   CI lints (Spectral) and blocks unannounced breaking changes (oasdiff).
-* **Five-minute success.** `haas dev` starts a local stack with a deterministic mock model;
-  a quickstart runs, streams and approves a tool call without any provider key.
+* **Five-minute success.** `haas dev up` starts an isolated local stack with a deterministic
+  mock model and billing endpoint; `haas dev seed` creates a local-only tenant and expiring
+  `hk_test_` submitter/admin and separate approver keys without a real provider key. CI
+  quickstart qualification remains a roadmap gate.
 * **Safe by default.** SDKs send idempotency keys, verify webhook signatures in constant time and
   never log credentials.
 * **One mental model.** Runs, threads, agents, approvals, artifacts, events and plugins are the
@@ -63,10 +67,11 @@ errors, OpenTelemetry context propagation, agents-as-code builders (see [multi-a
 
 ## 4. CLI
 
-`haas` replaces `haas-chat` and `haas-plugin` (kept as aliases):
+The current unified `haas` commands are `chat`, `profile`, `admin`, and `dev`;
+`haas-chat` and `haas-plugin` remain supported aliases. The target command set adds:
 `login` (device flow / API key), `runs`, `threads`, `agents publish`, `approvals`,
-`plugins new|test|pack|sign|publish|install`, `dev`, `logs`, `webhooks listen` (forwards signed
-deliveries to localhost), `chat` (the TUI).
+`plugins new|test|pack|sign|publish|install`, `logs`, and `webhooks listen` (forwards signed
+deliveries to localhost).
 
 ### Terminal product and capability parity
 

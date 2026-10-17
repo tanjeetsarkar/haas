@@ -17,6 +17,7 @@ TAKES_ARGS = {
     "/steps",
     "/budget",
     "/thread",
+    "/approve",
 }
 SECRET_SUBCOMMANDS = [
     ("set", "NAME VALUE: set a secret (memory only)"),

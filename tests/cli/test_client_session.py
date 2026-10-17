@@ -69,6 +69,43 @@ async def test_client_errors_are_mapped():
     assert e2.value.status is None and "Cannot reach" in str(e2.value)
 
 
+async def test_client_sends_bearer_identity_and_clears_rejected_credential():
+    requests: list[str | None] = []
+    reject = False
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal reject
+        requests.append(req.headers.get("authorization"))
+        if reject:
+            return httpx.Response(401, json={"detail": "Expired."})
+        return httpx.Response(
+            200,
+            json={
+                "tenant_id": "tenant-a",
+                "principal_id": "principal-a",
+                "roles": ["submitter"],
+                "credential_type": "api_key",
+            },
+        )
+
+    client = HaasClient(
+        "http://api",
+        "tenant-a",
+        credential="hk_test_secret",
+        transport=httpx.MockTransport(handler),
+    )
+    identity = await client.identity()
+    assert identity["principal_id"] == "principal-a"
+    assert requests == ["Bearer hk_test_secret"]
+
+    reject = True
+    with pytest.raises(HaasAPIError) as error:
+        await client.identity()
+    assert error.value.status == 401
+    assert client.credential is None
+    assert client.auth_expired
+
+
 async def test_stream_reconnects_from_last_event_id():
     calls: list[str] = []
 

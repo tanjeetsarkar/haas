@@ -1,11 +1,12 @@
 # `haas-chat` — TUI usage guide
 
-An interactive terminal workbench for the running HaaS stack. Chat, browse tenant-scoped
-runs, reattach to their event stream, review approvals, and request cooperative cancellation.
+An interactive terminal workbench for HaaS. Chat, browse tenant-scoped runs, reattach to
+their event stream, review approvals, request cooperative cancellation, and—when authorized—
+administer tenant access and policy.
 
-The current Chat/Runs/Help shell is the first increment of the
-[terminal experience design](design/tui-experience.md). Identity administration,
-marketplace operations and multi-agent controls remain future roadmap work.
+Chat, Runs, identity/profile switching, and the role-aware Admin workspace are the current
+increments of the [terminal experience design](design/tui-experience.md). Marketplace,
+multi-agent and production-operations controls remain future roadmap work.
 
 * [1. Start it](#1-start-it)
 * [2. The screen](#2-the-screen)
@@ -25,10 +26,15 @@ marketplace operations and multi-agent controls remain future roadmap work.
 ## 1. Start it
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
-uv pip install -e ".[tui]"                 # once; installs Textual + the `haas-chat` / `haas-plugin` commands
-haas-chat                                  # or: python -m haas_cli.chat
+uv pip install -e ".[tui]"                 # once
+haas dev up                                # isolated Compose project; deterministic mock provider
+haas dev seed                              # prints separate one-time submitter/admin and approver keys
+haas chat --url http://127.0.0.1:18000 --tenant local-dev
+# In the TUI, use /login and paste the submitter/admin key.
 ```
+
+`haas dev down` stops this isolated project and preserves its data volumes. `haas-chat` remains
+available as an alias; the standard `docker compose` workflow is also supported.
 
 Useful launch options (all optional):
 
@@ -46,7 +52,7 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 
 ```
 ● http://localhost:8000  tenant default-tenant              ← (1) connection dot (green ok / red down) + tenant
-   Chat                         Runs                         Help
+   Chat                         Runs       Admin*              Help
    ◆ HaaS Workbench  distributed agent harness
    Connected … — 7 skills, 23 tools.
                                                             ← (2) chat log (scrolls; mouse wheel / PgUp / PgDn)
@@ -71,6 +77,7 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 | **Dim `· step N` lines** | One per LLM step: which model ran and which skills were active |
 | **Run footer `✓ done`** | Steps used, USD cost of that run, cached prompt tokens |
 | **Runs** | Tenant-scoped cursor-paginated run list with status, thread, steps and cost. Select a run to attach or, for running/paused runs, request cancellation |
+| **Admin** | Appears for a verified tenant administrator or auditor. Admins can manage memberships, API keys and policy, inspect scoped plugins and audit events; auditors can read audit events only |
 
 ## 3. Keyboard
 
@@ -82,6 +89,7 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 | `↑` / `↓` | While several suggestions are shown: choose one. Otherwise browse sent messages (when the cursor is on the first/last line). `/secret …` lines are never stored |
 | `Esc` | **Detach** from the running task; inside an approval dialog it leaves the run pending |
 | `Ctrl+1` / `Ctrl+2` | Switch to Chat / Runs |
+| `Ctrl+3` | Open Admin/audit when the verified role permits it |
 | `F6` | Move keyboard focus to the next control |
 | `Ctrl+R` | Refresh the current run list |
 | `Ctrl+T` | Cycle the dark/light/auto theme |
@@ -113,7 +121,11 @@ Type `/` to open the suggestion list under the prompt (command name + descriptio
 | Command | What it does |
 |---|---|
 | `/help` | List commands |
+| `/login` · `/logout` | Sign in with a bearer credential (memory only) / clear it |
+| `/tenant [id]` · `/profile [name]` | Verify and switch tenant / saved environment profile |
 | `/status` | API URL + health, tenant, thread, models, limits, preload list, secret **names**, total cost |
+| `/admin` | Open the role-authorized Admin/audit workspace |
+| `/approve <run-id>` | Review a known pending approval as a verified approver |
 | `/skills` | Installed skills with description, tools and the secrets each may read |
 | `/tools` | Registered tools and queue; `⚠` marks tools that need your approval |
 | `/preload <skill> […]` | Skills activated before the first step of every run. `/preload clear` empties the list; `/preload` shows it |
@@ -125,6 +137,41 @@ Type `/` to open the suggestion list under the prompt (command name + descriptio
 | `/new` | New conversation: new thread, cost counter reset (settings and secrets are kept) |
 | `/clear` | Clear the screen only |
 | `/quit` | Exit (`/exit`, `/q` also work) |
+
+## Identity and tenant administration
+
+Use `/login` to authenticate with a tenant-scoped API key or OIDC bearer token; the
+credential stays in process memory. `/logout` clears it. `/tenant` verifies a tenant switch
+through `/v1/me`; `/profile` changes to a saved endpoint profile and verifies it before the
+switch. Profiles contain only endpoint, tenant and environment metadata, never credentials.
+
+The Admin workspace appears only after the server verifies a `tenant_admin` or `auditor`
+role. Tenant admins can list/grant/revoke memberships, list/create/revoke API keys, inspect
+and activate tenant policy revisions, inspect the tenant-scoped plugin catalog, and page
+through audit events. Auditors receive audit-read access but do not see mutation controls.
+Every operation is still authorized by the API; a hidden button is only a usability aid.
+Human membership grants need a configured OIDC issuer. An API key created in the TUI is
+shown once in the result panel and is not saved; copy it securely before leaving the view.
+
+The local seed produces a distinct approver identity because the API forbids approving
+one's own run. An authenticated submitter cannot approve its own run in the inline dialog;
+leave it pending and share the displayed run ID with an approver. Sign in as that approver,
+then run `/approve <run-id>` to inspect the pending actions and approve, reject, or leave
+them pending. This flow is scoped to a known run ID; a tenant-wide approval inbox/stream
+for a second identity is a later T3 roadmap capability.
+
+The equivalent current command-line surfaces are `haas profile`, `haas admin`, and
+`haas dev`. For example:
+
+```bash
+haas profile add local-dev --url http://127.0.0.1:18000 --tenant local-dev \
+  --environment dev --activate
+haas profile list
+haas admin --url http://127.0.0.1:18000 --tenant local-dev memberships list
+```
+
+The `haas admin` commands require `HAAS_API_KEY` or `HAAS_BEARER_TOKEN` in the process
+environment. Unlike TUI `/login`, profiles do not persist or retrieve credentials.
 
 ## 5. Approvals (human-in-the-loop)
 
@@ -146,7 +193,7 @@ their own. The run pauses and a dialog opens:
 * **`n`** or the *Reject* button: nothing runs; the optional reason is passed to the agent, which then
   explains/adapts. Type the reason first (click the field) if you want one.
 * **`Esc`** or *Leave pending*: close review without approving or rejecting. The run remains paused on the server.
-  Reattach from Runs to review it again.
+  Reattach from Runs to review it as an authorized approver, or use `/approve <run-id>` with a separate approver identity.
 * Read the JSON arguments: they are exactly what will be executed. Several tools in one batch are approved or
   rejected together.
 
@@ -205,6 +252,8 @@ Without `--auto-approve` it asks `approve? [y/N]` on the terminal at each gate.
 |---|---|---|---|
 | `HAAS_URL` | `--url` | `http://localhost:8000` | API base URL |
 | `HAAS_TENANT` | `--tenant` | `default-tenant` | `X-Tenant-ID`; runs/threads are isolated per tenant |
+| `HAAS_API_KEY` / `HAAS_BEARER_TOKEN` | `/login` | none | In-memory bearer credential; conflicting values are rejected |
+| `HAAS_CLIENT_PROFILE` | – | active saved profile | Select a non-secret endpoint profile |
 | – | `--thread` | new | Continue a thread |
 | `HAAS_PRIMARY_MODEL` / `HAAS_PLANNER_MODEL` | `--model` / `--planner` | server default | Model overrides (OpenRouter ids) |
 | `HAAS_MAX_STEPS` | `--max-steps` | server (15) | Steps per run |
@@ -244,4 +293,5 @@ Without `--auto-approve` it asks `approve? [y/N]` on the terminal at each gate.
   starts a fresh thread. Threads are tenant-scoped.
 * **Cost** in the status bar is the sum of the finished runs' `total_cost_usd` in this TUI session.
 * **Reconnects:** if the event stream drops, the client resumes from the last event id (up to 5 attempts).
-* **Tenant identity is trusted from the header** by the server; use `--tenant` only on networks you control.
+* **Unauthenticated dev tenancy uses the header only as a local selector.** Authenticated
+  profiles verify tenant membership with the server; production does not trust header-only identity.

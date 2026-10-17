@@ -59,7 +59,7 @@ services:
     image: haas-distributed:3.0.0
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
     ports:
-      - "8000:8000"
+      - "${HAAS_API_BIND_ADDRESS:-0.0.0.0}:${HAAS_API_PORT:-8000}:8000"
     environment:
       <<: *app-env
       # The API stamps these defaults on every run it creates (the workers only obey them).

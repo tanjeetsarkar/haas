@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from haas_cli.client import HaasAPIError, HaasClient, SSEEvent
-from haas_cli.config import ChatSettings
+from haas_cli.config import ChatSettings, parse_environment
+from haas_cli.profiles import ProfileStore
 from haas_cli.session import ChatSession, Decision, PendingCall
 
 
@@ -19,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--url", help="API base URL (env HAAS_URL, default http://localhost:8000)"
     )
     p.add_argument("--tenant", help="X-Tenant-ID (env HAAS_TENANT)")
+    p.add_argument("--profile", help="Named endpoint profile (env HAAS_CLIENT_PROFILE)")
     p.add_argument("--thread", help="Continue an existing thread id")
     p.add_argument(
         "--preload", nargs="*", metavar="SKILL", help="Skills to activate up-front"
@@ -59,27 +62,45 @@ def build_parser() -> argparse.ArgumentParser:
 
 def settings_from_args(args: argparse.Namespace) -> ChatSettings:
     s = ChatSettings.from_env()
-    if args.url:
+    selected_profile = getattr(args, "profile", None) or os.environ.get(
+        "HAAS_CLIENT_PROFILE"
+    )
+    profiles = ProfileStore()
+    profile = profiles.get(selected_profile) if selected_profile else profiles.active()
+    if selected_profile and profile is None:
+        raise ValueError(f"HaaS profile {selected_profile!r} does not exist.")
+    if profile:
+        s.profile_name = profile.name
+        s.base_url = profile.base_url
+        s.tenant = profile.tenant
+        s.environment = profile.environment
+    if os.environ.get("HAAS_URL"):
+        s.base_url = os.environ["HAAS_URL"].rstrip("/")
+    if os.environ.get("HAAS_TENANT"):
+        s.tenant = os.environ["HAAS_TENANT"]
+    if os.environ.get("HAAS_ENVIRONMENT"):
+        s.environment = parse_environment(os.environ["HAAS_ENVIRONMENT"])
+    if getattr(args, "url", None):
         s.base_url = args.url.rstrip("/")
-    if args.tenant:
+    if getattr(args, "tenant", None):
         s.tenant = args.tenant
-    if args.thread:
+    if getattr(args, "thread", None):
         s.thread_id = args.thread
-    if args.preload is not None:
+    if getattr(args, "preload", None) is not None:
         s.preload_skills = args.preload
-    if args.model:
+    if getattr(args, "model", None):
         s.primary_model = args.model
-    if args.planner:
+    if getattr(args, "planner", None):
         s.planner_model = args.planner
-    if args.max_steps:
+    if getattr(args, "max_steps", None):
         s.max_steps = args.max_steps
-    if args.budget:
+    if getattr(args, "budget", None):
         s.max_cost_usd = args.budget
-    if args.theme:
+    if getattr(args, "theme", None):
         s.theme = args.theme
-    if args.no_color is not None:
+    if getattr(args, "no_color", None) is not None:
         s.no_color = args.no_color
-    if args.ascii is not None:
+    if getattr(args, "ascii", None) is not None:
         s.ascii = args.ascii
     return s
 
@@ -116,7 +137,11 @@ async def run_once(session: ChatSession, prompt: str, auto_approve: bool) -> int
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    settings = settings_from_args(args)
+    try:
+        settings = settings_from_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     client = HaasClient(settings.base_url, settings.tenant)
     session = ChatSession(client, settings)
 

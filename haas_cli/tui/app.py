@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from rich.syntax import Syntax
@@ -26,6 +28,7 @@ from textual.widgets import (
 
 from haas_cli.client import HaasAPIError, SSEEvent
 from haas_cli.completion import Completion, common_prefix, suggest
+from haas_cli.profiles import EnvironmentProfile, ProfileStore
 from haas_cli.session import (
     ChatSession,
     Decision,
@@ -156,10 +159,19 @@ class ApprovalScreen(ModalScreen[Decision | None]):
         Binding("escape", "leave_pending", "Leave pending"),
     ]
 
-    def __init__(self, calls: list[PendingCall], *, ascii: bool = False) -> None:
+    def __init__(
+        self,
+        calls: list[PendingCall],
+        *,
+        ascii: bool = False,
+        decisions_enabled: bool = True,
+        decision_disabled_reason: str | None = None,
+    ) -> None:
         super().__init__()
         self.calls = calls
         self.ascii = ascii
+        self.decisions_enabled = decisions_enabled
+        self.decision_disabled_reason = decision_disabled_reason
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-box"):
@@ -169,6 +181,8 @@ class ApprovalScreen(ModalScreen[Decision | None]):
                 "The agent wants to run the following action(s). Nothing runs until you approve.",
                 id="approval-sub",
             )
+            if self.decision_disabled_reason:
+                yield Static(self.decision_disabled_reason, classes="error-box")
             with VerticalScroll(id="approval-calls"):
                 for c in self.calls:
                     arguments = sanitize_terminal_text(
@@ -198,15 +212,24 @@ class ApprovalScreen(ModalScreen[Decision | None]):
                 yield Button("Leave pending  (Esc)", id="leave-pending")
 
     def on_mount(self) -> None:
-        if any(len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls):
+        if not self.decisions_enabled:
+            self.query_one("#approve", Button).disabled = True
+            self.query_one("#reject", Button).disabled = True
+        if any(
+            len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls
+        ):
             self.query_one("#approve", Button).disabled = True
         self.query_one("#leave-pending", Button).focus()
 
     def action_approve(self) -> None:
-        if not isinstance(self.focused, Input):
+        if self.decisions_enabled and not any(
+            len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls
+        ) and not isinstance(self.focused, Input):
             self.dismiss(Decision(True))
 
     def action_reject(self) -> None:
+        if not self.decisions_enabled:
+            return
         reason = self.query_one("#reason", Input).value.strip() or None
         self.dismiss(Decision(False, reason))
 
@@ -215,7 +238,7 @@ class ApprovalScreen(ModalScreen[Decision | None]):
 
     @on(Button.Pressed, "#approve")
     def _approve(self) -> None:
-        self.dismiss(Decision(True))
+        self.action_approve()
 
     @on(Button.Pressed, "#reject")
     def _reject(self) -> None:
@@ -269,12 +292,238 @@ class CancelRunScreen(ModalScreen[bool]):
         self.action_keep_running()
 
 
+class LoginScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="identity-box"):
+            yield Static("Sign in to HaaS", id="identity-title")
+            yield Static(
+                "The bearer credential is kept in memory for this process only.",
+                classes="note",
+            )
+            yield Input(
+                placeholder="API key or OIDC bearer token",
+                password=True,
+                id="credential",
+            )
+            yield Static("", id="identity-error")
+            with Horizontal(id="identity-buttons"):
+                yield Button("Sign in", variant="primary", id="identity-submit")
+                yield Button("Cancel", id="identity-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#credential", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit(self) -> None:
+        credential = self.query_one("#credential", Input).value.strip()
+        if not credential:
+            self.query_one("#identity-error", Static).update("Enter a credential.")
+            return
+        self.dismiss(credential)
+
+    @on(Input.Submitted, "#credential")
+    def _on_submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#identity-submit")
+    def _on_submit_button(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#identity-cancel")
+    def _on_cancel_button(self) -> None:
+        self.action_cancel()
+
+
+class TenantSwitchScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, current_tenant: str) -> None:
+        super().__init__()
+        self.current_tenant = current_tenant
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="identity-box"):
+            yield Static("Switch tenant", id="identity-title")
+            yield Static(
+                "The selected tenant is verified by the server before the switch.",
+                classes="note",
+            )
+            yield Input(value=self.current_tenant, placeholder="Tenant ID", id="tenant")
+            with Horizontal(id="identity-buttons"):
+                yield Button("Switch", variant="primary", id="tenant-submit")
+                yield Button("Cancel", id="tenant-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#tenant", Input).focus()
+        self.query_one("#tenant", Input).select_all()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit(self) -> None:
+        tenant = self.query_one("#tenant", Input).value.strip()
+        if tenant:
+            self.dismiss(tenant)
+
+    @on(Input.Submitted, "#tenant")
+    def _on_submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#tenant-submit")
+    def _on_submit_button(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#tenant-cancel")
+    def _on_cancel_button(self) -> None:
+        self.action_cancel()
+
+
+class ProfileSwitchScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self, profiles: list[EnvironmentProfile], current_profile: str
+    ) -> None:
+        super().__init__()
+        self.profile_names = {profile.name for profile in profiles}
+        self.current_profile = current_profile
+        self.profiles = profiles
+
+    def compose(self) -> ComposeResult:
+        summary = "\n".join(
+            f"{sanitize_terminal_text(profile.name, limit=64)}  |  "
+            f"{profile.environment}  |  "
+            f"{sanitize_terminal_text(profile.base_url, limit=120)}  |  "
+            f"{sanitize_terminal_text(profile.tenant, limit=64)}"
+            for profile in self.profiles
+        )
+        with Vertical(id="identity-box"):
+            yield Static("Switch environment profile", id="identity-title")
+            yield Static(summary, id="profile-list")
+            yield Input(
+                value=self.current_profile, placeholder="Profile name", id="profile"
+            )
+            with Horizontal(id="identity-buttons"):
+                yield Button("Use profile", variant="primary", id="profile-submit")
+                yield Button("Cancel", id="profile-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#profile", Input).focus()
+        self.query_one("#profile", Input).select_all()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit(self) -> None:
+        name = self.query_one("#profile", Input).value.strip()
+        if name in self.profile_names:
+            self.dismiss(name)
+        else:
+            self.query_one("#profile-list", Static).update(
+                f"Unknown profile {sanitize_terminal_text(name, limit=64)!r}."
+            )
+
+    @on(Input.Submitted, "#profile")
+    def _on_submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#profile-submit")
+    def _on_submit_button(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#profile-cancel")
+    def _on_cancel_button(self) -> None:
+        self.action_cancel()
+
+
+class AdminFormScreen(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        title: str,
+        fields: list[tuple[str, str, str]],
+        *,
+        json_value: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.form_title = title
+        self.fields = fields
+        self.json_value = json_value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="admin-form-box"):
+            yield Static(self.form_title, id="identity-title")
+            for field_id, label, placeholder in self.fields:
+                yield Static(label, classes="admin-field-label")
+                yield Input(placeholder=placeholder, id=f"admin-field-{field_id}")
+            if self.json_value is not None:
+                yield Static("Policy rules JSON", classes="admin-field-label")
+                yield TextArea(self.json_value, id="admin-form-json", language="json")
+            yield Static("", id="identity-error")
+            with Horizontal(id="identity-buttons"):
+                yield Button("Submit", variant="primary", id="admin-form-submit")
+                yield Button("Cancel", id="admin-form-cancel")
+
+    def on_mount(self) -> None:
+        if self.fields:
+            self.query_one(f"#admin-field-{self.fields[0][0]}", Input).focus()
+        elif self.json_value is not None:
+            self.query_one("#admin-form-json", TextArea).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit(self) -> None:
+        values = {
+            field_id: self.query_one(f"#admin-field-{field_id}", Input).value.strip()
+            for field_id, _, _ in self.fields
+        }
+        if any(not value for value in values.values()):
+            self.query_one("#identity-error", Static).update(
+                "Complete every required field."
+            )
+            return
+        if self.json_value is not None:
+            values["json"] = self.query_one("#admin-form-json", TextArea).text
+        self.dismiss(values)
+
+    @on(Input.Submitted)
+    def _on_input_submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#admin-form-submit")
+    def _on_submit(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed, "#admin-form-cancel")
+    def _on_cancel(self) -> None:
+        self.action_cancel()
+
+
 class NavigationCommands(Provider):
     @staticmethod
     def _commands() -> list[tuple[str, str, str]]:
         return [
             ("Open chat", "action_show_chat", "Go to the chat workspace"),
             ("Browse runs", "action_show_runs", "List and attach to tenant runs"),
+            (
+                "Tenant administration",
+                "action_show_admin",
+                "Manage tenant access and policy",
+            ),
+            ("Sign in", "action_login", "Authenticate with an API key or OIDC token"),
+            ("Sign out", "action_logout", "Clear the in-memory credential"),
+            (
+                "Switch tenant",
+                "action_switch_tenant",
+                "Verify and change tenant context",
+            ),
+            ("Switch profile", "action_switch_profile", "Choose a saved environment"),
             ("Refresh runs", "action_refresh_runs", "Reload the current run page"),
             (
                 "Attach to selected run",
@@ -334,7 +583,7 @@ class ChatApp(App[None]):
     #navigation { height: 3; padding: 0 1; align-vertical: middle; }
     #navigation Button { margin-right: 1; min-width: 12; }
     #workspaces { height: 1fr; }
-    #chat-workspace, #runs-workspace { height: 1fr; }
+    #chat-workspace, #runs-workspace, #admin-workspace { height: 1fr; }
     #chat { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }
     .user { margin: 1 0 0 0; color: $text; background: $boost; padding: 0 1; }
     .assistant { margin: 1 0 0 0; padding: 0 1; border-left: thick $success; }
@@ -354,9 +603,33 @@ class ChatApp(App[None]):
     #run-actions { height: 3; padding: 0 1; }
     #run-actions Button { margin-right: 1; }
     #run-detail { height: 3; padding: 0 1; color: $text-muted; }
+    #nav-admin { display: none; }
+    #admin-memberships, #admin-member-grant, #admin-member-revoke,
+    #admin-api-keys, #admin-key-create, #admin-key-revoke, #admin-policy-view,
+    #admin-policy-activate, #admin-plugin-inventory, #admin-audit,
+    #admin-audit-next { display: none; }
+    #admin-heading { height: 2; padding: 0 1; }
+    .admin-actions { height: 3; padding: 0 1; }
+    .admin-actions Button { margin-right: 1; }
+    #admin-output { height: 1fr; margin: 0 1; border: round $primary-darken-1; }
+    #admin-result { padding: 1; }
     #status { height: 1; background: $surface-darken-1; color: $text-muted; padding: 0 1; }
 
-    ApprovalScreen, CancelRunScreen { align: center middle; background: $background 70%; }
+    ApprovalScreen, CancelRunScreen, LoginScreen, TenantSwitchScreen, ProfileSwitchScreen {
+        align: center middle; background: $background 70%;
+    }
+    AdminFormScreen { align: center middle; background: $background 70%; }
+    #identity-box { width: 80%; max-width: 90; height: auto; border: thick $primary;
+        background: $surface; padding: 1 2; }
+    #identity-title { text-style: bold; color: $accent; }
+    #identity-buttons { height: auto; margin-top: 1; align-horizontal: right; }
+    #identity-buttons Button { margin-left: 2; }
+    #identity-error { color: $error; }
+    #profile-list { height: auto; max-height: 10; margin: 1 0; }
+    #admin-form-box { width: 80%; max-width: 90; height: auto; max-height: 90%;
+        border: thick $primary; background: $surface; padding: 1 2; }
+    .admin-field-label { margin-top: 1; color: $text-muted; }
+    #admin-form-json { height: 12; min-height: 6; margin-top: 1; }
     #approval-box { width: 80%; max-width: 100; height: auto; max-height: 85%;
         border: thick $warning; background: $surface; padding: 1 2; }
     #approval-title { text-style: bold; color: $warning; }
@@ -378,8 +651,10 @@ class ChatApp(App[None]):
         Binding("escape", "detach", "Detach run", show=True),
         Binding("ctrl+1", "show_chat", "Chat", show=True),
         Binding("ctrl+2", "show_runs", "Runs", show=True),
+        Binding("ctrl+3", "show_admin", "Admin", show=True),
         Binding("ctrl+r", "refresh_runs", "Refresh"),
         Binding("ctrl+t", "cycle_theme", "Theme"),
+        Binding("ctrl+shift+l", "login", "Sign in"),
         Binding("f1", "show_help", "Help"),
         Binding("f6", "focus_next", "Next focus"),
         Binding("ctrl+l", "clear_screen", "Clear"),
@@ -388,12 +663,19 @@ class ChatApp(App[None]):
     ]
 
     def __init__(
-        self, session: ChatSession, *, initial_prompt: str | None = None
+        self,
+        session: ChatSession,
+        *,
+        initial_prompt: str | None = None,
+        profile_store: ProfileStore | None = None,
     ) -> None:
         super().__init__()
         self.session = session
         self.initial_prompt = initial_prompt
+        self.profile_store = profile_store or ProfileStore()
+        self.identity: dict[str, Any] | None = None
         self.busy = False
+        self._submitting_run = False
         self.healthy: bool | None = None
         self._step = 0
         self._phase = ""
@@ -403,6 +685,7 @@ class ChatApp(App[None]):
         self._runs: dict[str, dict[str, Any]] = {}
         self._runs_cursor: str | None = None
         self._selected_run_id: str | None = None
+        self._audit_cursor: str | None = None
         self._ascii = session.settings.ascii
         self._loading_runs = False
         self._system_theme = self.theme
@@ -414,6 +697,7 @@ class ChatApp(App[None]):
         with Horizontal(id="navigation"):
             yield Button("Chat", id="nav-chat", variant="primary")
             yield Button("Runs", id="nav-runs")
+            yield Button("Admin", id="nav-admin")
             yield Button("Help", id="nav-help")
         with ContentSwitcher(initial="chat-workspace", id="workspaces"):
             with Vertical(id="chat-workspace"):
@@ -434,6 +718,32 @@ class ChatApp(App[None]):
                         disabled=True,
                     )
                 yield Static("Select a run to inspect or attach.", id="run-detail")
+            with Vertical(id="admin-workspace"):
+                yield Static(
+                    "Tenant administration | changes are authorized by the server",
+                    id="admin-heading",
+                )
+                with Horizontal(classes="admin-actions"):
+                    yield Button("List members", id="admin-memberships")
+                    yield Button("Grant member", id="admin-member-grant")
+                    yield Button("Revoke member", id="admin-member-revoke")
+                with Horizontal(classes="admin-actions"):
+                    yield Button("List API keys", id="admin-api-keys")
+                    yield Button("Create API key", id="admin-key-create")
+                    yield Button("Revoke API key", id="admin-key-revoke")
+                with Horizontal(classes="admin-actions"):
+                    yield Button("View policy", id="admin-policy-view")
+                    yield Button("Activate policy…", id="admin-policy-activate")
+                    yield Button("Scoped plugins", id="admin-plugin-inventory")
+                with Horizontal(classes="admin-actions"):
+                    yield Button("Audit events", id="admin-audit")
+                    yield Button("Audit next", id="admin-audit-next", disabled=True)
+                with VerticalScroll(id="admin-output"):
+                    yield Static(
+                        "Choose an administration action. Credentials are never "
+                        "saved by the TUI.",
+                        id="admin-result",
+                    )
         yield Static(id="status")
         yield Footer()
 
@@ -456,6 +766,7 @@ class ChatApp(App[None]):
         else:
             await self._add(Static(BANNER, classes="note"))
         await self._check_health()
+        self._refresh_admin_visibility()
         await self._note(
             (
                 "Type a task and press Enter | Ctrl+J newline | /help for commands "
@@ -497,15 +808,6 @@ class ChatApp(App[None]):
     async def _check_health(self) -> None:
         try:
             await self.session.client.health()
-            self.healthy = True
-            data = await self.session.plugins()
-            await self._note(
-                f"Connected to {self.session.settings.base_url} as tenant "
-                f"'{self.session.settings.tenant}' "
-                f"{'-' if self._ascii else '—'} {len(data['skills'])} skills, "
-                f"{len(data['tools'])} tools.",
-                style="green",
-            )
         except HaasAPIError as exc:
             self.healthy = False
             await self._add(
@@ -521,25 +823,122 @@ class ChatApp(App[None]):
                     classes="error-box",
                 )
             )
+            return
+
+        self.healthy = True
+        if self.session.client.credential:
+            try:
+                self._accept_identity(await self.session.client.identity())
+            except HaasAPIError as exc:
+                self._sync_auth_state()
+                await self._note(
+                    "Session could not be verified: "
+                    f"{sanitize_terminal_text(exc, limit=300)}",
+                    style="yellow" if exc.status == 401 else "red",
+                )
+        try:
+            data = await self.session.plugins()
+            await self._note(
+                f"Connected to {self.session.settings.base_url} as tenant "
+                f"'{self.session.settings.tenant}' "
+                f"{'-' if self._ascii else '—'} {len(data['skills'])} skills, "
+                f"{len(data['tools'])} tools.",
+                style="green",
+            )
+        except HaasAPIError as exc:
+            if exc.status == 401:
+                self._sync_auth_state()
+                await self._note(
+                    "Authentication required. Use Sign in or the /login command.",
+                    style="yellow",
+                )
+            elif exc.status == 403:
+                await self._note(
+                    "Connected, but this identity cannot read the plugin catalog.",
+                    style="yellow",
+                )
+            else:
+                await self._note(
+                    f"Connected, but the plugin catalog is unavailable: "
+                    f"{sanitize_terminal_text(exc, limit=300)}",
+                    style="red",
+                )
+
+    @staticmethod
+    def _validate_identity(identity: Any) -> dict[str, Any]:
+        if (
+            not isinstance(identity, dict)
+            or not isinstance(identity.get("tenant_id"), str)
+            or not isinstance(identity.get("principal_id"), str)
+            or not isinstance(identity.get("roles"), list)
+            or not all(isinstance(role, str) for role in identity["roles"])
+            or not isinstance(identity.get("credential_type"), str)
+            or identity.get("environment") not in ("dev", "staging", "prod")
+        ):
+            raise HaasAPIError("Identity response is malformed.", 502)
+        return identity
+
+    def _accept_identity(self, identity: Any) -> dict[str, Any]:
+        verified = self._validate_identity(identity)
+        self.identity = verified
+        self.session.settings.environment = verified["environment"]
+        self._refresh_admin_visibility()
+        return verified
+
+    def _sync_auth_state(self) -> None:
+        if self.session.client.auth_expired:
+            self.session.settings.credential = None
+            self.identity = None
+            self._refresh_admin_visibility()
+            self._refresh_bars()
 
     def _refresh_bars(self) -> None:
         s = self.session.settings
         state = {True: "UP", False: "DOWN", None: "?"}[self.healthy]
         endpoint = sanitize_terminal_text(s.base_url, limit=160)
         tenant = sanitize_terminal_text(s.tenant, limit=100)
+        environment = s.environment.upper()
+        principal = (
+            sanitize_terminal_text(
+                str(self.identity.get("principal_id", ""))[:8], limit=8
+            )
+            if self.identity
+            else "auth required"
+            if self.session.client.auth_expired
+            else "signed out"
+        )
+        identity_roles = self.identity.get("roles", []) if self.identity else []
+        roles = (
+            ",".join(role for role in identity_roles if isinstance(role, str))
+            if isinstance(identity_roles, list)
+            else ""
+        )
         if self._ascii:
-            self._main("#topbar", Static).update(
-                Text(f"{state} {endpoint} | tenant {tenant} | theme {s.theme}")
+            text = Text(
+                f"{state} {environment} {s.profile_name} {endpoint} | "
+                f"tenant {tenant} | {principal} {roles} | theme {s.theme}"
             )
         else:
             dot = {True: "●", False: "●", None: "●"}[self.healthy]
             color = {True: "green", False: "red", None: "yellow"}[self.healthy]
             text = Text()
             text.append(f"{dot} ", style=color)
+            if s.environment == "prod":
+                text.append("PRODUCTION ", style="bold reverse red")
+            else:
+                text.append(f"{environment} ", style="dim")
+            text.append(sanitize_terminal_text(s.profile_name, limit=40), style="bold")
+            text.append("  ")
             text.append(endpoint)
             text.append("  tenant ", style="dim")
             text.append(tenant, style="bold")
-            self._main("#topbar", Static).update(text)
+            text.append("  as ", style="dim")
+            text.append(principal, style="bold")
+            if roles:
+                text.append(
+                    f" [{sanitize_terminal_text(roles, limit=80)}]", style="dim"
+                )
+        self._main("#topbar", Static).update(text)
         parts = [
             f"thread {sanitize_terminal_text(s.thread_id or '(new)', limit=48)}",
             f"step {self._step}" if self.busy else "idle",
@@ -657,6 +1056,27 @@ class ChatApp(App[None]):
                 classes="user",
             )
         )
+        parts = line.strip().split(maxsplit=1)
+        command = parts[0].lower()
+        argument = parts[1] if len(parts) == 2 else None
+        if command == "/login":
+            await self.action_login()
+            return
+        if command == "/logout":
+            await self.action_logout()
+            return
+        if command == "/tenant":
+            await self.action_switch_tenant(argument)
+            return
+        if command == "/profile":
+            await self.action_switch_profile(argument)
+            return
+        if command == "/admin":
+            await self.action_show_admin()
+            return
+        if command == "/approve":
+            await self.action_review_approval(argument)
+            return
         result = await handle_command(self.session, line)
         if result.quit:
             self.exit()
@@ -693,6 +1113,7 @@ class ChatApp(App[None]):
             )
         )
         self.busy, self._step, self._phase = True, 0, "submitting"
+        self._submitting_run = True
         self._tool_cards.clear()
         self._tool_names.clear()
         self._refresh_bars()
@@ -711,6 +1132,7 @@ class ChatApp(App[None]):
             )
             raise
         except HaasAPIError as exc:
+            self._sync_auth_state()
             self.healthy = exc.status is not None
             await self._add(
                 Static(
@@ -726,13 +1148,32 @@ class ChatApp(App[None]):
             )
         finally:
             self.busy = False
+            self._submitting_run = False
             self._phase = ""
             self._refresh_bars()
             self._main("#prompt", PromptInput).focus()
 
     async def _on_approval(self, calls: list[PendingCall]) -> Decision | None:
         self._phase = "waiting for approval"
-        decision = await self.push_screen_wait(ApprovalScreen(calls, ascii=self._ascii))
+        roles = self.identity.get("roles", []) if self.identity else []
+        decisions_enabled = self.identity is None or (
+            isinstance(roles, list)
+            and "approver" in roles
+            and not self._submitting_run
+        )
+        decision = await self.push_screen_wait(
+            ApprovalScreen(
+                calls,
+                ascii=self._ascii,
+                decisions_enabled=decisions_enabled,
+                decision_disabled_reason=(
+                    "This identity cannot approve this action. Leave it pending, then use "
+                    "/approve <run-id> with a separate approver credential."
+                    if not decisions_enabled
+                    else None
+                ),
+            )
+        )
         if decision is None:
             await self._note(
                 "Approval left pending on the server. Attach to the run again to review it.",
@@ -756,6 +1197,12 @@ class ChatApp(App[None]):
         if ev.event == "run_queued":
             self.healthy = True
             self._phase = "queued"
+            run_id = d.get("run_id")
+            if isinstance(run_id, str):
+                await self._note(
+                    f"Run ID: {sanitize_terminal_text(run_id, limit=64)}",
+                    style="dim",
+                )
         elif ev.event == "step_started":
             self._step = int(d.get("step", self._step))
             model = sanitize_terminal_text(d.get("model", ""), limit=160)
@@ -864,6 +1311,449 @@ class ChatApp(App[None]):
 
     # ---- actions ------------------------------------------------------------------------
 
+    async def action_login(self) -> None:
+        if self.busy:
+            await self._note(
+                "Detach from the active run before changing identity.", style="yellow"
+            )
+            return
+        credential = await self.push_screen_wait(LoginScreen())
+        if credential is None:
+            return
+        old_credential = self.session.client.credential
+        old_identity = self.identity
+        self.session.client.set_credential(credential)
+        try:
+            identity = self._accept_identity(await self.session.client.identity())
+        except HaasAPIError as exc:
+            if old_credential is not None:
+                self.session.client.set_credential(old_credential)
+                self.session.settings.credential = old_credential
+                self.identity = old_identity
+            else:
+                self.session.client.set_credential(None)
+                self.session.settings.credential = None
+                self.identity = None
+            await self._note(
+                f"Sign in failed: {sanitize_terminal_text(exc, limit=300)}",
+                style="red",
+            )
+            self._refresh_bars()
+            return
+        self.session.settings.credential = credential
+        self.identity = identity
+        self.session.new_conversation()
+        self._refresh_bars()
+        await self._note(
+            f"Signed in for tenant {self.session.settings.tenant} "
+            f"with role(s): {', '.join(identity['roles']) or 'none'}.",
+            style="green",
+        )
+
+    async def action_logout(self) -> None:
+        if self.busy:
+            await self._note(
+                "Detach from the active run before changing identity.", style="yellow"
+            )
+            return
+        self.session.client.set_credential(None)
+        self.session.settings.credential = None
+        self.identity = None
+        self._refresh_admin_visibility()
+        self.session.new_conversation()
+        self._refresh_bars()
+        await self._note(
+            "Signed out. The credential was cleared from memory.", style="yellow"
+        )
+
+    async def action_switch_tenant(self, tenant: str | None = None) -> None:
+        if self.busy:
+            await self._note(
+                "Detach from the active run before changing tenant.", style="yellow"
+            )
+            return
+        if not self.session.client.credential or self.identity is None:
+            await self._note("Sign in before switching tenants.", style="yellow")
+            return
+        selected = tenant or await self.push_screen_wait(
+            TenantSwitchScreen(self.session.settings.tenant)
+        )
+        if not selected or selected == self.session.settings.tenant:
+            return
+        previous_tenant = self.session.client.tenant
+        self.session.client.tenant = selected
+        try:
+            identity = self._accept_identity(await self.session.client.identity())
+        except HaasAPIError as exc:
+            self.session.client.tenant = previous_tenant
+            self._sync_auth_state()
+            await self._note(
+                f"Tenant switch rejected: {sanitize_terminal_text(exc, limit=300)}",
+                style="red",
+            )
+            self._refresh_bars()
+            return
+        self.session.settings.tenant = selected
+        self.identity = identity
+        self.session.new_conversation()
+        self._refresh_bars()
+        await self._note(f"Switched to tenant {selected}.", style="green")
+
+    async def action_switch_profile(self, profile_name: str | None = None) -> None:
+        if self.busy:
+            await self._note(
+                "Detach from the active run before changing profiles.", style="yellow"
+            )
+            return
+        try:
+            profiles = self.profile_store.profiles()
+        except ValueError as exc:
+            await self._note(str(exc), style="red")
+            return
+        if not profiles:
+            await self._note(
+                "No saved profiles. Create one with `haas profile add`.",
+                style="yellow",
+            )
+            return
+        selected = profile_name or await self.push_screen_wait(
+            ProfileSwitchScreen(profiles, self.session.settings.profile_name)
+        )
+        if not selected:
+            return
+        try:
+            profile = self.profile_store.get(selected)
+        except ValueError as exc:
+            await self._note(str(exc), style="red")
+            return
+        if profile is None:
+            await self._note(f"Profile {selected!r} no longer exists.", style="red")
+            return
+
+        old_url = self.session.settings.base_url
+        old_tenant = self.session.settings.tenant
+        old_identity = self.identity
+        self.session.client.set_connection(profile.base_url, profile.tenant)
+        identity = None
+        if self.session.client.credential:
+            try:
+                identity = self._validate_identity(await self.session.client.identity())
+            except HaasAPIError as exc:
+                self.session.client.set_connection(old_url, old_tenant)
+                self._sync_auth_state()
+                if not self.session.client.auth_expired:
+                    self.identity = old_identity
+                await self._note(
+                    f"Profile could not be verified: "
+                    f"{sanitize_terminal_text(exc, limit=300)}",
+                    style="red",
+                )
+                self._refresh_bars()
+                return
+        try:
+            self.profile_store.activate(profile.name)
+        except (OSError, ValueError) as exc:
+            self.session.client.set_connection(old_url, old_tenant)
+            self.identity = old_identity
+            await self._note(str(exc), style="red")
+            self._refresh_bars()
+            return
+        self.session.settings.profile_name = profile.name
+        self.session.settings.base_url = profile.base_url
+        self.session.settings.tenant = profile.tenant
+        self.session.settings.environment = profile.environment
+        self.identity = None
+        self._refresh_admin_visibility()
+        if identity is not None:
+            self._accept_identity(identity)
+        self.session.new_conversation()
+        await self._check_health()
+        self._refresh_bars()
+
+    def _has_admin_role(self) -> bool:
+        return bool(self.identity and "tenant_admin" in self.identity["roles"])
+
+    def _has_audit_role(self) -> bool:
+        return bool(
+            self.identity
+            and {"tenant_admin", "auditor"}.intersection(self.identity["roles"])
+        )
+
+    def _refresh_admin_visibility(self) -> None:
+        try:
+            button = self._main("#nav-admin", Button)
+            button.display = self._has_audit_role()
+            for selector in (
+                "#admin-memberships",
+                "#admin-member-grant",
+                "#admin-member-revoke",
+                "#admin-api-keys",
+                "#admin-key-create",
+                "#admin-key-revoke",
+                "#admin-policy-view",
+                "#admin-policy-activate",
+                "#admin-plugin-inventory",
+            ):
+                self._main(selector, Button).display = self._has_admin_role()
+            for selector in ("#admin-audit", "#admin-audit-next"):
+                self._main(selector, Button).display = self._has_audit_role()
+            if (
+                not self._has_audit_role()
+                and self._main("#workspaces", ContentSwitcher).current
+                == "admin-workspace"
+            ):
+                self._switch_workspace("chat-workspace")
+        except NoMatches:
+            return
+
+    async def _admin_form(
+        self,
+        title: str,
+        fields: list[tuple[str, str, str]],
+        *,
+        json_value: str | None = None,
+    ) -> dict[str, str] | None:
+        if not self._has_admin_role():
+            await self._note(
+                "Tenant administration requires the tenant_admin role.",
+                style="yellow",
+            )
+            return None
+        if self.busy:
+            await self._note(
+                "Detach from the active run before changing tenant administration.",
+                style="yellow",
+            )
+            return None
+        return await self.push_screen_wait(
+            AdminFormScreen(title, fields, json_value=json_value)
+        )
+
+    async def _admin_execute(
+        self,
+        label: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> None:
+        if not self._has_admin_role():
+            await self._note(
+                "Tenant administration requires the tenant_admin role.",
+                style="yellow",
+            )
+            return
+        try:
+            result = await operation()
+            content = json.dumps(result, indent=2, default=str)
+            if label == "Create API key":
+                content = (
+                    "The API credential is shown once. Copy it now; the TUI will not "
+                    "save it.\n\n"
+                    + content
+                )
+            self._main("#admin-result", Static).update(
+                Text(sanitize_terminal_text(content, limit=MAX_RENDERED_OUTPUT))
+            )
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            self._main("#admin-result", Static).update(
+                Text(
+                    f"{label} failed: {sanitize_terminal_text(exc, limit=500)}",
+                    style="red",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self._main("#admin-result", Static).update(
+                Text(
+                    f"{label} failed: {sanitize_terminal_text(exc, limit=500)}",
+                    style="red",
+                )
+            )
+
+    async def action_admin_list_memberships(self) -> None:
+        await self._admin_execute(
+            "List memberships", self.session.client.list_memberships
+        )
+
+    async def action_admin_grant_membership(self) -> None:
+        values = await self._admin_form(
+            "Grant tenant membership",
+            [
+                ("subject", "Principal subject", "OIDC subject or service identity"),
+                ("kind", "Principal kind: human or service", "service"),
+                (
+                    "role",
+                    "Role: tenant_admin, submitter, approver, auditor",
+                    "submitter",
+                ),
+            ],
+        )
+        if values is None:
+            return
+        if values["kind"] not in ("human", "service"):
+            await self._note("Kind must be human or service.", style="red")
+            return
+        if values["role"] not in (
+            "tenant_admin",
+            "submitter",
+            "approver",
+            "auditor",
+        ):
+            await self._note("Unknown tenant role.", style="red")
+            return
+        await self._admin_execute(
+            "Grant membership",
+            lambda: self.session.client.grant_membership(
+                subject=values["subject"],
+                kind=values["kind"],
+                role=values["role"],
+            ),
+        )
+
+    async def action_admin_revoke_membership(self) -> None:
+        values = await self._admin_form(
+            "Revoke tenant membership",
+            [
+                ("principal", "Principal ID", "UUID"),
+                (
+                    "role",
+                    "Role to revoke",
+                    "tenant_admin, submitter, approver, or auditor",
+                ),
+            ],
+        )
+        if values is None:
+            return
+        if values["role"] not in (
+            "tenant_admin",
+            "submitter",
+            "approver",
+            "auditor",
+        ):
+            await self._note("Unknown tenant role.", style="red")
+            return
+        await self._admin_execute(
+            "Revoke membership",
+            lambda: self.session.client.revoke_membership(
+                values["principal"], values["role"]
+            ),
+        )
+
+    async def action_admin_list_api_keys(self) -> None:
+        await self._admin_execute("List API keys", self.session.client.list_api_keys)
+
+    async def action_admin_create_api_key(self) -> None:
+        values = await self._admin_form(
+            "Create tenant API key",
+            [
+                ("principal", "Principal ID", "UUID of an active tenant member"),
+                ("name", "Key name", "automation"),
+                ("expires", "Expires in days (1–365)", "90"),
+            ],
+        )
+        if values is None:
+            return
+        try:
+            expires_in_days = int(values["expires"])
+        except ValueError:
+            await self._note("Expiration must be a number of days.", style="red")
+            return
+        if not 1 <= expires_in_days <= 365:
+            await self._note("Expiration must be between 1 and 365 days.", style="red")
+            return
+        await self._admin_execute(
+            "Create API key",
+            lambda: self.session.client.create_api_key(
+                principal_id=values["principal"],
+                name=values["name"],
+                expires_in_days=expires_in_days,
+            ),
+        )
+
+    async def action_admin_revoke_api_key(self) -> None:
+        values = await self._admin_form(
+            "Revoke tenant API key",
+            [("key", "API key ID", "UUID")],
+        )
+        if values is None:
+            return
+        await self._admin_execute(
+            "Revoke API key",
+            lambda: self.session.client.revoke_api_key(values["key"]),
+        )
+
+    async def action_admin_view_policy(self) -> None:
+        await self._admin_execute(
+            "View tenant policy", self.session.client.get_tenant_policy
+        )
+
+    async def action_admin_plugin_inventory(self) -> None:
+        await self._admin_execute(
+            "View scoped plugin inventory", self.session.client.plugins
+        )
+
+    async def action_admin_activate_policy(self) -> None:
+        values = await self._admin_form(
+            "Activate policy revision",
+            [],
+            json_value='{\n  "model_providers": [],\n  "models": []\n}',
+        )
+        if values is None:
+            return
+        try:
+            rules = json.loads(values["json"])
+        except json.JSONDecodeError as exc:
+            await self._note(f"Policy JSON is invalid: {exc.msg}.", style="red")
+            return
+        if not isinstance(rules, dict):
+            await self._note("Policy JSON must be an object.", style="red")
+            return
+        await self._admin_execute(
+            "Activate policy",
+            lambda: self.session.client.activate_tenant_policy(rules),
+        )
+
+    async def action_admin_audit_events(self, *, next_page: bool = False) -> None:
+        if not self._has_audit_role():
+            await self._note(
+                "Audit access requires the tenant_admin or auditor role.",
+                style="yellow",
+            )
+            return
+        cursor = self._audit_cursor if next_page else None
+        try:
+            result = await self.session.client.list_audit_events(
+                limit=50, cursor=cursor
+            )
+            next_cursor = result.get("next_cursor")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise ValueError("Audit response contains an invalid cursor.")
+            if not isinstance(result.get("items"), list):
+                raise ValueError("Audit response contains an invalid items field.")
+            self._audit_cursor = next_cursor
+            self._main("#admin-audit-next", Button).disabled = next_cursor is None
+            self._main("#admin-result", Static).update(
+                Text(
+                    sanitize_terminal_text(
+                        json.dumps(result, indent=2, default=str),
+                        limit=MAX_RENDERED_OUTPUT,
+                    )
+                )
+            )
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            self._main("#admin-result", Static).update(
+                Text(
+                    f"Audit query failed: {sanitize_terminal_text(exc, limit=500)}",
+                    style="red",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self._main("#admin-result", Static).update(
+                Text(
+                    f"Audit query failed: {sanitize_terminal_text(exc, limit=500)}",
+                    style="red",
+                )
+            )
+
     def _switch_workspace(self, workspace: str) -> None:
         self._main("#workspaces", ContentSwitcher).current = workspace
         self._main("#nav-chat", Button).variant = (
@@ -871,6 +1761,104 @@ class ChatApp(App[None]):
         )
         self._main("#nav-runs", Button).variant = (
             "primary" if workspace == "runs-workspace" else "default"
+        )
+        self._main("#nav-admin", Button).variant = (
+            "primary" if workspace == "admin-workspace" else "default"
+        )
+
+    async def action_show_admin(self) -> None:
+        if not self._has_audit_role():
+            await self._note(
+                "Tenant administration requires tenant_admin or auditor access.",
+                style="yellow",
+            )
+            return
+        self._switch_workspace("admin-workspace")
+
+    async def action_admin_audit_next(self) -> None:
+        await self.action_admin_audit_events(next_page=True)
+
+    async def action_review_approval(self, run_id: str | None = None) -> None:
+        if self.busy:
+            await self._note(
+                "Detach from the active run before reviewing another approval.",
+                style="yellow",
+            )
+            return
+        if not self.identity or "approver" not in self.identity["roles"]:
+            await self._note(
+                "Reviewing pending actions requires the approver role.", style="yellow"
+            )
+            return
+        if not run_id:
+            await self._note("Usage: /approve <run-id>", style="yellow")
+            return
+        try:
+            run = await self.session.client.get_run(run_id)
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            await self._note(
+                f"Could not inspect run {sanitize_terminal_text(run_id, limit=64)}: "
+                f"{sanitize_terminal_text(exc, limit=400)}",
+                style="red",
+            )
+            return
+        raw_calls = run.get("pending_tool_calls")
+        if run.get("status") != "input_required" or not isinstance(raw_calls, list):
+            await self._note(
+                f"Run {sanitize_terminal_text(run_id, limit=64)} has no pending approval.",
+                style="yellow",
+            )
+            return
+        calls: list[PendingCall] = []
+        for item in raw_calls:
+            if not isinstance(item, dict):
+                await self._note("The approval data from the API is malformed.", style="red")
+                return
+            function = item.get("function")
+            function_data = function if isinstance(function, dict) else {}
+            call_id = item.get("id", item.get("tool_call_id"))
+            name = item.get("name", function_data.get("name"))
+            arguments = item.get("arguments", function_data.get("arguments", {}))
+            if not isinstance(call_id, str) or not isinstance(name, str):
+                await self._note("The approval data from the API is malformed.", style="red")
+                return
+            calls.append(PendingCall(call_id, name, arguments))
+        if not calls:
+            await self._note(
+                f"Run {sanitize_terminal_text(run_id, limit=64)} has no pending approval.",
+                style="yellow",
+            )
+            return
+
+        decision = await self.push_screen_wait(
+            ApprovalScreen(calls, ascii=self._ascii)
+        )
+        if decision is None:
+            await self._note(
+                f"Approval for {sanitize_terminal_text(run_id, limit=64)} remains pending.",
+                style="yellow",
+            )
+            return
+        try:
+            result = await self.session.client.resume(
+                run_id,
+                decision.approved,
+                rejection_reason=decision.reason,
+            )
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            await self._note(
+                f"Approval decision was not accepted: "
+                f"{sanitize_terminal_text(exc, limit=400)}",
+                style="red",
+            )
+            return
+        verb = "Approved" if decision.approved else "Rejected"
+        await self._note(
+            f"{verb} pending actions for {sanitize_terminal_text(run_id, limit=64)}; "
+            f"server status: {sanitize_terminal_text(result.get('status', 'unknown'), limit=32)}.",
+            style="green" if decision.approved else "yellow",
         )
 
     async def action_show_chat(self) -> None:
@@ -885,7 +1873,8 @@ class ChatApp(App[None]):
     async def action_show_help(self) -> None:
         self._switch_workspace("chat-workspace")
         await self._note(
-            "Ctrl+1 Chat | Ctrl+2 Runs | Ctrl+P command palette | F6 next focus | "
+            "Ctrl+1 Chat | Ctrl+2 Runs | Ctrl+3 Admin/audit (authorized roles) | "
+            "Ctrl+P command palette | F6 next focus | "
             "Esc detaches locally (server run continues). In Runs, select a row to "
             "attach or request cooperative cancellation. Cancellation cannot stop an "
             "external call already in progress.",
@@ -944,6 +1933,7 @@ class ChatApp(App[None]):
             )
             raise
         except HaasAPIError as exc:
+            self._sync_auth_state()
             await self._note(f"{self._symbol('✘', 'ERROR')} {exc}", style="red")
         finally:
             self.busy = False
@@ -963,6 +1953,7 @@ class ChatApp(App[None]):
         try:
             await self.session.client.cancel_run(run_id)
         except HaasAPIError as exc:
+            self._sync_auth_state()
             self._main("#run-detail", Static).update(
                 Text(
                     f"Cancellation request failed: {sanitize_terminal_text(exc, limit=500)}",
@@ -1018,6 +2009,7 @@ class ChatApp(App[None]):
                 table.move_cursor(row=0)
                 self._select_run(str(items[0]["run_id"]))
         except HaasAPIError as exc:
+            self._sync_auth_state()
             self._main("#run-detail", Static).update(
                 Text(
                     f"Could not load runs: {sanitize_terminal_text(exc, limit=500)}",
@@ -1077,9 +2069,57 @@ class ChatApp(App[None]):
     async def _on_nav_runs(self) -> None:
         await self.action_show_runs()
 
+    @on(Button.Pressed, "#nav-admin")
+    async def _on_nav_admin(self) -> None:
+        await self.action_show_admin()
+
     @on(Button.Pressed, "#nav-help")
     async def _on_nav_help(self) -> None:
         await self.action_show_help()
+
+    @on(Button.Pressed, "#admin-memberships")
+    async def _on_admin_memberships(self) -> None:
+        await self.action_admin_list_memberships()
+
+    @on(Button.Pressed, "#admin-member-grant")
+    async def _on_admin_member_grant(self) -> None:
+        await self.action_admin_grant_membership()
+
+    @on(Button.Pressed, "#admin-member-revoke")
+    async def _on_admin_member_revoke(self) -> None:
+        await self.action_admin_revoke_membership()
+
+    @on(Button.Pressed, "#admin-api-keys")
+    async def _on_admin_api_keys(self) -> None:
+        await self.action_admin_list_api_keys()
+
+    @on(Button.Pressed, "#admin-key-create")
+    async def _on_admin_key_create(self) -> None:
+        await self.action_admin_create_api_key()
+
+    @on(Button.Pressed, "#admin-key-revoke")
+    async def _on_admin_key_revoke(self) -> None:
+        await self.action_admin_revoke_api_key()
+
+    @on(Button.Pressed, "#admin-policy-view")
+    async def _on_admin_policy_view(self) -> None:
+        await self.action_admin_view_policy()
+
+    @on(Button.Pressed, "#admin-policy-activate")
+    async def _on_admin_policy_activate(self) -> None:
+        await self.action_admin_activate_policy()
+
+    @on(Button.Pressed, "#admin-plugin-inventory")
+    async def _on_admin_plugin_inventory(self) -> None:
+        await self.action_admin_plugin_inventory()
+
+    @on(Button.Pressed, "#admin-audit")
+    async def _on_admin_audit(self) -> None:
+        await self.action_admin_audit_events()
+
+    @on(Button.Pressed, "#admin-audit-next")
+    async def _on_admin_audit_next(self) -> None:
+        await self.action_admin_audit_next()
 
     @on(Button.Pressed, "#runs-refresh")
     async def _on_runs_refresh(self) -> None:

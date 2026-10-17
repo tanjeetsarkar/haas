@@ -10,7 +10,7 @@ services:
     image: haas-distributed:3.0.0
     command: uvicorn mock_services:app --app-dir /mock --host 0.0.0.0 --port 9000
     ports:
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:${HAAS_MOCK_PORT:-9000}:9000"
     volumes:
       - ./tests/e2e:/mock:ro
     depends_on:

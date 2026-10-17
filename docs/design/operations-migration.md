@@ -151,7 +151,7 @@ Implement in dependency order. This is a plan, not a claim these features are pr
 | Phase | Changes | Exit gate / rollback boundary |
 |---|---|---|
 | 0. Baseline qualification | Preserve current API/E2E behavior; document exposed ports, trusted plugins and data handling | Baseline tests pass; no untrusted production tenants |
-| 1. Identity and tenant authority | IdP/gateway + verified API context, membership/RBAC, tenant status, model/destination/skill policy, scoped inventory | SEC-01/02/13; legacy mode development-only; reject unverified internal routes |
+| 1. Identity and tenant authority | Provider-neutral OIDC/API-key verification and registry foundation; complete membership/RBAC, tenant status, model/destination/skill policy, scoped inventory | SEC-01/02/13; legacy mode development-only; reject unverified internal routes |
 | 2. Tenant-aware schema | Versioned migrations, tenant registry, composite constraints/RLS, exact cost types, agent/policy/plugin revision records | SEC-03 and migration count/ownership checks; expand/backfill/validate before contract |
 | 3. Durable workflow correctness | Steps/invocations, thread claims, state versions/leases, approval batches/decisions, outbox/inbox/events, usage ledger and reconciliation | SEC-06/07/15; crash-boundary matrix and supported effect dedupe |
 | 4. Execution and credentials | Static-only privileged catalog, immutable artifacts, per-run sandbox supervisor, credential broker, egress mediation, artifact service | SEC-04/05/08/09/12; no raw secrets on transport; all P0 controls complete |

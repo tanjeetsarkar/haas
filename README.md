@@ -26,6 +26,34 @@ Current behavior and target requirements are explicitly separated. Authenticated
 tenancy, RBAC/RLS, durable dispatch recovery and per-run sandboxing are production
 design requirements, not implemented guarantees of the current Compose stack.
 
+## Deterministic local development
+
+The `haas dev` stack is isolated from the regular Compose project, uses a deterministic mock
+model and billing service, binds published ports to loopback, and does not use real provider
+credentials:
+
+```bash
+uv pip install -e ".[tui]"      # once; installs the `haas` and TUI commands
+haas dev up
+haas dev status
+haas dev seed                  # prints one-time admin/submitter and approver keys
+haas chat --url http://127.0.0.1:18000 --tenant local-dev
+# In the TUI, run /login and paste the admin/submitter key.
+haas dev down                  # preserves local database/Redis volumes
+```
+
+The default local ports are API `18000`, PostgreSQL `15432`, Redis `16379`, Flower `15555`,
+and the mock service `19000`. Override them with `HAAS_DEV_API_PORT`,
+`HAAS_DEV_POSTGRES_PORT`, `HAAS_DEV_REDIS_PORT`, `HAAS_DEV_FLOWER_PORT`, and
+`HAAS_DEV_MOCK_PORT`. The seed operation is restricted to `HAAS_PROFILE=dev` and a local
+PostgreSQL host. It creates an active `local-dev` tenant, a tenant-admin/submitter principal,
+a separate approver principal, a mock-only policy, and two hashed, expiring test keys. Both
+clear credentials are printed once and are never written to profiles. The separate approver
+preserves the no-self-approval rule; use the admin/submitter key to create a run and the
+approver key to inspect/approve its pending action in the TUI with `/approve <run-id>` or
+through the API. The queued run ID is displayed in the chat. Use
+`haas dev seed --rotate-key` to revoke and replace both keys.
+
 ## Repository layout
 
 * [app/](app/): FastAPI API, shared core modules, and Celery workers.
@@ -51,10 +79,19 @@ curl -X POST -H 'X-Tenant-ID: fin-ops' -H 'Content-Type: application/json' \
      -d '{"approved": true}' "localhost:8000/v1/runs/$RUN_ID/resume"         # HITL gate
 ```
 
-All endpoints take `X-Tenant-ID` (default `default-tenant`). Tenant identity is **trusted from the header**;
-this is development/demo behavior only. `HAAS_PROFILE=prod` fails startup until authenticated tenancy
-lands in Phase 1. The base Compose file does not publish Redis/PostgreSQL ports or start Flower;
-the dev overlay adds loopback-only ports and Flower. Do not combine the dev overlay with production.
+The development profile accepts `X-Tenant-ID` (default `default-tenant`) as a local
+selector. It is **not authentication**. The Phase 1 identity foundation now verifies
+provider-neutral OIDC JWTs or tenant-scoped API keys against active tenant memberships,
+and role-based action checks protect run, plugin, tenant administration and audit routes.
+Approvers are separated from submitters; tenant policy revisions, membership/key
+administration and append-only audit are available through the API and `haas` clients.
+Phase 1 identity and tenant-authority controls are now qualified, but this is not a
+production/GA claim: RLS, worker-time policy revocation, mediated egress and other later-phase
+controls remain tracked in the roadmap. Production API startup requires complete HTTPS OIDC
+configuration and the production encryption key; authenticated runs also require an active
+tenant policy revision.
+The base Compose file does not publish Redis/PostgreSQL ports or start Flower; the dev
+overlay adds loopback-only ports and Flower. Do not combine the dev overlay with production.
 
 ## Chat TUI
 
@@ -66,6 +103,10 @@ haas-chat --preload weather     # activate a skill from the first message
 
 Full navigation guide (screen layout, keys, slash commands, approvals, secrets, recipes, troubleshooting):
 [docs/tui_usage.md](docs/tui_usage.md).
+Verified identities with tenant-admin or auditor roles also get an Admin workspace for
+authorized membership, API-key, policy, scoped-plugin and audit workflows. The unified
+`haas` CLI currently includes `chat`, `profile`, `admin`, and `dev` commands; other CLI
+surfaces remain roadmap work.
 
 ## Plugins: skills and tools
 
@@ -99,8 +140,13 @@ Authoring guide: [plugins/_templates/README.md](plugins/_templates/README.md).
 
 Operator controls (identical for the API and every worker; see [.env.example](.env.example)):
 `PLUGINS_ALLOW`, `PLUGINS_DENY`, `PLUGINS_EXTRA_DIRS`, `PLUGINS_STRICT`, `SKILLS_PROMPT_MAX_CHARS`,
-`TENANT_SKILL_ALLOWLISTS`. `POST /v1/runs` accepts an optional `skills` list that can only narrow the tenant's
-allowlist; `GET /v1/plugins` reports plugin status and the registry fingerprint. Upgrading from the flat
+`TENANT_SKILL_ALLOWLISTS` applies to development header-tenancy only. Authenticated tenants instead require an
+active immutable policy revision: exact model/provider grants, plugin digest and skill grants, webhook host
+grants, budget ceilings and retention class. `POST /v1/runs` accepts an optional `skills` list that can only
+narrow those grants; authenticated `GET /v1/plugins` returns only the scoped catalog. Use `haas admin`
+or the TUI Admin workspace to author policy revisions and administer members/API keys; authenticated
+tenants without an active revision are deliberately denied run admission. Human membership grants
+require a configured OIDC issuer. Upgrading from the flat
 `plugins/skills|tools|manifests` layout: run `haas-plugin migrate` once.
 
 Set `FLOWER_BASIC_AUTH` in `.env` to protect the Flower UI. The sample billing endpoints

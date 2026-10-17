@@ -35,6 +35,36 @@ class Settings(BaseSettings):
     flower_enabled: bool = False
     flower_basic_auth: str = ""
     otel_exporter_otlp_endpoint: str | None = None
+    oidc_issuer: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("HAAS_OIDC_ISSUER", "oidc_issuer"),
+    )
+    oidc_audience: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("HAAS_OIDC_AUDIENCE", "oidc_audience"),
+    )
+    oidc_jwks_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("HAAS_OIDC_JWKS_URL", "oidc_jwks_url"),
+    )
+    bootstrap_tenant_slug: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_BOOTSTRAP_TENANT_SLUG", "bootstrap_tenant_slug"
+        ),
+    )
+    bootstrap_admin_issuer: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_BOOTSTRAP_ADMIN_ISSUER", "bootstrap_admin_issuer"
+        ),
+    )
+    bootstrap_admin_subject: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_BOOTSTRAP_ADMIN_SUBJECT", "bootstrap_admin_subject"
+        ),
+    )
 
     # Plugin policy (comma-separated plugin ids). `deny` always wins; a non-empty `allow` is
     # exclusive. Extra roots rank below `plugins_dir` when the same plugin id appears twice.
@@ -119,11 +149,41 @@ def validate_profile_settings(
         return
 
     errors: list[str] = []
-    if role == "api":
+    oidc_values = (config.oidc_issuer, config.oidc_audience, config.oidc_jwks_url)
+    configured_oidc_values = tuple(
+        value for value in oidc_values if value and value.strip()
+    )
+    if configured_oidc_values and len(configured_oidc_values) != len(oidc_values):
         errors.append(
-            "production tenancy authentication is not implemented; "
-            "the current API trusts X-Tenant-ID (complete Phase 1 first)"
+            "HAAS_OIDC_ISSUER, HAAS_OIDC_AUDIENCE and HAAS_OIDC_JWKS_URL must be configured together"
         )
+    if (
+        role == "api"
+        and config.haas_profile == "prod"
+        and not configured_oidc_values
+    ):
+        errors.append(
+            "HAAS_OIDC_ISSUER, HAAS_OIDC_AUDIENCE and HAAS_OIDC_JWKS_URL "
+            "are required for production API identity."
+        )
+    if config.haas_profile == "prod" and config.oidc_issuer is not None:
+        if not config.oidc_issuer.startswith("https://"):
+            errors.append("HAAS_OIDC_ISSUER must use HTTPS in production")
+    if config.haas_profile == "prod" and config.oidc_jwks_url is not None:
+        if not config.oidc_jwks_url.startswith("https://"):
+            errors.append("HAAS_OIDC_JWKS_URL must use HTTPS in production")
+
+    bootstrap_values = (
+        config.bootstrap_tenant_slug,
+        config.bootstrap_admin_issuer,
+        config.bootstrap_admin_subject,
+    )
+    if any(bootstrap_values) and not all(bootstrap_values):
+        errors.append(
+            "HAAS_BOOTSTRAP_TENANT_SLUG, HAAS_BOOTSTRAP_ADMIN_ISSUER and "
+            "HAAS_BOOTSTRAP_ADMIN_SUBJECT must be configured together"
+        )
+
     encryption_key = config.secret_encryption_key
     if role != "tools" and not encryption_key:
         errors.append("HAAS_SECRET_ENCRYPTION_KEY is required in production")

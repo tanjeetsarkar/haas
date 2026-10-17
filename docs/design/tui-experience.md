@@ -2,19 +2,22 @@
 
 [Design index](README.md) | [Developer platform](developer-platform.md) | [Roadmap: Track T](../roadmap.md#track-t--terminal-experience) | [Current TUI guide](../tui_usage.md)
 
-**Status: TARGET, not implemented.** This is the terminal product direction and its
-qualification contract. Track T in the roadmap owns delivery and status. Retain Textual
-and evolve `haas-chat` into `haas chat`; do not rewrite the UI framework or wait for a web UI.
-The existing chat remains a supported entry point, not the only application screen.
+**Status: PARTIALLY IMPLEMENTED.** This is the terminal product direction and qualification
+contract; Track T in the roadmap owns delivery and status. The Textual workbench now includes
+Chat, Runs, authenticated profiles/tenant switching, and role-aware tenant administration
+under both `haas chat` and the `haas-chat` alias. Remaining journeys ship with their backend
+milestones; do not rewrite the UI framework or wait for a web UI.
 
 ## 1. Baseline and ambition
 
-Today the TUI has multiline composition, command completion, prompt history, Markdown
-answers, tool previews, model/step/cost indicators, approval dialogs, and SSE reconnect.
-It is primarily one attached conversation. The internal client still uses trusted tenant
-headers. The Phase 0 API's run listing and cancellation are not exposed by the TUI.
-Persistent server-side browsing, authenticated profiles, revision management, marketplace
-consent, distributed agent inspection, and operator workflows are not present.
+The shipped TUI has multiline composition, command completion, prompt history, Markdown
+answers, tool previews, model/step/cost indicators, approval dialogs, SSE reconnect, cursor
+run browsing/reattach/cooperative cancellation, verified bearer identity, named non-secret
+profiles, tenant switching, and role-gated membership/API-key/policy/scoped-inventory/audit
+workflows. The client verifies the tenant with `/v1/me`; unauthenticated development mode
+still uses the header only as a local selector. Agent revisions, persistent thread/history
+browsing, capability metadata, marketplace consent, distributed-agent inspection and
+operator workflows remain roadmap work.
 
 The target is an **agent mission control terminal**: a welcoming chat for first-time users,
 a precise execution workbench for developers, and an authorized control surface for

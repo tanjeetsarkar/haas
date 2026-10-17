@@ -2,28 +2,46 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import Button, DataTable, Markdown, Static
+from textual.widgets import Button, DataTable, Input, Markdown, Static
 
 from haas_cli.client import HaasClient
 from haas_cli.config import ChatSettings
-from haas_cli.session import ChatSession
-from haas_cli.tui.app import ApprovalScreen, CancelRunScreen, ChatApp, PromptInput
+from haas_cli.session import ChatSession, Decision
+from haas_cli.profiles import EnvironmentProfile, ProfileStore
+from haas_cli.tui.app import (
+    ApprovalScreen,
+    AdminFormScreen,
+    CancelRunScreen,
+    ChatApp,
+    LoginScreen,
+    PromptInput,
+)
 
 from fake_haas import FakeHaas
 
 
-def make_app(fake: FakeHaas, *, ascii: bool = False, no_color: bool = False) -> ChatApp:
+def make_app(
+    fake: FakeHaas,
+    *,
+    ascii: bool = False,
+    no_color: bool = False,
+    credential: str | None = None,
+    profile_store: ProfileStore | None = None,
+    environment: str = "unknown",
+) -> ChatApp:
     session = ChatSession(
         HaasClient("http://api", "t1", transport=fake.transport(), reconnect_delay=0),
         ChatSettings(
             base_url="http://api",
             tenant="t1",
+            credential=credential,
+            environment=environment,
             secrets={"TOK": "supersecretvalue"},
             ascii=ascii,
             no_color=no_color,
         ),
     )
-    return ChatApp(session)
+    return ChatApp(session, profile_store=profile_store)
 
 
 async def wait_for(pilot, predicate, timeout=5.0):
@@ -59,6 +77,137 @@ async def test_connects_and_shows_banner():
         assert "api" in str(app.query_one("#topbar", Static).render())
 
 
+async def test_login_logout_and_production_identity_banner():
+    fake = FakeHaas()
+    app = make_app(fake, environment="prod")
+    async with app.run_test(size=(120, 40)) as pilot:
+        assert "PRODUCTION" in str(app.query_one("#topbar", Static).render())
+        app.run_worker(app.action_login(), group="login")
+        await wait_for(pilot, lambda: isinstance(app.screen, LoginScreen))
+        app.screen.query_one("#credential", Input).value = "hk_test_memory_only"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: app.identity is not None)
+        assert app.session.client.credential == "hk_test_memory_only"
+        assert (
+            fake.identity_headers[-1]["authorization"] == "Bearer hk_test_memory_only"
+        )
+        assert "as principa" in str(app.query_one("#topbar", Static).render())
+
+        await app.action_logout()
+        assert app.session.client.credential is None
+        assert app.session.settings.credential is None
+        assert app.identity is None
+
+
+async def test_tenant_switch_is_server_verified_and_clears_thread():
+    fake = FakeHaas()
+    app = make_app(fake, credential="hk_test_session")
+    async with app.run_test(size=(120, 40)):
+        assert app.identity is not None
+        app.session.settings.thread_id = "old-thread"
+        await app.action_switch_tenant("t2")
+        assert app.session.settings.tenant == "t2"
+        assert app.session.settings.thread_id is None
+
+        await app.action_switch_tenant("not-authorized")
+        assert app.session.settings.tenant == "t2"
+        assert app.session.client.tenant == "t2"
+
+
+async def test_expired_session_clears_credential_and_updates_banner():
+    fake = FakeHaas()
+    app = make_app(fake, credential="hk_test_expiring")
+    async with app.run_test(size=(120, 40)):
+        assert app.identity is not None
+        fake.auth_rejected = True
+        await app.action_show_runs()
+
+        assert app.session.client.credential is None
+        assert app.session.settings.credential is None
+        assert app.identity is None
+        assert "auth required" in str(app.query_one("#topbar", Static).render())
+
+
+async def test_profile_switch_updates_context_without_persisting_credentials(tmp_path):
+    fake = FakeHaas()
+    fake.environment = "staging"
+    profiles = ProfileStore(tmp_path / "profiles.json")
+    profiles.save(
+        EnvironmentProfile("staging", "https://staging.example.test", "t2", "staging")
+    )
+    app = make_app(fake, credential="hk_test_memory_only", profile_store=profiles)
+    async with app.run_test(size=(120, 40)):
+        await app.action_switch_profile("staging")
+        assert app.session.settings.profile_name == "staging"
+        assert app.session.settings.environment == "staging"
+        assert app.session.settings.tenant == "t2"
+        assert app.session.client.credential == "hk_test_memory_only"
+        assert profiles.active() is not None
+        assert "hk_test_memory_only" not in profiles.path.read_text()
+
+
+async def test_admin_workspace_is_role_gated_and_shows_one_time_api_key(monkeypatch):
+    fake = FakeHaas()
+    fake.roles = ["tenant_admin"]
+    app = make_app(fake, credential="hk_test_admin")
+    async with app.run_test(size=(120, 40)):
+        assert app.query_one("#nav-admin", Button).display
+        await app.action_show_admin()
+        assert app.query_one("#workspaces").current == "admin-workspace"
+
+        await app.action_admin_list_memberships()
+        assert "principal-1" in str(app.query_one("#admin-result", Static).render())
+        await app.action_admin_plugin_inventory()
+        assert "revenue-ops" in str(app.query_one("#admin-result", Static).render())
+
+        async def submit_form(_screen):
+            assert isinstance(_screen, AdminFormScreen)
+            return {
+                "principal": "principal-1",
+                "name": "tui-test",
+                "expires": "30",
+            }
+
+        monkeypatch.setattr(app, "push_screen_wait", submit_form)
+        await app.action_admin_create_api_key()
+        output = str(app.query_one("#admin-result", Static).render())
+        assert "hk_test_one_time" in output
+        assert "shown once" in output
+        assert fake.admin_requests[-1] == (
+            "POST",
+            "/v1/admin/api-keys",
+            {
+                "principal_id": "principal-1",
+                "name": "tui-test",
+                "expires_in_days": 30,
+            },
+        )
+
+
+async def test_auditor_can_open_audit_but_not_tenant_admin_controls():
+    fake = FakeHaas()
+    fake.roles = ["auditor"]
+    app = make_app(fake, credential="hk_test_auditor")
+    async with app.run_test(size=(120, 40)):
+        assert app.query_one("#nav-admin", Button).display
+        assert not app.query_one("#admin-member-grant", Button).display
+        await app.action_show_admin()
+        await app.action_admin_audit_events()
+        assert fake.admin_requests[-1][:2] == (
+            "GET",
+            "/v1/audit-events",
+        )
+
+
+async def test_non_admin_cannot_call_tenant_admin_endpoints_from_tui():
+    fake = FakeHaas()
+    app = make_app(fake, credential="hk_test_submitter")
+    async with app.run_test(size=(120, 40)):
+        assert not app.query_one("#nav-admin", Button).display
+        await app.action_admin_list_memberships()
+        assert fake.admin_requests == []
+
+
 async def test_unreachable_api_shows_error_banner():
     app = make_app(FakeHaas(healthy=False))
     async with app.run_test(size=(120, 40)) as pilot:
@@ -75,8 +224,97 @@ async def test_simple_chat_turn_renders_markdown_answer():
         await send(pilot, app, "hi")
         await wait_for(pilot, lambda: "Hello there" in chat_text(app) and not app.busy)
         assert "❯ hi" in chat_text(app)
+        assert "Run ID: run_1" in chat_text(app)
         assert "$0.0010" in str(app.query_one("#status", Static).render())
         assert app.query_one("#prompt", PromptInput).text == ""
+
+
+async def test_authenticated_submitter_cannot_approve_own_run():
+    fake = FakeHaas()
+    app = make_app(fake, credential="hk_test_submitter")
+    async with app.run_test(size=(120, 40)) as pilot:
+        await send(pilot, app, "refund please")
+        await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen))
+        assert app.screen.query_one("#approve", Button).disabled
+        assert app.screen.query_one("#reject", Button).disabled
+        assert "separate approver credential" in str(app.screen.query(".error-box")[0].render())
+        await pilot.press("y")
+        assert isinstance(app.screen, ApprovalScreen)
+        await pilot.press("n")
+        assert isinstance(app.screen, ApprovalScreen)
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: not app.busy)
+        assert fake.resumes == []
+
+
+async def test_approver_can_review_and_approve_known_pending_run(monkeypatch):
+    fake = FakeHaas()
+    fake.roles = ["approver"]
+    app = make_app(fake, credential="hk_test_approver")
+    async with app.run_test(size=(120, 40)):
+        screens: list[ApprovalScreen] = []
+
+        async def approve(screen):
+            assert isinstance(screen, ApprovalScreen)
+            screens.append(screen)
+            return Decision(True)
+
+        monkeypatch.setattr(app, "push_screen_wait", approve)
+        await app._run_command("/approve run_1")
+        assert len(screens) == 1
+        assert [call.name for call in screens[0].calls] == ["prepare_refund_batch"]
+        assert fake.resumes == [{"approved": True, "secrets": {}}]
+
+
+async def test_approve_command_rejects_unauthorized_identity():
+    fake = FakeHaas()
+    app = make_app(fake, credential="hk_test_submitter")
+    async with app.run_test(size=(120, 40)):
+        await app._run_command("/approve run_1")
+        assert "requires the approver role" in chat_text(app)
+        assert fake.resumes == []
+
+
+async def test_approve_command_rejects_nonpending_and_malformed_data():
+    fake = FakeHaas()
+    fake.roles = ["approver"]
+    fake.run_status = "completed"
+    app = make_app(fake, credential="hk_test_approver")
+    async with app.run_test(size=(120, 40)):
+        await app._run_command("/approve run_1")
+        assert "has no pending approval" in chat_text(app)
+
+        fake.run_status = "input_required"
+        fake.pending_tool_calls = [{"name": "missing-call-id"}]
+        await app._run_command("/approve run_1")
+        assert "approval data from the API is malformed" in chat_text(app)
+        assert fake.resumes == []
+
+
+async def test_approver_can_reject_or_leave_pending(monkeypatch):
+    fake = FakeHaas()
+    fake.roles = ["approver"]
+    app = make_app(fake, credential="hk_test_approver")
+    async with app.run_test(size=(120, 40)):
+        async def reject(screen):
+            assert isinstance(screen, ApprovalScreen)
+            return Decision(False, "not today")
+
+        monkeypatch.setattr(app, "push_screen_wait", reject)
+        await app._run_command("/approve run_1")
+        assert fake.resumes == [
+            {"approved": False, "secrets": {}, "rejection_reason": "not today"}
+        ]
+
+        fake.resumes.clear()
+
+        async def leave_pending(screen):
+            assert isinstance(screen, ApprovalScreen)
+            return None
+
+        monkeypatch.setattr(app, "push_screen_wait", leave_pending)
+        await app._run_command("/approve run_1")
+        assert fake.resumes == []
 
 
 async def test_approval_flow_approve_with_key():
@@ -187,8 +425,7 @@ async def test_cancel_failure_is_visible_and_does_not_claim_success():
         await app.action_show_runs()
         app.run_worker(app.action_cancel_selected(), group="cancel")
         await wait_for(pilot, lambda: isinstance(app.screen, CancelRunScreen))
-        await pilot.click("#confirm-cancel")
-        await pilot.pause(0.2)
+        await pilot.press("y")
         await wait_for(
             pilot,
             lambda: (

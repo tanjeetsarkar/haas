@@ -54,6 +54,9 @@ class ChatSession:
     skill_names: list[str] = field(default_factory=list)  # cached for completion
     _costed_runs: set[str] = field(default_factory=set, repr=False)
 
+    def __post_init__(self) -> None:
+        self.client.set_credential(self.settings.credential)
+
     async def plugins(self) -> dict[str, Any]:
         data = await self.client.plugins()
         self.skill_names = [s["name"] for s in data["skills"]]
@@ -222,6 +225,12 @@ class CommandResult:
 
 COMMAND_HELP: list[tuple[str, str]] = [
     ("/help", "Show this help"),
+    ("/login", "Sign in with an API key or OIDC bearer token (memory only)"),
+    ("/logout", "Clear the in-memory credential"),
+    ("/tenant [id]", "Verify and switch the authenticated tenant"),
+    ("/profile [name]", "Switch to a saved environment profile"),
+    ("/admin", "Open role-authorized tenant administration and audit"),
+    ("/approve <run-id>", "Review and resolve a pending run approval as an approver"),
     ("/status", "Connection, thread, models, budgets, secrets (names only)"),
     ("/skills", "List installed skills"),
     ("/tools", "List registered tools (⚠ = needs approval)"),

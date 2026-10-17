@@ -49,15 +49,23 @@ def test_secret_envelope_rejects_missing_or_invalid_key(monkeypatch):
         encrypt_secrets("run-1", {"TOKEN": "value"})
 
 
-def test_production_profile_fails_closed(monkeypatch):
+def test_production_profile_requires_identity_and_encryption():
     production = Settings(
         _env_file=None,
         haas_profile="prod",
         secret_encryption_key=base64.b64encode(b"x" * 32).decode(),
         openrouter_api_key="configured-provider-key",
+        oidc_issuer="https://identity.example.test/",
+        oidc_audience="haas-api",
+        oidc_jwks_url="https://identity.example.test/jwks",
     )
-    with pytest.raises(ValueError, match="tenancy authentication is not implemented"):
-        validate_profile_settings(production, role="api")
+    validate_profile_settings(production, role="api")
+
+    no_oidc = production.model_copy(
+        update={"oidc_issuer": None, "oidc_audience": None, "oidc_jwks_url": None}
+    )
+    with pytest.raises(ValueError, match="required for production API identity"):
+        validate_profile_settings(no_oidc, role="api")
 
     missing_key = production.model_copy(update={"secret_encryption_key": None})
     with pytest.raises(ValueError, match="HAAS_SECRET_ENCRYPTION_KEY"):
@@ -79,15 +87,16 @@ def test_production_profile_fails_closed(monkeypatch):
         validate_profile_settings(flower_open, role="tools")
 
 
-def test_api_lifespan_refuses_production_header_tenancy(monkeypatch):
-    monkeypatch.setattr(settings, "haas_profile", "prod")
-
-    async def start():
-        async with app.router.lifespan_context(app):
-            pytest.fail("unqualified production API unexpectedly started")
-
-    with pytest.raises(ValueError, match="tenancy authentication is not implemented"):
-        asyncio.run(start())
+def test_production_api_can_pass_phase_one_configuration_gate():
+    production = Settings(
+        _env_file=None,
+        haas_profile="prod",
+        secret_encryption_key=base64.b64encode(b"x" * 32).decode(),
+        oidc_issuer="https://identity.example.test/",
+        oidc_audience="haas-api",
+        oidc_jwks_url="https://identity.example.test/jwks",
+    )
+    validate_profile_settings(production, role="api")
 
 
 def test_dev_profile_retains_local_defaults():
@@ -97,12 +106,16 @@ def test_dev_profile_retains_local_defaults():
 def test_production_compose_does_not_publish_stores_or_flower():
     root = Path(__file__).resolve().parents[1]
     base = yaml.safe_load((root / "docker-compose.yml").read_text())["services"]
+    production = yaml.safe_load((root / "docker-compose.prod.yml").read_text())[
+        "services"
+    ]
     development = yaml.safe_load((root / "docker-compose.dev.yml").read_text())[
         "services"
     ]
     assert "ports" not in base["redis"]
     assert "ports" not in base["postgres"]
     assert "flower" not in base
+    assert "flower" not in production
     assert all(
         port.startswith("127.0.0.1:")
         for service in ("redis", "postgres", "flower")

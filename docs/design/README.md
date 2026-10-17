@@ -43,9 +43,11 @@ DFD arrows name the data being transferred; architecture arrows name protocols o
 * **GAP:** a difference between current code and the production target.
 
 Do not interpret a target diagram, target API field, SLO, or threat-control requirement
-as an implemented feature. There is no authentication service, tenant membership
-database, RLS policy, outbox dispatcher, Kubernetes deployment, or per-run sandbox
-in the current repository.
+as an implemented feature. The provider-neutral OIDC/API-key verifier, tenant registry
+and initial action-level RBAC for existing API routes are implemented, but production
+API startup remains fail-closed until the full RBAC and tenant-policy surfaces are
+deployed. There is no RLS policy, outbox dispatcher, Kubernetes
+deployment, or per-run sandbox in the current repository.
 
 ## Evidence and precedence
 

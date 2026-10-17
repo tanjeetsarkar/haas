@@ -19,7 +19,7 @@ here named `NNNN-short-title.md` using the template below, and are added to the 
 | ADR-11 | Namespaced plugins with per-run tool aliases | Accepted |
 | ADR-12 | Sub-agents are child runs with attenuated delegation and budget slices | Accepted |
 | ADR-13 | Sandbox runtime selection (gVisor / Kata / Firecracker) | Open — roadmap `p4-sandbox-runtime` |
-| ADR-14 | Identity provider and secret manager abstraction | Open — roadmap `p1-authn`, `p4-credential-broker` |
+| [ADR-14](0014-provider-neutral-identity.md) | Provider-neutral identity and secret-manager boundary | Partially accepted — OIDC/API-key contract; secret manager open |
 | ADR-15 | Delegation token format (Biscuit vs macaroons vs signed JSON) | Open — roadmap `a-attenuation-budget` |
 | ADR-16 | Docs portal and SDK generation toolchain | Open — roadmap `d-api-contract` |
 

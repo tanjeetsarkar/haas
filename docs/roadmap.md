@@ -108,13 +108,13 @@ All new Track T items are targets, not implemented features.
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p1-authn | OIDC JWT (JWKS rotation) + tenant-scoped hashed API keys; header stripping | p0-profiles, t0-qualification | SEC-01 | ⬜ |
-| p1-tenant-registry | Tenants, principals, memberships, lifecycle state machine, revocation epoch, bootstrap admin | p0-migrations, t0-qualification | SEC-02 | ⬜ |
-| p1-rbac | Policy decision point; admin/submitter/approver/auditor/operator/break-glass | p1-authn, p1-tenant-registry | SEC-02, SEC-13 | ⬜ |
-| p1-tenant-policy | Deny-by-default models, destinations, plugin grants, budgets, retention (replaces `TENANT_SKILL_ALLOWLISTS`) | p1-rbac | SEC-04 | ⬜ |
-| p1-admin-api | Tenant/member/API-key/policy endpoints + CLI | p1-rbac, p1-tenant-policy | SEC-13 | ⬜ |
-| p1-scoped-inventory | Grant-filtered `/v1/plugins`; Flower behind operator auth or removed in prod | p1-tenant-policy | TM-15 | ⬜ |
-| p1-audit-v1 | Append-only audit with verified actor | p1-rbac | SEC-13 | ⬜ |
+| p1-authn | OIDC JWT (JWKS rotation) + tenant-scoped hashed API keys; header stripping | p0-profiles, t0-qualification | SEC-01 | ✅ |
+| p1-tenant-registry | Tenants, principals, memberships, lifecycle state machine, revocation epoch, bootstrap admin | p0-migrations, t0-qualification | SEC-02 | ✅ |
+| p1-rbac | Deny-by-default action policy; separated submitter/approver, auditor/operator isolation; break-glass remains actionless without a separately approved grant | p1-authn, p1-tenant-registry | SEC-02, SEC-13 | ✅ |
+| p1-tenant-policy | Immutable deny-by-default policy revisions; exact models, plugin digests/skills, webhook hosts, budgets and retention | p1-rbac | SEC-04 | ✅ |
+| p1-admin-api | Tenant/member/API-key/policy endpoints + CLI | p1-rbac, p1-tenant-policy | SEC-13 | ✅ |
+| p1-scoped-inventory | Grant-filtered `/v1/plugins`; Flower omitted from production Compose and loopback-only in dev | p1-tenant-policy | TM-15 | ✅ |
+| p1-audit-v1 | Append-only audit with verified actor | p1-rbac | SEC-13 | ✅ |
 
 ## Phase 2 — Tenant-aware schema
 
@@ -184,8 +184,8 @@ All new Track T items are targets, not implemented features.
 | d-capabilities | Versioned identity-scoped feature/action capabilities and event-schema compatibility metadata; never substitutes for server authorization | d-api-contract, p1-rbac | TUI-02, TUI-07 | ⬜ |
 | d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
 | d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
-| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | ⬜ |
-| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | ⬜ |
+| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | 🚧 |
+| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | 🚧 |
 | d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ⬜ |
 | d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | ⬜ |
 | d-openai-compat | `/v1/chat/completions` + Responses facade over agent revisions | p2-agent-revisions, p3-durable-events | SEC-24 | ⬜ |
@@ -204,8 +204,8 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | t0-foundation | Before P1 | Adaptive shell, navigation/command palette, contextual help, themes/no-color/ASCII, focus navigation, bounded safe content rendering | p0-profiles | TUI-04, TUI-05 | ✅ |
 | t0-run-control | Before P1 | Cursor run browser, filter where supported, attach/reattach, explicit cooperative cancel vs detach, problem details, masked secret form; migrate Esc approval behavior with docs/tests | t0-foundation, p0-quick-wins | TUI-01, TUI-03, TUI-05 | ✅ |
 | t0-qualification | Before P1 | Pilot/snapshot/resize regression baseline, keyboard journeys and mock-API fault fixtures; document finite replay and current cancellation limits | t0-run-control | TUI-01, TUI-03..05 | ✅ |
-| t1-identity | P1 | Login/logout, credential-store or memory-only sessions, environment profiles, tenant switching, auth expiry/revocation and production banner | t0-qualification, p1-authn, p1-tenant-registry | TUI-02, SEC-26 | ⬜ |
-| t1-administration | P1 | Authorized membership/API-key/policy workflows, scoped plugin inventory, audit view and capability-aware actions | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | ⬜ |
+| t1-identity | P1 | Login/logout, credential-store or memory-only sessions, environment profiles, tenant switching, auth expiry/revocation and production banner | t0-qualification, p1-authn, p1-tenant-registry | TUI-02, SEC-26 | ✅ |
+| t1-administration | P1 | Role-gated membership/API-key/policy workflows, scoped plugin inventory and audit paging; capability metadata integration remains pending | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | 🚧 |
 | t2-agents | P2 | Draft/validate/publish agent revisions, structured configuration, revision/permission diff and pinned run launcher | t1-administration, p2-agent-revisions | FR-14, TUI-01, TUI-02 | ⬜ |
 | t2-threads | P2 | Persistent thread/history browser, search/paging contracts, explicit branch and active-run/version conflict recovery | t1-identity, t0-run-control, p2-thread-fencing | SEC-15, TUI-03 | ⬜ |
 | t3-inspector | P3 | Searchable durable timeline, plans/attempts/tool evidence, replay/gap/reconnect states, correlation IDs, unknown-effect and recovery explanations | t2-threads, p3-steps-invocations, p3-durable-events | TUI-01, TUI-03 | ⬜ |
@@ -265,20 +265,25 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 
 ---
 
-## Current Phase 0 execution
+## Current qualification status
 
-Unit/static checks, live PostgreSQL migration qualification, and the full Compose E2E
-suite have passed locally. `p0-ci` and `p0-baseline-tests` remain 🚧 until the GitHub
-workflow is green on `main`. The `prod` profile intentionally refuses to serve requests
-until Phase 1 replaces header-derived tenant identity.
+Phase 1 identity and tenant authority are implemented and their RBAC, policy and scoped
+inventory gates are qualified. Approval/rejection decisions and tenant administration
+mutations have verified-actor append-only audit records. A `break_glass` membership has no
+actions or grant endpoint; separately approved, time-limited access remains unavailable.
+Production API startup requires complete HTTPS OIDC configuration and a production
+encryption key; authenticated run admission still fails closed without an active policy.
+`haas dev` provides a distinct loopback-only Compose project with deterministic mocks and
+local test-key seeding. Remaining release work includes scoped capability metadata,
+automated quickstart and full CI qualification. `p0-ci` and `p0-baseline-tests` remain 🚧
+until the GitHub workflow is green on `main`.
 
-## Next execution wave — Terminal bridge, then identity
+## Next execution wave — Finish Phase 1 qualification
 
-Complete `t0-foundation` → `t0-run-control` → `t0-qualification` before beginning
-Phase 1 implementation. These are new planned items, not retroactive claims that the
-Phase 0 API changes already upgraded the terminal. Then deliver `t1-identity` and
-`t1-administration` alongside their Phase 1 APIs. The remaining T waves follow the
-capability milestones above; preserve a working, releasable chat experience at every step.
+The Phase 1 identity, tenant authority, policy, audit and scoped inventory rows are
+complete. T1 administration remains in progress until scoped capability metadata is
+integrated. The local-dev stack still needs an automated CI quickstart, and CI/baseline
+qualification remains open; subsequent T waves ship with their backend capabilities.
 
 ## Open decisions
 

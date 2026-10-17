@@ -154,6 +154,21 @@ class FakeHaas:
         self.run_status = "input_required"
         self.list_error: str | None = None
         self.cancel_error: str | None = None
+        self.auth_rejected = False
+        self.allowed_tenants = {"t1", "t2"}
+        self.environment = "dev"
+        self.identity_headers: list[dict[str, str]] = []
+        self.roles = ["submitter"]
+        self.admin_requests: list[tuple[str, str, Any]] = []
+        self.pending_tool_calls: Any = [
+            {
+                "id": "c2",
+                "function": {
+                    "name": "prepare_refund_batch",
+                    "arguments": '{"invoice_ids": ["inv_3002"]}',
+                },
+            }
+        ]
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -164,8 +179,45 @@ class FakeHaas:
             raise httpx.ConnectError("connection refused")
         if path == "/healthz":
             return httpx.Response(200, json={"status": "ok"})
+        if path == "/v1/me":
+            self.identity_headers.append(dict(request.headers))
+            if self.auth_rejected or not request.headers.get("authorization"):
+                return httpx.Response(401, json={"detail": "Authentication required."})
+            tenant = request.headers.get("x-tenant-id", "")
+            if tenant not in self.allowed_tenants:
+                return httpx.Response(403, json={"detail": "Tenant access denied."})
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": tenant,
+                    "principal_id": "principal-1234",
+                    "roles": self.roles,
+                    "credential_type": "api_key",
+                    "environment": self.environment,
+                },
+            )
+        if self.auth_rejected and path.startswith("/v1/"):
+            return httpx.Response(401, json={"detail": "Authentication expired."})
         if path == "/v1/plugins":
             return httpx.Response(200, json=PLUGINS)
+        if path.startswith("/v1/admin/") or path == "/v1/audit-events":
+            body = json.loads(request.content) if request.content else None
+            self.admin_requests.append((request.method, path, body))
+            if path == "/v1/admin/memberships" and request.method == "GET":
+                result = {"items": [{"principal_id": "principal-1", "role": "submitter"}]}
+            elif path == "/v1/admin/api-keys" and request.method == "POST":
+                result = {
+                    "key_id": "key-1",
+                    "credential": "hk_test_one_time",
+                    "name": body["name"],
+                }
+            elif path == "/v1/admin/policy" and request.method == "GET":
+                result = {"active": None}
+            elif path == "/v1/audit-events":
+                result = {"items": [], "next_cursor": None}
+            else:
+                result = {"ok": True}
+            return httpx.Response(200, json=result)
         if path == "/v1/runs" and request.method == "GET":
             if self.list_error:
                 return httpx.Response(503, json={"detail": self.list_error})
@@ -250,15 +302,7 @@ class FakeHaas:
                     "step_count": 2,
                     "total_cost_usd": 0.0,
                     "active_skills": ["revenue-ops"],
-                    "pending_tool_calls": [
-                        {
-                            "id": "c2",
-                            "function": {
-                                "name": "prepare_refund_batch",
-                                "arguments": '{"invoice_ids": ["inv_3002"]}',
-                            },
-                        }
-                    ]
+                    "pending_tool_calls": self.pending_tool_calls
                     if self.run_status == "input_required"
                     else None,
                     "result": "Run cancelled."

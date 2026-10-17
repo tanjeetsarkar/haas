@@ -247,8 +247,13 @@ Constraints:
 3. Runtime loading imports modules, registers handlers/endpoints and verifies declared capabilities.
 4. Failed registrations are rolled back and reported; strict mode fails startup.
 5. Readiness requires all skill tools to exist. Hidden skills are preload-only.
-6. Effective skill access is tenant policy narrowed by request; active skills unlock tools.
-7. Restart API/workers to reload. Fingerprint drift warns but does not pin execution.
+6. Authenticated effective skill access comes from the active tenant policy's exact
+   plugin digest and skill grants, narrowed by request; active skills unlock tools.
+   Development header mode continues to use `TENANT_SKILL_ALLOWLISTS`.
+7. Restart API/workers to reload. Runs pin the policy revision and keep the existing
+   global registry fingerprint diagnostic. Admission compares each grant with the
+   installed plugin digest, but workers do not yet revalidate policy revocation or
+   safely load immutable artifacts.
 
 See [authoring templates](../../plugins/_templates/README.md). Installed packs are not
 untrusted tenant uploads. Direct native network calls must implement their own safe
@@ -338,8 +343,13 @@ original run receipt; a different digest returns 409.
 7. Tenant auditor reviews redacted usage and decision history; administrators rotate
    bindings, revoke capabilities or suspend service without editing past run provenance.
 
-Administration APIs and authenticated CLI/UI support for this journey still need to
-be implemented; current `/v1` examples above do not provision tenants or agents.
+Tenant identity, membership, API-key, policy and audit APIs are implemented with
+authenticated `haas admin` and TUI workflows. Tenant provisioning starts with the
+bootstrap command; immutable agent revisions remain a Phase 2 capability, so the
+current `/v1` examples do not provision agents. Production API startup accepts only a
+complete HTTPS OIDC configuration and the production encryption-key requirements;
+authenticated run admission still fails closed when no valid active tenant policy exists.
+Development examples continue to use the local-only `X-Tenant-ID` compatibility path.
 
 ### Execution envelope
 

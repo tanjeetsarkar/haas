@@ -4,7 +4,8 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, NoReturn
+from urllib.parse import quote
 
 import httpx
 
@@ -78,12 +79,15 @@ class HaasClient:
         base_url: str,
         tenant: str = "default-tenant",
         *,
+        credential: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         max_reconnects: int = 5,
         reconnect_delay: float = 1.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.tenant = tenant
+        self.credential = credential
+        self.auth_expired = False
         self.max_reconnects = max_reconnects
         self.reconnect_delay = reconnect_delay
         # No read timeout: the stream is silent while the server blocks on Redis.
@@ -98,7 +102,26 @@ class HaasClient:
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"X-Tenant-ID": self.tenant}
+        headers = {"X-Tenant-ID": self.tenant}
+        if self.credential:
+            headers["Authorization"] = f"Bearer {self.credential}"
+        return headers
+
+    def set_credential(self, credential: str | None) -> None:
+        self.credential = credential
+        self.auth_expired = False
+
+    def set_connection(self, base_url: str, tenant: str) -> None:
+        normalized_url = base_url.rstrip("/")
+        self.base_url = normalized_url
+        self.tenant = tenant
+        self._http.base_url = httpx.URL(f"{normalized_url}/")
+
+    def _raise_api_error(self, response: httpx.Response) -> NoReturn:
+        if response.status_code == 401:
+            self.credential = None
+            self.auth_expired = True
+        raise HaasAPIError(_detail(response), response.status_code)
 
     async def _request(self, method: str, path: str, **kw: Any) -> Any:
         try:
@@ -108,7 +131,7 @@ class HaasClient:
                 f"Cannot reach {self.base_url}: {exc or type(exc).__name__}"
             ) from exc
         if resp.status_code >= 400:
-            raise HaasAPIError(_detail(resp), resp.status_code)
+            self._raise_api_error(resp)
         return resp.json()
 
     async def health(self) -> dict[str, Any]:
@@ -116,6 +139,66 @@ class HaasClient:
 
     async def plugins(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/plugins")
+
+    async def identity(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/me")
+
+    async def list_memberships(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/admin/memberships")
+
+    async def grant_membership(
+        self, *, subject: str, role: str, kind: str = "human"
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/v1/admin/memberships",
+            json={"subject": subject, "role": role, "kind": kind},
+        )
+
+    async def revoke_membership(self, principal_id: str, role: str) -> dict[str, Any]:
+        return await self._request(
+            "DELETE",
+            f"/v1/admin/memberships/{quote(principal_id, safe='')}/{quote(role, safe='')}",
+        )
+
+    async def list_api_keys(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/admin/api-keys")
+
+    async def create_api_key(
+        self,
+        *,
+        principal_id: str,
+        name: str,
+        expires_in_days: int = 90,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/v1/admin/api-keys",
+            json={
+                "principal_id": principal_id,
+                "name": name,
+                "expires_in_days": expires_in_days,
+            },
+        )
+
+    async def revoke_api_key(self, key_id: str) -> dict[str, Any]:
+        return await self._request(
+            "DELETE", f"/v1/admin/api-keys/{quote(key_id, safe='')}"
+        )
+
+    async def get_tenant_policy(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/admin/policy")
+
+    async def activate_tenant_policy(self, rules: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("PUT", "/v1/admin/policy", json={"rules": rules})
+
+    async def list_audit_events(
+        self, *, limit: int = 50, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, int | str] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/v1/audit-events", params=params)
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/v1/runs/{run_id}")
@@ -188,7 +271,7 @@ class HaasClient:
                 ) as resp:
                     if resp.status_code >= 400:
                         await resp.aread()
-                        raise HaasAPIError(_detail(resp), resp.status_code)
+                        self._raise_api_error(resp)
                     async for line in resp.aiter_lines():
                         ev = parser.feed(line)
                         if ev is None:

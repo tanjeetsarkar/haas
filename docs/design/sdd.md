@@ -129,6 +129,24 @@ Roles may be scoped to project/agent later; project hierarchy is not required fo
 the initial target. Deny self-approval for configured high-risk actions. An approver
 cannot expand skill policy, replace a tool's arguments or authorize a different tenant.
 
+The initial `/v1` action policy permits tenant administrators and submitters to create,
+read, stream and cancel tenant runs. Approvers can read only a pending approval summary
+and approve/reject it; they cannot stream run events or decide their own submission.
+Auditors have no run-content access, operators receive no implicit customer-content
+access, and a `break_glass` membership alone grants nothing without a separate
+time-limited approval. Unknown roles and actions are denied. Development-only
+header-tenancy remains an explicit bypass for local compatibility.
+
+The Phase 1 policy slice stores digest-verified immutable tenant policy revisions and
+pins each authenticated run to its active revision. Admission requires an explicit
+OpenRouter provider and exact model grant, caps requested budgets, checks webhook
+destinations against exact normalized host grants, and resolves plugin skills only when
+the installed plugin digest matches the tenant grant. The development header path retains
+the legacy environment skill allowlist. Policy authoring/admin APIs and authenticated
+approval-decision audit are implemented. Worker-time policy revalidation and mediated
+egress remain later-phase controls; a `break_glass` membership is deliberately actionless
+until a separately approved, time-limited workflow exists.
+
 ### 4.2 Data isolation
 
 Shared PostgreSQL uses `tenant_id` on every tenant-owned row and composite
@@ -175,8 +193,11 @@ stateDiagram-v2
 **TARGET:** provisioning allocates tenant identity, initial administrator membership,
 region/cell assignment, quota, key/secret namespace and deny-by-default policy.
 Activate only after those dependencies are verified. Suspension denies new admission,
-revokes grants, fences ongoing execution and restricts reads according to incident
-policy. Re-activation never resurrects stale approvals or work envelopes.
+revokes credentials and grants, advances the revocation epoch, fences ongoing execution
+and restricts reads according to incident policy. Re-activation requires explicit
+reauthorization, advances the epoch, and invalidates credentials issued before the
+reactivation time; it never resurrects stale approvals or work envelopes. Deletion
+requires execution fencing and resolved retention/export obligations.
 Offboarding follows the [deletion procedure](data-model.md#6-retention-and-deletion-target-policy-defaults).
 
 An agent definition moves through draft, validation and publication. Publication

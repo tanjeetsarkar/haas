@@ -19,6 +19,7 @@ dependencies = [
     "redis>=5.2.0",
     "asyncpg>=0.30.0",
     "cryptography>=44.0.0",
+    "PyJWT[crypto]>=2.10.0",
     "httpx>=0.28.0",
     "pyyaml>=6.0.2",
     "flower>=2.0.1",
@@ -43,8 +44,10 @@ dev = [
 tui = ["textual>=0.86"]
 
 [project.scripts]
+haas = "haas_cli.cli:main"
 haas-chat = "haas_cli.chat:main"
 haas-plugin = "haas_cli.plugin:main"
+haas-bootstrap-tenant = "app.bootstrap_tenant:main"
 
 # The repo root also holds plugins/ and tests/, which setuptools' flat-layout
 # auto-discovery would reject as "multiple top-level packages".

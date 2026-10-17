@@ -5,17 +5,17 @@ services:
 
   redis:
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${HAAS_REDIS_PORT:-6379}:6379"
 
   postgres:
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${HAAS_POSTGRES_PORT:-5432}:5432"
 
   flower:
     image: haas-distributed:3.0.0
     command: celery -A app.worker.celery_app flower --port=5555
     ports:
-      - "127.0.0.1:5555:5555"
+      - "127.0.0.1:${HAAS_FLOWER_PORT:-5555}:5555"
     environment:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2

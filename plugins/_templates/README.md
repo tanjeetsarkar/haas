@@ -49,8 +49,9 @@ layout from older versions is no longer loaded: run `haas-plugin migrate` once.
 | `requires` | `{"plugins": [...]}`: packs whose tools your skills use; loaded first, blocked if they are missing. |
 
 A pack that fails to load is isolated (its tools and skills are rolled back; the rest keep serving) unless
-`PLUGINS_STRICT=true`. Operators control packs with `PLUGINS_ALLOW` / `PLUGINS_DENY` / `PLUGINS_EXTRA_DIRS`,
-skills per tenant with `TENANT_SKILL_ALLOWLISTS`, and per run with `skills` in `POST /v1/runs`.
+`PLUGINS_STRICT=true`. Operators control packs with `PLUGINS_ALLOW` / `PLUGINS_DENY` / `PLUGINS_EXTRA_DIRS`.
+Authenticated tenant grants pin plugin digests and skills in policy revisions; `TENANT_SKILL_ALLOWLISTS`
+is retained only for the development header-tenancy path. Per-run `skills` can narrow, never expand, those grants.
 
 ## How the pieces connect
 
