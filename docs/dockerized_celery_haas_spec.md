@@ -1,6 +1,12 @@
 # Distributed FastAPI + Celery Canvas + Redis Harness-as-a-Service (HaaS)
 ## Production Architecture & Build Specification (v3.0)
 
+> Historical build specification, not a production-readiness guarantee. For verified
+> current behavior, complete SDD/DFD/ERD diagrams, and the proposed authenticated
+> multi-tenant architecture, see the [HaaS design set](design/README.md).
+> In particular, tenant authentication, exactly-once effects and sandbox isolation
+> must not be inferred from this specification's original topology labels.
+
 * **Architecture:** Stateless FastAPI API Tier + Redis 7 (Broker, Chord Coordinator, & SSE Streams) + Celery 5.4 Canvas Workers (`q_orchestrator`, `q_tools_fast`, `q_tools_sandbox`) + PostgreSQL 16 (Durable Threads, Checkpoints, & Cost Ledger) + OpenRouter Gateway
 * **Extension Standards:** 3-Tier Progressive Disclosure (`agentskills.io` `SKILL.md` + `references/`), Native Python `@registry.tool`, and Stateless MCP HTTP (`2026-07-28`)
 * **License & Stack Cost:** 100% Open-Source Containers ($0 software licensing; pay-per-token or free-tier models via OpenRouter)

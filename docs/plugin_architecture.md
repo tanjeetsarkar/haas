@@ -2,6 +2,13 @@
 
 Status: implemented. Supersedes the flat `plugins/skills|tools|manifests` layout of spec v3.0 §5.5.
 
+For the complete service design and production tenancy boundaries, see the
+[HaaS design set](design/README.md). Tool handlers execute on tool workers, but native
+plugin modules are imported during API and orchestrator discovery too. Both tool
+queues currently share one worker service; they are not per-run security sandboxes.
+The [architecture](design/architecture.md) and [threat model](design/threat-model.md)
+qualify the isolation and secret-scoping descriptions below.
+
 ## Why change
 
 The original layout grouped files **by type**. A skill and the tools it unlocks lived in different trees and were

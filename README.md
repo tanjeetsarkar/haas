@@ -2,6 +2,23 @@
 
 Implementation of [docs/dockerized_celery_haas_spec.md](docs/dockerized_celery_haas_spec.md) (v3.0).
 
+## System design
+
+The [HaaS design set](docs/design/README.md) documents the verified implementation and
+the proposed production multi-tenant service:
+
+* [Software design description (SDD)](docs/design/sdd.md)
+* [Architecture and deployment diagrams](docs/design/architecture.md)
+* [Data-flow diagrams (DFD) and execution sequences](docs/design/data-flows.md)
+* [Entity-relationship diagrams (ERD) and data lifecycle](docs/design/data-model.md)
+* [Integration patterns, API contracts and usage](docs/design/integrations-usage.md)
+* [Threat model and security acceptance criteria](docs/design/threat-model.md)
+* [Operations, reliability and migration plan](docs/design/operations-migration.md)
+
+Current behavior and target requirements are explicitly separated. Authenticated
+tenancy, RBAC/RLS, durable dispatch recovery and per-run sandboxing are production
+design requirements, not implemented guarantees of the current Compose stack.
+
 ## Repository layout
 
 * [app/](app/): FastAPI API, shared core modules, and Celery workers.
