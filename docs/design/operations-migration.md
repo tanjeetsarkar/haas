@@ -155,6 +155,11 @@ Implement in dependency order. This is a plan, not a claim these features are pr
 Production multi-tenancy is gated by the whole acceptance set, not merely phase 1.
 Trusted internal demonstrations can continue in the isolated development profile.
 
+Three product tracks run alongside these phases: developer platform (from phase 0),
+multi-agent collaboration (after phase 3 primitives) and the open marketplace (code
+plugins only after phase 4 gates). Their items, dependencies and gates (SEC-16 to SEC-26)
+are tracked in the living [roadmap](../roadmap.md).
+
 ### Data migration procedure
 
 1. Back up and measure existing rows, tenant strings, ownership consistency and

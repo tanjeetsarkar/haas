@@ -34,8 +34,14 @@ extension. It does not add runtime functionality.
 * TARGET: verified identity and membership, RBAC, tenant administration, immutable agent
   versions and policy snapshots, per-run sandboxes, credential references, durable event
   and dispatch outbox, idempotent recovery, quotas, auditing and retention.
-* NON-GOALS for this design: arbitrary customer code in the API process, an open plugin
-  marketplace, a multi-agent collaboration protocol, model training, and exactly-once
+* TARGET (product extensions): an open plugin marketplace with private registries
+  ([marketplace](marketplace.md)), the HaaS Agent Collaboration Protocol for distributed
+  multi-agent work with A2A/MCP/OpenAI-compatible interoperability ([multi-agent](multi-agent.md)),
+  and a contract-first developer platform with SDKs and CLI ([developer platform](developer-platform.md)).
+  Delivery order is in the [roadmap](../roadmap.md).
+* NON-GOALS for this design: arbitrary customer or marketplace code in the control plane
+  (API, orchestrator, relay, policy) — such code runs only in qualified per-run sandboxes;
+  agent-authored plugins installed at run time; model training; and exactly-once
   side effects without cooperation from destination systems.
 
 ## 2. Functional requirements and traceability
@@ -56,6 +62,16 @@ extension. It does not add runtime functionality.
 | FR-12 | Meter usage per tenant and export an audit trail | Floating-point run cost and basic logs | Unique ledger charges and immutable audit tests |
 | FR-13 | Cancel work and enforce tenant suspension | `cancelled` recognized, no cancel endpoint | Fenced cancellation and revocation tests |
 | FR-14 | Select approved agent configuration reproducibly | Request model overrides; fingerprint drift warning | Agent/policy/plugin revision pinning tests |
+| FR-15 | Publish signed, versioned plugin revisions with declared permissions | Local packs, no signing or permission manifest | Signature/provenance and manifest validation tests (SEC-16) |
+| FR-16 | Let tenants discover and install marketplace plugins under consent and tier policy | Operator allow/deny env only | Consent, tier and re-consent-on-expansion tests (SEC-18) |
+| FR-17 | Revoke or yank plugin revisions and fence affected work | Restart-based reload | Yank/advisory revocation fencing tests (SEC-19) |
+| FR-18 | Import Agent Skills, ClawHub skills, OpenAPI specs and MCP servers as plugins | Agent Skills + HTTP/MCP manifests | Adapter contract and rug-pull detection tests |
+| FR-19 | Spawn, join, message and hand off between agents as durable child runs | Single-agent loop | Run-tree crash/recovery and join semantics tests |
+| FR-20 | Delegate only attenuated capabilities and budget slices to child agents | Not applicable | Delegation attenuation and budget-tree tests (SEC-20, SEC-21) |
+| FR-21 | Share a versioned, scoped workspace between agents in a run tree | Shared scratch volume, no scoping | Path-scope, CAS and isolation tests (SEC-22) |
+| FR-22 | Interoperate via A2A, MCP server and an OpenAI-compatible facade with policy parity | Not present | Authn/authz matrix and facade parity tests (SEC-23, SEC-24) |
+| FR-23 | Provide a versioned machine-readable contract for API, events and webhooks | FastAPI-generated OpenAPI only | Spectral lint, breaking-change diff, schema conformance tests |
+| FR-24 | Provide Python and TypeScript SDKs and a unified CLI with safe defaults | Internal Python client, TUI, `haas-plugin` | SDK conformance suite against mock server; credential hygiene (SEC-26) |
 
 Proposed availability, latency, recovery and retention objectives are specified in
 [operations](operations-migration.md). They are acceptance targets, not measured results.
@@ -318,6 +334,10 @@ correlation IDs; restricted diagnostic records preserve actionable internal deta
 | ADR-06 | At-least-once transport with deduplicated effects where supported | Honest distributed semantics; unsupported destinations need manual reconciliation |
 | ADR-07 | SSE is an observation interface, never the workflow coordinator | Client disconnect/reconnect must not own execution liveness |
 | ADR-08 | Separate authorization from prompt instructions | Prompt injection must not expand permissions |
+| ADR-09 | Keep Celery as task transport; workflow correctness lives in PostgreSQL (outbox, leases, fencing) | Avoids an engine migration; multi-agent waits are outbox-driven, never cross-agent chords. Revisit if reconciler complexity grows |
+| ADR-10 | Open marketplace code executes only in per-run sandboxes; control plane consumes build-time static metadata | Enables third-party publishers without TM-04 exposure; requires a build/extraction pipeline |
+| ADR-11 | Namespace plugins (`@publisher/plugin`) and expose tools to models through per-run aliases | Replaces globally unique flat names; requires alias mapping in history and events |
+| ADR-12 | Sub-agents are child runs with attenuated delegation tokens and budget slices | Reuses durable run machinery; adds run-tree state and wake-up outbox messages |
 
 ## 8. Compatibility and acceptance
 

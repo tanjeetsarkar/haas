@@ -32,6 +32,9 @@ tool observations are also untrusted; a model cannot grant privileges.
 * Compromised plugin artifact or dependency.
 * Mistaken/compromised tenant administrator, approver or platform operator.
 * Compromised worker/sandbox attempting lateral movement.
+* TARGET extensions: malicious or compromised marketplace publisher; malicious peer
+  agent (child, sibling or remote A2A agent); external client of the A2A, MCP-server or
+  OpenAI-compatible surfaces.
 
 CURRENT assumes trusted installed plugins, trusted private infrastructure and a
 correct authenticating gateway. It does not safely accept arbitrary hostile Python
@@ -95,6 +98,18 @@ delivery order, not an exploit severity score.
 | TM-20 Tampering / DoS | Concurrent runs overwrite shared thread; cross-policy old history confuses model | Tenant ownership only; whole-thread completion update | Thread version/active-run claim, explicit branching, history provenance and current-policy checks | P1 |
 | TM-21 Disclosure / repudiation | Operator or telemetry sink accesses unrestricted content | Shared operations privileges and basic logs | Separate operational/content roles, least privilege, restricted sinks, audited break-glass | P1 |
 | TM-22 Spoofing / tampering | Forged task envelope confuses tenant/cell or reuses credential grant | Current worker trusts internal task arguments and shared broker | Workload identity, envelope authentication, durable-state comparison, expiry and audience-bound grants | P0 |
+| TM-23 Elevation / disclosure | Malicious or compromised marketplace publisher ships code that exfiltrates data or credentials | No marketplace; operator-reviewed packs only | Verified publisher identity, automated + manual review, sandbox-only execution, declared-egress enforcement, per-invocation credentials ([marketplace](marketplace.md)) | P0 |
+| TM-24 Spoofing | Typosquatted plugin names or dependency confusion between public and private registries | Not applicable | Namespaces, registry precedence pinned per tenant, lockfiles with digests, name-similarity checks | P1 |
+| TM-25 Tampering | Benign plugin update or remote MCP server later changes behavior, schemas or tool descriptions (rug pull) | Not applicable | Digest pinning, permission-diff re-consent, MCP schema-digest pinning with change blocking | P0 |
+| TM-26 Tampering / elevation | `SKILL.md` or tool descriptions carry prompt injection that steers the model toward other tools/data | Skills are operator-trusted | Prompt-injection lint at review, provenance labelling, enforcement outside prompt (ADR-08), risk-class approvals | P1 |
+| TM-27 Elevation | Agent delegates broader capabilities, secrets or budget to a child than it holds (confused deputy) | Not applicable | Attenuable delegation tokens checked against durable parent grants on every spawn and invocation | P0 |
+| TM-28 Tampering | Peer agent injects instructions via messages, handoff input or workspace entries | Not applicable | Treat agent messages as untrusted data with provenance; recipient grants unchanged by content; approvals for high-risk effects | P1 |
+| TM-29 DoS / billing | Recursive spawn, fan-out storms or budget-tree evasion | Not applicable | Depth, fan-out and descendant caps; ledger sub-reservations; cascade cancellation | P0 |
+| TM-30 Spoofing / disclosure | Caller of A2A, MCP-server or OpenAI-compatible surfaces impersonates a tenant or reaches another tenant's agents | Not applicable | Same identity, membership and RBAC path as `/v1`; per-surface audience; scoped agent cards | P0 |
+| TM-31 Tampering | Concurrent agents overwrite or poison shared workspace entries | Shared scratch volume, no versioning | Versioned entries, CAS writes, per-agent path scopes, provenance on every version | P1 |
+| TM-32 Elevation | OpenAI-compatible facade bypasses approvals, budgets or tool policy | Not applicable | Facade maps to agent revisions only; same admission, policy and approval pipeline; parity tests | P0 |
+| TM-33 Disclosure | SDK/CLI leaks tokens via logs, URLs, crash reports or shell history | Client holds secrets in memory; no bearer support | Redacting loggers, header-only credentials, OS keychain storage, device flow | P2 |
+| TM-34 Tampering | Registry, signing key or CDN compromise distributes malicious artifacts | Not applicable | Sigstore transparency log, provenance verification at install and launch, key ceremony and rotation, mirror digest checks | P0 |
 
 ### Important limits of existing controls
 
@@ -164,6 +179,17 @@ delivery order, not an exploit severity score.
 | SEC-13 Attribution and operations | Approvals/policy changes/replays/break-glass carry verified actor; monitoring exposes no credentials | TM-14, TM-15, TM-21 |
 | SEC-14 Retention/restore | Deletion removes projections and artifacts; restoring a backup reapplies deletion tombstones | TM-17 |
 | SEC-15 Thread fencing | Racing creates produce one active run or explicit branch; stale completion cannot overwrite newer history | TM-20 |
+| SEC-16 Signature and provenance | Unsigned, wrongly signed, untraceable or digest-mismatched artifacts are rejected at publish, install and sandbox launch | TM-23, TM-34 |
+| SEC-17 Declared vs observed behavior | Canary plugin attempting undeclared egress, secrets, workspace paths or syscalls is blocked and flagged in review and at run time | TM-23, TM-26 |
+| SEC-18 Upgrade re-consent | Permission-expanding update or changed MCP tool schema is not used until re-consent; non-expanding update follows policy | TM-25 |
+| SEC-19 Yank and revocation | Yanked/revoked revision cannot be installed or dispatched; in-flight runs are fenced | TM-23, TM-25, TM-34 |
+| SEC-20 Delegation attenuation | No spawn, handoff or message yields a child capability, secret, destination, path or budget outside the parent's | TM-27 |
+| SEC-21 Spawn and budget limits | Depth, fan-out and descendant caps hold; descendant spend never exceeds the root reservation | TM-29 |
+| SEC-22 Cross-agent injection containment | Malicious messages/workspace entries cannot unlock tools or widen grants of the recipient; workspace scopes and CAS hold | TM-28, TM-31 |
+| SEC-23 Interop surface authorization | A2A, MCP-server and OpenAI-compatible callers pass the SEC-01/02 matrix; agent cards expose only granted agents | TM-30 |
+| SEC-24 Facade policy parity | Every policy/approval/budget denial on `/v1` reproduces through the OpenAI-compatible facade | TM-32 |
+| SEC-25 Cascade | Cancelling, suspending or revoking any run-tree node fences all descendants; descendant approvals require root-tenant approver RBAC | TM-27, TM-29 |
+| SEC-26 Client credential hygiene | Canary tokens absent from SDK/CLI logs, errors, URLs and telemetry | TM-33 |
 
 Test names are proposed acceptance identifiers, not claims about existing test coverage.
 Existing unit/E2E tests are a baseline, not a substitute for these adversarial checks.

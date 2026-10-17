@@ -23,6 +23,10 @@ These are design decisions, not capabilities already supplied by Docker Compose.
 | [Integrations and usage](integrations-usage.md) | Actual REST/SSE contract, working request examples, native/HTTP/MCP plugins, target event and credential contracts |
 | [Threat model](threat-model.md) | Assets, actors, trust boundaries, STRIDE scenarios, controls, residual risk, security acceptance tests |
 | [Operations and migration](operations-migration.md) | Proposed SLOs, capacity, failure recovery, observability, rollout stages and verification gates |
+| [Plugin marketplace](marketplace.md) | TARGET open marketplace: publishers, manifest v2 permissions, signing, review, trust tiers, installs |
+| [Multi-agent collaboration (HACP)](multi-agent.md) | TARGET distributed sub-agents, delegation attenuation, workspace, topologies, A2A/MCP interop |
+| [Developer platform](developer-platform.md) | TARGET API conventions, Python/TypeScript SDKs, unified CLI, docs and examples |
+| [Roadmap](../roadmap.md) | Living, dependency-ordered production-readiness checklist mapped to FR/TM/SEC gates |
 
 Diagrams are embedded as Mermaid source so GitHub and Mermaid-enabled Markdown
 viewers can render them without maintaining a second, drifting diagram source.

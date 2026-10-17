@@ -299,6 +299,10 @@ access. An unsigned callback is not sufficient evidence to authorize a business 
 
 ## 5. Production contracts (TARGET; not accepted by current API)
 
+API conventions, SDKs, CLI and the A2A / MCP-server / OpenAI-compatible surfaces are specified
+in the [developer platform design](developer-platform.md). Marketplace registry and multi-agent
+contracts are in the [marketplace](marketplace.md) and [multi-agent](multi-agent.md) designs.
+
 ### Admission
 
 Require verified bearer/session identity, selected tenant membership, an

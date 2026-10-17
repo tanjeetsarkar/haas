@@ -14,6 +14,11 @@ the proposed production multi-tenant service:
 * [Integration patterns, API contracts and usage](docs/design/integrations-usage.md)
 * [Threat model and security acceptance criteria](docs/design/threat-model.md)
 * [Operations, reliability and migration plan](docs/design/operations-migration.md)
+* [Plugin marketplace](docs/design/marketplace.md), [multi-agent collaboration (HACP)](docs/design/multi-agent.md)
+  and [developer platform](docs/design/developer-platform.md) (TARGET product extensions)
+
+The **[production-readiness roadmap](docs/roadmap.md)** is the living, dependency-ordered checklist
+that tracks progress toward these targets; decisions are indexed in [docs/adr/](docs/adr/README.md).
 
 Current behavior and target requirements are explicitly separated. Authenticated
 tenancy, RBAC/RLS, durable dispatch recovery and per-run sandboxing are production

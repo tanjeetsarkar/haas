@@ -401,6 +401,122 @@ The target physical migration must implement these; diagrams alone do not enforc
 UUIDs are not authorization. Target timestamps use `TIMESTAMPTZ`; identifiers,
 trace IDs and provider request IDs are separate fields.
 
+## 4a. Proposed marketplace and multi-agent ERD (TARGET)
+
+Extends §3–§4 for the [marketplace](marketplace.md) and [multi-agent](multi-agent.md) designs.
+The same composite-key, RLS and immutability constraints apply. `PUBLISHER`, `LISTING`,
+`PLUGIN_REVISION` and `ADVISORY` are global; everything else is tenant-owned.
+
+```mermaid
+erDiagram
+    PUBLISHER ||--o{ LISTING : owns
+    LISTING ||--|{ PLUGIN_REVISION : versions
+    PLUGIN_REVISION ||--o{ SCAN_REPORT : reviewed_by
+    PLUGIN_REVISION ||--o{ ADVISORY : affected_by
+    TENANT ||--o{ INSTALLATION : installs
+    PLUGIN_REVISION ||--o{ INSTALLATION : pinned_by
+    INSTALLATION ||--o{ CAPABILITY_GRANT : backs
+    RUN ||--o{ RUN : parent_of
+    RUN ||--o{ DELEGATION : delegates
+    DELEGATION ||--|| RUN : child
+    RUN ||--o{ AGENT_MESSAGE : sends
+    RUN ||--o| WORKSPACE : roots
+    WORKSPACE ||--o{ WORKSPACE_ENTRY_VERSION : contains
+    AGENT_REVISION ||--o| AGENT_CARD : advertises
+    PUBLISHER {
+        uuid publisher_id PK
+        string namespace UK
+        string verification_status
+        string verified_domain
+    }
+    LISTING {
+        uuid listing_id PK
+        uuid publisher_id FK
+        string name
+        string trust_tier
+        string status
+    }
+    PLUGIN_REVISION {
+        uuid plugin_revision_id PK
+        uuid listing_id FK
+        string version
+        string artifact_digest
+        string signature_reference
+        string provenance_reference
+        jsonb permissions
+        jsonb static_catalog
+        string review_status
+    }
+    SCAN_REPORT {
+        uuid scan_id PK
+        uuid plugin_revision_id FK
+        string kind
+        string outcome
+        jsonb findings_summary
+    }
+    ADVISORY {
+        uuid advisory_id PK
+        string severity
+        string action
+        timestamptz published_at
+    }
+    INSTALLATION {
+        uuid installation_id PK
+        uuid tenant_id FK
+        uuid plugin_revision_id FK
+        string permissions_digest
+        uuid consented_by FK
+        timestamptz consented_at
+        string status
+    }
+    DELEGATION {
+        uuid delegation_id PK
+        uuid tenant_id FK
+        uuid parent_run_id FK
+        uuid child_run_id FK
+        string caveats_digest
+        numeric budget_slice_usd
+        integer depth
+        timestamptz deadline_at
+    }
+    AGENT_MESSAGE {
+        uuid message_id PK
+        uuid tenant_id FK
+        uuid root_run_id FK
+        uuid from_run_id FK
+        uuid to_run_id FK
+        string kind
+        string body_reference
+        timestamptz consumed_at
+    }
+    WORKSPACE {
+        uuid workspace_id PK
+        uuid tenant_id FK
+        uuid root_run_id FK
+    }
+    WORKSPACE_ENTRY_VERSION {
+        uuid tenant_id PK,FK
+        uuid workspace_id PK,FK
+        string path PK
+        bigint version PK
+        uuid written_by_run_id FK
+        string content_digest
+        uuid artifact_id FK
+    }
+    AGENT_CARD {
+        uuid agent_revision_id PK,FK
+        uuid tenant_id FK
+        jsonb card
+        string exposure
+    }
+```
+
+Additional constraints: `RUN` gains `parent_run_id`, `root_run_id`, `depth` and `delegation_id`
+with composite tenant FKs, and a check that a child's tenant equals its root's.
+`WORKSPACE_ENTRY_VERSION` writes require `version = current + 1` (CAS). An installation's
+`permissions_digest` must equal the pinned revision's permissions; an expansion creates a new
+installation row only after consent.
+
 ## 5. Checkpoint vs event vs audit
 
 | Record | Authority / purpose | Mutability |

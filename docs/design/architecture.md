@@ -249,3 +249,17 @@ enforcement must exist in runtime, network, identity and storage.
 * A workflow engine could replace part of Celery coordination if recovery requirements
   outgrow the lease/outbox design. It would not remove application-level authorization,
   effect idempotency, approval binding or sandbox requirements.
+
+## 6. Product extensions (TARGET)
+
+The following reuse the control/execution split above rather than adding new trust boundaries:
+
+* **Marketplace registry** ([design](marketplace.md)) belongs to the control plane but stores
+  only static metadata. Artifacts are pulled by digest by the execution supervisor and
+  verified before sandbox launch. The review pipeline runs dynamic tests in an isolated
+  analysis cell, never in a tenant cell.
+* **Multi-agent runs** ([design](multi-agent.md)) are ordinary runs linked as a tree. Each node
+  holds its own lease and sandbox and can be placed in any cell of the tenant's placement.
+  Wake-ups are outbox messages.
+* **Interop surfaces** (A2A, MCP server, OpenAI-compatible facade; [developer platform](developer-platform.md))
+  are additional API front-ends behind the same edge identity verification and admission path.
