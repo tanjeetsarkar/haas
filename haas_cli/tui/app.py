@@ -25,6 +25,7 @@ from textual.widgets import (
     Static,
     TextArea,
 )
+from textual.widgets.markdown import MarkdownStream
 
 from haas_cli.client import (
     OUTPUT_DELTA_EVENT,
@@ -761,7 +762,8 @@ class ChatApp(App[None]):
         self._loading_runs = False
         self._system_theme = self.theme
         self._follow = True
-        self._preview: Static | None = None
+        self._preview_markdown: Markdown | None = None
+        self._preview_stream: MarkdownStream | None = None
         self._preview_key: tuple[int, int, int] | None = None
         self._preview_text = ""
         self._preview_truncated = False
@@ -907,7 +909,7 @@ class ChatApp(App[None]):
             stale = [
                 w
                 for w in list(chat.children)[:overflow]
-                if w is not self._preview and w not in self._tool_cards.values()
+                if w is not self._preview_markdown and w not in self._tool_cards.values()
             ]
             if stale:
                 await chat.remove_children(stale)
@@ -1102,8 +1104,6 @@ class ChatApp(App[None]):
     def _tick(self) -> None:
         if not self.screen_stack:
             return
-        if self._preview_dirty:
-            self._render_preview()
         try:
             act = self._main("#activity", Static)
         except NoMatches:  # timer can fire before the screen finishes composing
@@ -1188,7 +1188,7 @@ class ChatApp(App[None]):
 
     async def _submit(self, text: str) -> None:
         if text.startswith("/"):
-            await self._run_command(text)
+            self.run_worker(self._run_command(text), exclusive=True, group="turn")
         else:
             self.run_worker(self._turn(text), exclusive=True, group="turn")
 
@@ -1376,23 +1376,7 @@ class ChatApp(App[None]):
         self._phase = "resuming"
         return decision
 
-    def _render_preview(self) -> None:
-        self._preview_dirty = False
-        if self._preview is None:
-            return
-        text = Text(
-            sanitize_terminal_text(self._preview_text, limit=MAX_RENDERED_OUTPUT)
-        )
-        if self._preview_truncated:
-            text.append(
-                "\n[live preview truncated; final output follows]"
-                if self._ascii
-                else "\n… live preview truncated; final output follows",
-                style="dim",
-            )
-        self._preview.update(text)
-        if self._follow:
-            self._main("#chat", VerticalScroll).scroll_end(animate=False)
+    
 
     async def _on_output_delta(self, d: dict[str, Any]) -> None:
         try:
@@ -1407,36 +1391,58 @@ class ChatApp(App[None]):
             self._preview_key = key
             self._preview_text = ""
             self._preview_truncated = False
-            if self._preview is None:
-                self._preview = Static("", classes="live-output")
-                await self._add(self._preview)
+            # Stop any existing stream
+            if self._preview_stream is not None:
+                await self._preview_stream.stop()
+                self._preview_stream = None
+            if self._preview_markdown is not None:
+                await self._preview_markdown.remove()
+                self._preview_markdown = None
+            # Create new Markdown widget for live preview
+            self._preview_markdown = Markdown("", classes="live-output")
+            await self._add(self._preview_markdown)
+            # Get stream for efficient updates
+            self._preview_stream = Markdown.get_stream(self._preview_markdown)
         if len(self._preview_text) < MAX_RENDERED_OUTPUT:
             self._preview_text += text[: MAX_RENDERED_OUTPUT - len(self._preview_text)]
         if d.get("truncated") or len(self._preview_text) >= MAX_RENDERED_OUTPUT:
             self._preview_truncated = True
-        self._preview_dirty = True
-        if d.get("final"):
-            self._render_preview()
+            # Add truncation indicator to the stream
+            if self._preview_stream is not None:
+                await self._preview_stream.write("\n\n[... truncated ...]")
+        # Write to stream for real-time Markdown rendering
+        if self._preview_stream is not None:
+            await self._preview_stream.write(text)
+        # Don't settle on final - let the next event (tool_dispatched, run_completed, etc.) handle it
+        # This matches the original behavior where preview persists until the next durable event
 
     async def _settle_preview(self, *, discard: bool) -> None:
         """Closes the live preview when the durable log moves past the streamed call."""
-        preview = self._preview
-        self._preview, self._preview_key = None, None
+        # Stop the stream if active
+        if self._preview_stream is not None:
+            await self._preview_stream.stop()
+            self._preview_stream = None
+        
+        preview_markdown = self._preview_markdown
+        self._preview_markdown = None
+        self._preview_key = None
         self._preview_dirty = False
-        if preview is None:
+        
+        if preview_markdown is None:
+            self._preview_text = ""
+            self._preview_truncated = False
             return
+            
         if discard or not self._preview_text.strip():
-            await preview.remove()
+            await preview_markdown.remove()
         else:
-            preview.update(
-                Text(
-                    sanitize_terminal_text(
-                        self._preview_text, limit=MAX_RENDERED_OUTPUT
-                    ),
-                    style="dim",
+            # Update the markdown content with the final text and dim it
+            preview_markdown.update(
+                sanitize_terminal_text(
+                    self._preview_text, limit=MAX_RENDERED_OUTPUT
                 )
             )
-            preview.add_class("settled")
+            preview_markdown.add_class("settled")
         self._preview_text = ""
         self._preview_truncated = False
 
@@ -1446,7 +1452,7 @@ class ChatApp(App[None]):
             if isinstance(d, dict):
                 await self._on_output_delta(d)
             return
-        if self._preview is not None:
+        if self._preview_markdown is not None:
             retry = (
                 ev.event == "step_started"
                 and self._preview_key is not None
@@ -2656,8 +2662,17 @@ class ChatApp(App[None]):
             self.workers.cancel_group(self, "turn")
 
     async def action_clear_screen(self) -> None:
-        self._preview, self._preview_key = None, None
-        self._preview_text, self._preview_dirty = "", False
+        # Stop any active stream
+        if self._preview_stream is not None:
+            await self._preview_stream.stop()
+            self._preview_stream = None
+        if self._preview_markdown is not None:
+            await self._preview_markdown.remove()
+            self._preview_markdown = None
+        self._preview_markdown = None
+        self._preview_key = None
+        self._preview_text = ""
+        self._preview_dirty = False
         await self._main("#chat", VerticalScroll).remove_children()
 
     def action_toggle_follow(self) -> None:

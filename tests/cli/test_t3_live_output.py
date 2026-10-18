@@ -76,7 +76,7 @@ async def test_tui_negotiates_deltas_and_reconciles_with_final_output():
         assert not app.query(".live-output")
         finals = [w.source for w in app.query("#chat > Markdown")]
         assert finals == ["Hello there"]
-        assert app._preview is None and app._preview_text == ""
+        assert app._preview_markdown is None and app._preview_text == ""
 
 
 async def test_tui_without_capability_never_requests_deltas():
@@ -97,14 +97,20 @@ async def test_tui_preview_resets_settles_and_drops_retries():
         await app._on_event(SSEEvent("step_started", {"step": 1, "model": "m"}))
         await app._on_event(_delta(1, 1, 1, "Thinking"))
         await app._on_event(_delta(1, 1, 1, " about it", final=True))
+        await pilot.pause()  # Let stream process
         [preview] = app.query(".live-output")
-        assert "Thinking about it" in str(preview.render())
+        # Markdown widget renders differently, check the source
+        assert "Thinking about it" in preview.source
         await app._on_event(
             _delta(1, 1, 2, "Second call")
         )  # new call resets the buffer
         assert app._preview_text == "Second call"
-        app._render_preview()
-        assert "Thinking" not in str(preview.render())
+        await pilot.pause()  # Let stream process
+        # New call creates a new preview widget, check the last one (the new one)
+        previews = app.query(".live-output")
+        preview = previews[-1]
+        assert "Thinking" not in preview.source
+        assert "Second call" in preview.source
 
         # A durable tool dispatch settles the interim text as a dim transcript entry.
         await app._on_event(
@@ -112,13 +118,15 @@ async def test_tui_preview_resets_settles_and_drops_retries():
                 "tool_dispatched", {"tool_call_id": "c1", "tool": "t", "queue": "q"}
             )
         )
-        assert preview.has_class("settled") and app._preview is None
+        await pilot.pause()
+        assert preview.has_class("settled") and app._preview_markdown is None
         assert "Second call" in chat_text(app)
 
         # A retry of the same step discards its stale partial output.
         await app._on_event(SSEEvent("step_started", {"step": 2, "model": "m"}))
         await app._on_event(_delta(2, 1, 1, "partial"))
-        stale = app._preview
+        await pilot.pause()
+        stale = app._preview_markdown
         await app._on_event(SSEEvent("step_started", {"step": 2, "model": "m"}))
         await pilot.pause()
         assert stale is not None and not stale.is_attached
@@ -127,8 +135,9 @@ async def test_tui_preview_resets_settles_and_drops_retries():
         # Malformed frames are ignored; truncation is surfaced.
         await app._on_event(SSEEvent(OUTPUT_DELTA_EVENT, {"step": "x"}))
         await app._on_event(_delta(2, 2, 1, "cut", truncated=True, final=True))
-        assert app._preview is not None
-        assert "truncated" in str(app._preview.render())
+        await pilot.pause()
+        assert app._preview_markdown is not None
+        assert "truncated" in app._preview_markdown.source
 
 
 async def test_tui_follow_toggle_pauses_autoscroll():
