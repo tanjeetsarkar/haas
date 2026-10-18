@@ -158,7 +158,7 @@ async def test_foreign_run_ids_disclose_no_data_or_effects(
 
     monkeypatch.setattr(main_module.store, "get_run", foreign_run)
     monkeypatch.setattr(main_module.store, "cancel_run", unexpected_effect)
-    monkeypatch.setattr(main_module.store, "claim_resume", unexpected_effect)
+    monkeypatch.setattr(main_module.store, "decide_approval", unexpected_effect)
     response = await _request_app(
         monkeypatch,
         method,
@@ -183,9 +183,19 @@ async def test_authenticated_identity_overrides_untrusted_tenant_header(monkeypa
             "active_skills": [],
             "pending_tool_calls": None,
             "result_text": "tenant-owned result",
+            "traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01",
+            "state_version": 4,
+            "event_sequence": 9,
+            "deadline_at": None,
+            "max_cost_usd": 1.0,
+            "budget_reserved_usd": 0,
         }
 
+    async def run_budget(run: dict[str, Any]):
+        return {"max_cost_usd": run["max_cost_usd"]}
+
     monkeypatch.setattr(main_module.store, "get_run", owned_run)
+    monkeypatch.setattr(main_module.store, "run_budget", run_budget)
     response = await _request_app(
         monkeypatch,
         "GET",
@@ -195,7 +205,12 @@ async def test_authenticated_identity_overrides_untrusted_tenant_header(monkeypa
     )
 
     assert response.status_code == 200
-    assert response.json()["result"] == "tenant-owned result"
+    body = response.json()
+    assert body["result"] == "tenant-owned result"
+    assert body["state_version"] == 4
+    assert body["traceparent"].startswith("00-" + "a" * 32)
+    assert body["approval"] is None
+    assert body["budget"] == {"max_cost_usd": 1.0}
 
 
 async def test_approver_can_read_only_a_pending_approval_summary(monkeypatch):
@@ -213,7 +228,17 @@ async def test_approver_can_read_only_a_pending_approval_summary(monkeypatch):
             "result_text": "private result",
         }
 
+    async def pending_approval_batch(_run_id: str):
+        return {
+            "batch_id": "b-1",
+            "batch_digest": "d" * 64,
+            "expires_at": "2030-01-01T00:00:00+00:00",
+        }
+
     monkeypatch.setattr(main_module.store, "get_run", get_run)
+    monkeypatch.setattr(
+        main_module.store, "pending_approval_batch", pending_approval_batch
+    )
     response = await _request_app(
         monkeypatch, "GET", "/v1/runs/run_123", roles={"approver"}
     )
@@ -223,6 +248,12 @@ async def test_approver_can_read_only_a_pending_approval_summary(monkeypatch):
         "run_id": "run_123",
         "status": "input_required",
         "pending_tool_calls": pending,
+        "approval": {
+            "batch_id": "b-1",
+            "batch_digest": "d" * 64,
+            "expires_at": "2030-01-01T00:00:00+00:00",
+            "decision_endpoint": "/v1/approvals/b-1/decision",
+        },
     }
 
 
@@ -248,7 +279,7 @@ async def test_approver_cannot_decide_own_submission(monkeypatch):
         raise AssertionError("self-approval reached resume claim")
 
     monkeypatch.setattr(main_module.store, "get_run", get_run)
-    monkeypatch.setattr(main_module.store, "claim_resume", unexpected_claim)
+    monkeypatch.setattr(main_module.store, "decide_approval", unexpected_claim)
     response = await _request_app(
         monkeypatch,
         "POST",
@@ -283,27 +314,12 @@ async def test_approval_decision_passes_verified_actor_and_request_id_to_store(
                 "traceparent": "00-" + "a" * 32 + "-" + "b" * 16 + "-01",
             }
 
-        async def claim_resume(self, run_id: str, tenant_id: str, **values: Any):
-            self.claim = {
-                "run_id": run_id,
-                "tenant_id": tenant_id,
-                **values,
-            }
-            return True
-
-        async def save_checkpoint(self, *_args: Any, **_kwargs: Any):
-            pass
-
-        async def publish_event(self, *_args: Any, **_kwargs: Any):
-            pass
-
-    class Task:
-        def apply_async(self, **_kwargs: Any):
-            pass
+        async def decide_approval(self, tenant_id: str, **values: Any):
+            self.claim = {"tenant_id": tenant_id, **values}
+            return {"run_id": values["run_id"], "batch_id": "b-1", "replayed": False}
 
     store = ResumeStore()
     monkeypatch.setattr(main_module, "store", store)
-    monkeypatch.setattr(main_module, "llm_step_task", Task())
     response = await _request_app(
         monkeypatch,
         "POST",
@@ -314,11 +330,16 @@ async def test_approval_decision_passes_verified_actor_and_request_id_to_store(
 
     assert response.status_code == 202
     assert response.headers["x-request-id"]
+    assert response.json()["batch_id"] == "b-1"
     assert store.claim == {
         "run_id": "run_123",
         "tenant_id": "acme",
+        "batch_id": None,
+        "batch_digest_value": None,
         "actor_principal_id": "principal-1",
         "request_id": response.headers["x-request-id"],
         "approved": False,
-        "pending_tool_count": 0,
+        "reason": "not authorized",
+        "idempotency_key": None,
+        "require_binding": False,
     }

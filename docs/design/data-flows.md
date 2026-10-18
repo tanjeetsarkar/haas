@@ -174,64 +174,53 @@ sequenceDiagram
     actor C as Client
     participant A as FastAPI
     participant P as PostgreSQL
-    participant R as Redis streams / secrets
-    participant Q as Celery broker / results
+    participant M2 as Maintenance (relay + reconciler)
+    participant R as Redis secrets / wakeups
+    participant Q as Celery broker
     participant O as Orchestrator
     participant M as OpenRouter
     participant T as Tool worker
     participant X as External destination
-    C->>A: POST /v1/runs + trusted X-Tenant-ID
-    A->>P: Load/create thread and check tenant ownership
+    C->>A: POST /v1/runs (+ Idempotency-Key)
     A->>R: SETEX run secrets (if supplied)
-    A->>P: INSERT run status=running + checkpoint
-    A->>R: XADD run_queued
-    A->>Q: Enqueue llm_step_task
-    A-->>C: 202 run_id, thread_id, stream_url
-    Note over A,Q: Separate writes: a crash can leave undispatched durable state
-    C->>A: GET stream + Last-Event-ID
-    A->>P: Check run ownership
-    A->>R: XREAD BLOCK from cursor
-    Q->>O: Deliver model task (redelivery possible)
-    O->>P: Load checkpoint
-    O->>R: Publish step_started
+    A->>P: Txn: admission + run queued + run_queued event + orchestrate outbox
+    A-->>C: 202 run_id, thread_id, stream/events URLs
+    C->>A: GET stream + Last-Event-ID (integer)
+    A->>P: Replay run_events after cursor; wait on Redis wakeup between polls
+    M2->>P: Claim outbox rows (SKIP LOCKED)
+    M2->>Q: Publish orchestrate task (redelivery possible)
+    Q->>O: Deliver; consumer_inbox dedup
+    O->>P: Fenced lease (epoch+1) + step attempt + cost reservation + step_started
     O->>M: Messages + unlocked tool schemas
     M-->>O: Assistant message + usage
     alt Any requested tool needs approval
-        O->>P: Save pending whole batch with input_required status
-        O->>R: Publish input_required
-        R-->>A: Stream entry
-        A-->>C: SSE input_required and close if still paused
+        O->>P: Txn: invocations + approval batch (digest, expiry) + input_required
+        A-->>C: SSE input_required, closes while still paused
     else Ungated tool batch
-        O->>P: Save model checkpoint and observed cost
-        O->>R: Read union-scoped run secrets
-        O->>Q: Chord of tool tasks + aggregation callback
-        par Tool invocation 1
-            Q->>T: Context + arguments + scoped secret values
-            T->>X: Validated native / HTTP / MCP invocation
-            X-->>T: Observation / effect response
-            T->>Q: Tool outcome
-        and Other tool invocations
-            Q->>T: Sibling calls with pre-batch active skills
-            T->>Q: Sibling outcomes
-        end
-        Q->>O: aggregate_step_task(outcomes)
-        O->>R: Publish tool_result events
-        O->>P: Merge messages / skills and checkpoint
-        O->>Q: Enqueue next model step
+        O->>P: Txn: settle usage + invocations (effect_key) + signed envelopes in outbox
+        M2->>Q: Publish tool tasks
+        Q->>T: Signed envelope + scoped secret values
+        T->>T: Verify signature, expiry, arguments digest
+        T->>X: Validated native / HTTP / MCP invocation
+        X-->>T: Observation / effect response
+        T->>Q: record_tool_outcome task
+        Q->>O: Deliver outcome
+        O->>P: Fenced outcome + tool_result event; last outcome queues aggregate
+        O->>P: Aggregate: merge messages/skills, queue next step via outbox
     else No tool calls
-        O->>P: Finalize run and update thread if completed
-        O->>R: Delete secret key and publish run_completed
-        O->>Q: Optional terminal callback task
-        R-->>A: Terminal event
+        O->>P: Txn: complete run + thread history + usage + run_completed + callback outbox
+        O->>R: Delete secret key
         A-->>C: SSE run_completed
     end
+    M2->>P: Reconcile: expired leases → run_recovering + requeue; lost tools → unknown
 ```
 
-Event order within aggregation is tool-result publication followed by its checkpoint.
-Finalization and event publication are also separate operations. SSE is not an atomic
-commit log of PostgreSQL and cannot repair missing publication.
+Every state change and its events/outbox intents commit in one transaction, so SSE is a
+faithful replay of PostgreSQL. A crash between commit and publish only delays work: the
+relay retries pending outbox rows, and the reconciler requeues expired leases with a new
+epoch so stale workers cannot write.
 
-## 6. Approval and safe continuation sequence (TARGET)
+## 6. Approval and safe continuation sequence (TARGET; Phase 3 implements all but the sandbox supervisor)
 
 ```mermaid
 sequenceDiagram

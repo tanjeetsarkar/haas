@@ -18,7 +18,9 @@ from app.core.config import settings
         ),
     ],
 )
-async def test_seed_refuses_non_dev_or_remote_database(profile, dsn, message, monkeypatch):
+async def test_seed_refuses_non_dev_or_remote_database(
+    profile, dsn, message, monkeypatch
+):
     monkeypatch.setattr(
         seed_dev,
         "settings",

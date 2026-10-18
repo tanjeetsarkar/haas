@@ -124,6 +124,9 @@ class FakeStore:
     async def store_ephemeral_secrets(self, run_id, secrets):
         pass
 
+    async def clear_ephemeral_secrets(self, run_id):
+        pass
+
     async def create_run(self, **kw):
         self.runs.append(kw)
 
@@ -132,19 +135,18 @@ class FakeStore:
 
 
 class Dispatched:
-    def __init__(self) -> None:
-        self.calls: list[Any] = []
+    """create_run enqueues through the transactional outbox, so a created run is dispatched."""
 
-    def apply_async(self, *a, **kw):
-        self.calls.append((a, kw))
+    def __init__(self, store: FakeStore) -> None:
+        self.calls = store.runs
 
 
 @pytest.fixture
 def api(reg, monkeypatch):
-    store, dispatched = FakeStore(), Dispatched()
+    store = FakeStore()
+    dispatched = Dispatched(store)
     monkeypatch.setattr(main_mod, "registry", reg)
     monkeypatch.setattr(main_mod, "store", store)
-    monkeypatch.setattr(main_mod, "llm_step_task", dispatched)
     monkeypatch.setattr(
         settings,
         "tenant_skill_allowlists",

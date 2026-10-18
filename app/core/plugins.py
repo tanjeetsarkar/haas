@@ -330,6 +330,10 @@ class PluginRegistry:
                 "Accept": "application/json, text/event-stream",
                 "traceparent": ctx.traceparent,
             }
+            if ctx.effect_key:
+                # Same key on every redelivery, so destinations can deduplicate the effect.
+                headers["Idempotency-Key"] = ctx.effect_key
+                headers["X-HaaS-Effect-Key"] = ctx.effect_key
             request_id: str | None = None
             if secret_key:
                 secret_val = ctx.get_secret(secret_key)

@@ -26,10 +26,16 @@ from textual.widgets import (
     TextArea,
 )
 
-from haas_cli.client import HaasAPIError, SSEEvent
+from haas_cli.client import (
+    OUTPUT_DELTA_EVENT,
+    OUTPUT_DELTA_FEATURE,
+    HaasAPIError,
+    SSEEvent,
+)
 from haas_cli.completion import Completion, common_prefix, suggest
 from haas_cli.profiles import EnvironmentProfile, ProfileStore
 from haas_cli.session import (
+    ApprovalBinding,
     ChatSession,
     Decision,
     PendingCall,
@@ -44,6 +50,27 @@ BANNER = "[b #7aa2f7]◆ HaaS Chat[/]  [dim]distributed agent harness[/]"
 ASCII_SPINNER = "|/-\\"
 MAX_RENDERED_OUTPUT = 20_000
 MAX_APPROVAL_ARGUMENTS = 12_000
+APPROVAL_FILTERS = ("pending", "all", "approved", "rejected", "expired", "cancelled")
+CANCELLABLE_STATUSES = ("queued", "running", "input_required")
+
+
+def pending_calls_from(raw_calls: Any) -> list[PendingCall] | None:
+    """Normalise API tool-call shapes; None when the payload is malformed."""
+    if not isinstance(raw_calls, list):
+        return None
+    calls: list[PendingCall] = []
+    for item in raw_calls:
+        if not isinstance(item, dict):
+            return None
+        function = item.get("function")
+        function_data = function if isinstance(function, dict) else {}
+        call_id = item.get("id", item.get("tool_call_id"))
+        name = item.get("name", function_data.get("name"))
+        arguments = item.get("arguments", function_data.get("arguments", {}))
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            return None
+        calls.append(PendingCall(call_id, name, arguments))
+    return calls
 
 
 class PromptInput(TextArea):
@@ -166,9 +193,11 @@ class ApprovalScreen(ModalScreen[Decision | None]):
         ascii: bool = False,
         decisions_enabled: bool = True,
         decision_disabled_reason: str | None = None,
+        binding: ApprovalBinding | None = None,
     ) -> None:
         super().__init__()
         self.calls = calls
+        self.binding = binding
         self.ascii = ascii
         self.decisions_enabled = decisions_enabled
         self.decision_disabled_reason = decision_disabled_reason
@@ -181,6 +210,16 @@ class ApprovalScreen(ModalScreen[Decision | None]):
                 "The agent wants to run the following action(s). Nothing runs until you approve.",
                 id="approval-sub",
             )
+            if self.binding is not None:
+                yield Static(
+                    Text(
+                        f"batch {sanitize_terminal_text(self.binding.batch_id, limit=40)}"
+                        f" | digest {sanitize_terminal_text(self.binding.batch_digest, limit=64)[:16]}"
+                        f" | expires {sanitize_terminal_text(self.binding.expires_at or '?', limit=40)}",
+                        style="dim",
+                    ),
+                    id="approval-binding",
+                )
             if self.decision_disabled_reason:
                 yield Static(self.decision_disabled_reason, classes="error-box")
             with VerticalScroll(id="approval-calls"):
@@ -530,6 +569,16 @@ class NavigationCommands(Provider):
             ("Switch profile", "action_switch_profile", "Choose a saved environment"),
             ("Refresh runs", "action_refresh_runs", "Reload the current run page"),
             (
+                "Approval inbox",
+                "action_show_approvals",
+                "Review digest-bound pending approvals",
+            ),
+            (
+                "Inspect selected run",
+                "action_inspect_selected",
+                "Budget, steps, tool invocations and usage ledger",
+            ),
+            (
                 "Attach to selected run",
                 "action_attach_selected",
                 "Follow the selected run",
@@ -587,12 +636,16 @@ class ChatApp(App[None]):
     #navigation { height: 3; padding: 0 1; align-vertical: middle; }
     #navigation Button { margin-right: 1; min-width: 12; }
     #workspaces { height: 1fr; }
-    #chat-workspace, #runs-workspace, #admin-workspace { height: 1fr; }
+    #chat-workspace, #runs-workspace, #admin-workspace, #approvals-workspace {
+        height: 1fr;
+    }
     #chat { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }
     .user { margin: 1 0 0 0; color: $text; background: $boost; padding: 0 1; }
     .assistant { margin: 1 0 0 0; padding: 0 1; border-left: thick $success; }
     .assistant MarkdownBlock { margin-bottom: 0; }
     .note { color: $text-muted; margin: 0 0 0 2; }
+    .live-output { margin: 1 0 0 0; padding: 0 1; border-left: thick $warning; }
+    .live-output.settled { border-left: thick $panel; color: $text-muted; }
     .tool { margin: 0 0 0 2; color: $text-muted; }
     .tool.error { color: $error; }
     .tool.done { color: $text-muted; }
@@ -607,6 +660,13 @@ class ChatApp(App[None]):
     #run-actions { height: 3; padding: 0 1; }
     #run-actions Button { margin-right: 1; }
     #run-detail { height: 3; padding: 0 1; color: $text-muted; }
+    #run-inspector { height: 14; margin: 0 1; border: round $primary-darken-1; }
+    #run-inspector-body { padding: 0 1; }
+    #approvals-heading { height: 2; padding: 0 1; }
+    #approvals-table { height: 1fr; }
+    #approval-actions { height: 3; padding: 0 1; }
+    #approval-actions Button { margin-right: 1; }
+    #approval-detail { height: 4; padding: 0 1; color: $text-muted; }
     #nav-admin { display: none; }
     #admin-memberships, #admin-member-grant, #admin-member-revoke,
     #admin-api-keys, #admin-key-create, #admin-key-revoke, #admin-policy-view,
@@ -656,6 +716,7 @@ class ChatApp(App[None]):
         Binding("ctrl+1", "show_chat", "Chat", show=True),
         Binding("ctrl+2", "show_runs", "Runs", show=True),
         Binding("ctrl+3", "show_admin", "Admin", show=True),
+        Binding("ctrl+4", "show_approvals", "Approvals", show=True),
         Binding("ctrl+r", "refresh_runs", "Refresh"),
         Binding("ctrl+t", "cycle_theme", "Theme"),
         Binding("ctrl+shift+l", "login", "Sign in"),
@@ -663,6 +724,7 @@ class ChatApp(App[None]):
         Binding("f6", "focus_next", "Next focus"),
         Binding("ctrl+l", "clear_screen", "Clear"),
         Binding("ctrl+n", "new_chat", "New chat"),
+        Binding("ctrl+f", "toggle_follow", "Follow"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
 
@@ -690,9 +752,19 @@ class ChatApp(App[None]):
         self._runs_cursor: str | None = None
         self._selected_run_id: str | None = None
         self._audit_cursor: str | None = None
+        self._approvals: dict[str, dict[str, Any]] = {}
+        self._approval_filter = "pending"
+        self._selected_batch_id: str | None = None
+        self._loading_approvals = False
         self._ascii = session.settings.ascii
         self._loading_runs = False
         self._system_theme = self.theme
+        self._follow = True
+        self._preview: Static | None = None
+        self._preview_key: tuple[int, int, int] | None = None
+        self._preview_text = ""
+        self._preview_truncated = False
+        self._preview_dirty = False
 
     # ---- layout -------------------------------------------------------------------------
 
@@ -701,6 +773,7 @@ class ChatApp(App[None]):
         with Horizontal(id="navigation"):
             yield Button("Chat", id="nav-chat", variant="primary")
             yield Button("Runs", id="nav-runs")
+            yield Button("Approvals", id="nav-approvals")
             yield Button("Admin", id="nav-admin")
             yield Button("Help", id="nav-help")
         with ContentSwitcher(initial="chat-workspace", id="workspaces"):
@@ -716,12 +789,39 @@ class ChatApp(App[None]):
                     yield Button("Refresh", id="runs-refresh")
                     yield Button("Load more", id="runs-more", disabled=True)
                     yield Button("Attach", id="runs-attach", disabled=True)
+                    yield Button("Inspect", id="runs-inspect", disabled=True)
                     yield Button(
                         "Cancel..." if self._ascii else "Cancel…",
                         id="runs-cancel",
                         disabled=True,
                     )
                 yield Static("Select a run to inspect or attach.", id="run-detail")
+                with VerticalScroll(id="run-inspector"):
+                    yield Static(
+                        "Inspect a run to see its budget, steps, tool invocations "
+                        "and usage ledger.",
+                        id="run-inspector-body",
+                    )
+            with Vertical(id="approvals-workspace"):
+                yield Static(
+                    "Approval inbox | decisions are bound to the reviewed batch digest",
+                    id="approvals-heading",
+                )
+                yield DataTable(
+                    id="approvals-table", cursor_type="row", zebra_stripes=True
+                )
+                with Horizontal(id="approval-actions"):
+                    yield Button("Refresh", id="approvals-refresh")
+                    yield Button("Filter: pending", id="approvals-filter")
+                    yield Button(
+                        "Review..." if self._ascii else "Review…",
+                        id="approvals-review",
+                        variant="warning",
+                        disabled=True,
+                    )
+                yield Static(
+                    "Select an approval batch to review.", id="approval-detail"
+                )
             with Vertical(id="admin-workspace"):
                 yield Static(
                     "Tenant administration | changes are authorized by the server",
@@ -760,6 +860,9 @@ class ChatApp(App[None]):
             self.theme = self._system_theme
         table = self._main("#runs-table", DataTable)
         table.add_columns("Run ID", "Status", "Thread", "Steps", "Cost")
+        self._main("#approvals-table", DataTable).add_columns(
+            "Batch", "Status", "Run", "Step", "Tools", "Expires"
+        )
         self._main("#prompt", PromptInput).focus()
         self.set_interval(0.1, self._tick)
         self.sub_title = self.session.settings.base_url
@@ -796,7 +899,8 @@ class ChatApp(App[None]):
     async def _add(self, widget: Static | Markdown) -> None:
         chat = self._main("#chat", VerticalScroll)
         await chat.mount(widget)
-        chat.scroll_end(animate=False)
+        if self._follow:
+            chat.scroll_end(animate=False)
 
     async def _note(self, text: str, *, style: str = "") -> Static:
         w = Static(
@@ -887,7 +991,7 @@ class ChatApp(App[None]):
             or not isinstance(capabilities.get("actions"), list)
             or not all(isinstance(action, str) for action in capabilities["actions"])
             or not isinstance(capabilities.get("event_schemas"), list)
-            or "redis-stream.v1" not in capabilities.get("event_schemas", [])
+            or "run-events.v1" not in capabilities.get("event_schemas", [])
         ):
             raise HaasAPIError(
                 "Server capability/event schema is incompatible; update the client.",
@@ -898,6 +1002,13 @@ class ChatApp(App[None]):
     def _accept_identity(self, identity: Any) -> dict[str, Any]:
         verified = self._validate_identity(identity)
         self.identity = verified
+        capabilities = verified.get("capabilities")
+        features = (
+            capabilities.get("features") if isinstance(capabilities, dict) else None
+        )
+        self.session.output_deltas = isinstance(features, list) and (
+            OUTPUT_DELTA_FEATURE in features
+        )
         self.session.settings.environment = verified["environment"]
         self._refresh_admin_visibility()
         return verified
@@ -968,12 +1079,18 @@ class ChatApp(App[None]):
             )
         if s.secrets:
             parts.append(f"secrets: {len(s.secrets)}")
+        if not self._follow:
+            parts.append("PAUSED (ctrl+f)" if self._ascii else "⏸ paused (ctrl+f)")
+        elif self.session.output_deltas and self.session.live_output:
+            parts.append("live" if self._ascii else "◉ live")
         separator = " | " if self._ascii else " │ "
         self._main("#status", Static).update(Text(separator.join(parts)))
 
     def _tick(self) -> None:
         if not self.screen_stack:
             return
+        if self._preview_dirty:
+            self._render_preview()
         try:
             act = self._main("#activity", Static)
         except NoMatches:  # timer can fire before the screen finishes composing
@@ -1225,6 +1342,7 @@ class ChatApp(App[None]):
                     if not decisions_enabled
                     else None
                 ),
+                binding=self.session.pending_approval,
             )
         )
         if decision is None:
@@ -1245,8 +1363,84 @@ class ChatApp(App[None]):
         self._phase = "resuming"
         return decision
 
+    def _render_preview(self) -> None:
+        self._preview_dirty = False
+        if self._preview is None:
+            return
+        text = Text(
+            sanitize_terminal_text(self._preview_text, limit=MAX_RENDERED_OUTPUT)
+        )
+        if self._preview_truncated:
+            text.append(
+                "\n[live preview truncated; final output follows]"
+                if self._ascii
+                else "\n… live preview truncated; final output follows",
+                style="dim",
+            )
+        self._preview.update(text)
+        if self._follow:
+            self._main("#chat", VerticalScroll).scroll_end(animate=False)
+
+    async def _on_output_delta(self, d: dict[str, Any]) -> None:
+        try:
+            key = (int(d["step"]), int(d["attempt"]), int(d["call"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        text = d.get("text")
+        if not isinstance(text, str):
+            return
+        if key != self._preview_key:
+            # A new step, retry or provider-call attempt restarts the live buffer.
+            self._preview_key = key
+            self._preview_text = ""
+            self._preview_truncated = False
+            if self._preview is None:
+                self._preview = Static("", classes="live-output")
+                await self._add(self._preview)
+        if len(self._preview_text) < MAX_RENDERED_OUTPUT:
+            self._preview_text += text[: MAX_RENDERED_OUTPUT - len(self._preview_text)]
+        if d.get("truncated") or len(self._preview_text) >= MAX_RENDERED_OUTPUT:
+            self._preview_truncated = True
+        self._preview_dirty = True
+        if d.get("final"):
+            self._render_preview()
+
+    async def _settle_preview(self, *, discard: bool) -> None:
+        """Closes the live preview when the durable log moves past the streamed call."""
+        preview = self._preview
+        self._preview, self._preview_key = None, None
+        self._preview_dirty = False
+        if preview is None:
+            return
+        if discard or not self._preview_text.strip():
+            await preview.remove()
+        else:
+            preview.update(
+                Text(
+                    sanitize_terminal_text(
+                        self._preview_text, limit=MAX_RENDERED_OUTPUT
+                    ),
+                    style="dim",
+                )
+            )
+            preview.add_class("settled")
+        self._preview_text = ""
+        self._preview_truncated = False
+
     async def _on_event(self, ev: SSEEvent) -> None:
         d = ev.data
+        if ev.event == OUTPUT_DELTA_EVENT:
+            if isinstance(d, dict):
+                await self._on_output_delta(d)
+            return
+        if self._preview is not None:
+            retry = (
+                ev.event == "step_started"
+                and self._preview_key is not None
+                and str(d.get("step")) == str(self._preview_key[0])
+            )
+            # The durable run_completed output supersedes the advisory preview.
+            await self._settle_preview(discard=retry or ev.event == "run_completed")
         if ev.event == "run_queued":
             self.healthy = True
             self._phase = "queued"
@@ -1322,6 +1516,30 @@ class ChatApp(App[None]):
             )
         elif ev.event in ("hitl_approved", "hitl_rejected"):
             self._phase = "running tools"
+        elif ev.event == "run_cancelling":
+            self._phase = "cancelling"
+            await self._note(
+                f"Cancellation requested; waiting for {d.get('outstanding_tools', '?')} "
+                "in-flight tool(s) to settle.",
+                style="yellow",
+            )
+        elif ev.event == "run_recovering":
+            await self._note(
+                f"Run recovered by the reconciler "
+                f"({sanitize_terminal_text(d.get('reason', 'unknown'), limit=40)}, "
+                f"attempt {sanitize_terminal_text(d.get('attempt', '?'), limit=8)}).",
+                style="dim",
+            )
+        elif ev.event == "approval_expired":
+            await self._note(
+                "The pending approval expired before a decision was recorded.",
+                style="yellow",
+            )
+        elif ev.event == "stream_gap":
+            await self._note(
+                "Stream cursor was ahead of the server; replay restarted at the latest event.",
+                style="dim",
+            )
         self._refresh_bars()
 
     async def _tool_card(self, call_id: str, name: str, detail: str) -> Static:
@@ -1822,6 +2040,9 @@ class ChatApp(App[None]):
         self._main("#nav-admin", Button).variant = (
             "primary" if workspace == "admin-workspace" else "default"
         )
+        self._main("#nav-approvals", Button).variant = (
+            "primary" if workspace == "approvals-workspace" else "default"
+        )
 
     async def action_show_admin(self) -> None:
         if not self._has_audit_role():
@@ -1867,24 +2088,13 @@ class ChatApp(App[None]):
                 style="yellow",
             )
             return
-        calls: list[PendingCall] = []
-        for item in raw_calls:
-            if not isinstance(item, dict):
-                await self._note(
-                    "The approval data from the API is malformed.", style="red"
-                )
-                return
-            function = item.get("function")
-            function_data = function if isinstance(function, dict) else {}
-            call_id = item.get("id", item.get("tool_call_id"))
-            name = item.get("name", function_data.get("name"))
-            arguments = item.get("arguments", function_data.get("arguments", {}))
-            if not isinstance(call_id, str) or not isinstance(name, str):
-                await self._note(
-                    "The approval data from the API is malformed.", style="red"
-                )
-                return
-            calls.append(PendingCall(call_id, name, arguments))
+        calls = pending_calls_from(raw_calls)
+        if calls is None:
+            await self._note(
+                "The approval data from the API is malformed.", style="red"
+            )
+            return
+        binding = ApprovalBinding.parse(run.get("approval"))
         if not calls:
             await self._note(
                 f"Run {sanitize_terminal_text(run_id, limit=64)} has no pending approval.",
@@ -1892,7 +2102,9 @@ class ChatApp(App[None]):
             )
             return
 
-        decision = await self.push_screen_wait(ApprovalScreen(calls, ascii=self._ascii))
+        decision = await self.push_screen_wait(
+            ApprovalScreen(calls, ascii=self._ascii, binding=binding)
+        )
         if decision is None:
             await self._note(
                 f"Approval for {sanitize_terminal_text(run_id, limit=64)} remains pending.",
@@ -1904,6 +2116,8 @@ class ChatApp(App[None]):
                 run_id,
                 decision.approved,
                 rejection_reason=decision.reason,
+                batch_id=binding.batch_id if binding else None,
+                batch_digest=binding.batch_digest if binding else None,
             )
         except HaasAPIError as exc:
             self._sync_auth_state()
@@ -1920,6 +2134,208 @@ class ChatApp(App[None]):
             style="green" if decision.approved else "yellow",
         )
 
+    async def action_show_approvals(self) -> None:
+        self._switch_workspace("approvals-workspace")
+        await self._load_approvals()
+        self._main("#approvals-table", DataTable).focus()
+
+    async def action_refresh_approvals(self) -> None:
+        await self._load_approvals()
+
+    async def action_cycle_approval_filter(self) -> None:
+        index = APPROVAL_FILTERS.index(self._approval_filter)
+        self._approval_filter = APPROVAL_FILTERS[(index + 1) % len(APPROVAL_FILTERS)]
+        self._main(
+            "#approvals-filter", Button
+        ).label = f"Filter: {self._approval_filter}"
+        await self._load_approvals()
+
+    async def _load_approvals(self) -> None:
+        if self._loading_approvals:
+            return
+        self._loading_approvals = True
+        table = self._main("#approvals-table", DataTable)
+        detail = self._main("#approval-detail", Static)
+        table.clear(columns=False)
+        self._approvals.clear()
+        self._selected_batch_id = None
+        try:
+            response = await self.session.client.list_approvals(
+                status=self._approval_filter
+            )
+            items = response.get("items")
+            if not isinstance(items, list) or not all(
+                isinstance(item, dict) for item in items
+            ):
+                raise HaasAPIError(
+                    "Approval inbox response has an invalid items field."
+                )
+            for item in items:
+                batch_id = str(item["batch_id"])
+                self._approvals[batch_id] = item
+                calls = item.get("tool_calls") or []
+                tools = ", ".join(
+                    str(c.get("name", "?")) for c in calls if isinstance(c, dict)
+                )
+                status = str(item.get("status", "?"))
+                if item.get("expired"):
+                    status += " (expired)"
+                table.add_row(
+                    sanitize_terminal_text(batch_id, limit=12),
+                    sanitize_terminal_text(status, limit=24),
+                    sanitize_terminal_text(item.get("run_id", ""), limit=40),
+                    str(item.get("step_number", "?")),
+                    sanitize_terminal_text(tools or "-", limit=60),
+                    sanitize_terminal_text(item.get("expires_at", ""), limit=32),
+                    key=batch_id,
+                )
+            if items:
+                table.move_cursor(row=0)
+                self._select_approval(str(items[0]["batch_id"]))
+            else:
+                detail.update(f"No {self._approval_filter} approvals.")
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            detail.update(
+                Text(
+                    f"Could not load approvals: {sanitize_terminal_text(exc, limit=400)}",
+                    style="red",
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            detail.update(
+                Text(
+                    f"Invalid approval response: {sanitize_terminal_text(exc, limit=300)}",
+                    style="red",
+                )
+            )
+        finally:
+            self._loading_approvals = False
+            self._update_approval_actions()
+
+    def _select_approval(self, batch_id: str) -> None:
+        self._selected_batch_id = batch_id if batch_id in self._approvals else None
+        item = self._approvals.get(self._selected_batch_id or "")
+        detail = self._main("#approval-detail", Static)
+        if item is None:
+            detail.update("Select an approval batch to review.")
+        else:
+            decision = item.get("decision") or {}
+            decided = (
+                f" | {decision.get('decision')} by "
+                f"{str(decision.get('decided_by') or '?')[:8]}"
+                f"{': ' + str(decision['reason']) if decision.get('reason') else ''}"
+                if decision
+                else ""
+            )
+            detail.update(
+                Text(
+                    sanitize_terminal_text(
+                        f"batch {item.get('batch_id')} | run {item.get('run_id')} | "
+                        f"thread {item.get('thread_id')}\n"
+                        f"digest {item.get('batch_digest')}{decided}",
+                        limit=600,
+                    )
+                )
+            )
+        self._update_approval_actions()
+
+    def _update_approval_actions(self) -> None:
+        try:
+            item = self._approvals.get(self._selected_batch_id or "")
+            self._main("#approvals-review", Button).disabled = (
+                item is None
+                or item.get("status") != "pending"
+                or bool(item.get("expired"))
+            )
+        except NoMatches:
+            return
+
+    async def action_review_selected_approval(self) -> None:
+        batch_id = self._selected_batch_id
+        if batch_id is None:
+            await self._note("Select an approval batch to review.", style="yellow")
+            return
+        if not self.identity or "approver" not in self.identity["roles"]:
+            self._main("#approval-detail", Static).update(
+                Text(
+                    "Reviewing pending actions requires the approver role.",
+                    style="yellow",
+                )
+            )
+            return
+        try:
+            batch = await self.session.client.get_approval(batch_id)
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            self._main("#approval-detail", Static).update(
+                Text(
+                    f"Could not load batch: {sanitize_terminal_text(exc, limit=400)}",
+                    style="red",
+                )
+            )
+            return
+        binding = ApprovalBinding.parse(batch)
+        calls = pending_calls_from(batch.get("tool_calls"))
+        if batch.get("status") != "pending" or batch.get("expired"):
+            await self._load_approvals()
+            self._main("#approval-detail", Static).update(
+                Text("This batch is no longer pending.", style="yellow")
+            )
+            return
+        if binding is None or not calls:
+            self._main("#approval-detail", Static).update(
+                Text("The approval data from the API is malformed.", style="red")
+            )
+            return
+        decision = await self.push_screen_wait(
+            ApprovalScreen(calls, ascii=self._ascii, binding=binding)
+        )
+        if decision is None:
+            return
+        try:
+            result = await self.session.client.decide_approval(
+                binding.batch_id,
+                approve=decision.approved,
+                batch_digest=binding.batch_digest,
+                reason=decision.reason,
+            )
+        except HaasAPIError as exc:
+            self._sync_auth_state()
+            self._main("#approval-detail", Static).update(
+                Text(
+                    "Decision was not accepted: "
+                    f"{sanitize_terminal_text(exc, limit=400)}",
+                    style="red",
+                )
+            )
+            return
+        verb = "Approved" if decision.approved else "Rejected"
+        await self._note(
+            f"{verb} batch {sanitize_terminal_text(binding.batch_id, limit=40)}; "
+            f"run status: {sanitize_terminal_text(result.get('status', 'unknown'), limit=32)}.",
+            style="green" if decision.approved else "yellow",
+        )
+        await self._load_approvals()
+
+    async def action_inspect_selected(self) -> None:
+        run_id = self._selected_run_id or self.session.last_run_id
+        if run_id is None:
+            await self._note("Select a run to inspect.", style="yellow")
+            return
+        self._switch_workspace("runs-workspace")
+        body = self._main("#run-inspector-body", Static)
+        result = await handle_command(self.session, f"/inspect {run_id}")
+        self._sync_auth_state()
+        body.update(
+            Text(
+                sanitize_terminal_text(
+                    "\n".join(result.lines), limit=MAX_RENDERED_OUTPUT
+                ),
+                style="red" if result.error else "",
+            )
+        )
+
     async def action_show_chat(self) -> None:
         self._switch_workspace("chat-workspace")
         self._main("#prompt", PromptInput).focus()
@@ -1933,6 +2349,7 @@ class ChatApp(App[None]):
         self._switch_workspace("chat-workspace")
         await self._note(
             "Ctrl+1 Chat | Ctrl+2 Runs | Ctrl+3 Admin/audit (authorized roles) | "
+            "Ctrl+4 Approval inbox (digest-bound decisions) | "
             "Ctrl+P command palette | F6 next focus | "
             "Esc detaches locally (server run continues). In Runs, select a row to "
             "attach or request cooperative cancellation. Cancellation cannot stop an "
@@ -2110,9 +2527,10 @@ class ChatApp(App[None]):
         try:
             run = self._runs.get(self._selected_run_id or "")
             self._main("#runs-attach", Button).disabled = run is None or self.busy
-            self._main("#runs-cancel", Button).disabled = run is None or run.get(
-                "status"
-            ) not in ("running", "input_required")
+            self._main("#runs-inspect", Button).disabled = run is None
+            self._main("#runs-cancel", Button).disabled = (
+                run is None or run.get("status") not in CANCELLABLE_STATUSES
+            )
         except NoMatches:
             return
 
@@ -2196,12 +2614,44 @@ class ChatApp(App[None]):
     async def _on_runs_cancel(self) -> None:
         await self.action_cancel_selected()
 
+    @on(Button.Pressed, "#runs-inspect")
+    async def _on_runs_inspect(self) -> None:
+        await self.action_inspect_selected()
+
+    @on(Button.Pressed, "#nav-approvals")
+    async def _on_nav_approvals(self) -> None:
+        await self.action_show_approvals()
+
+    @on(Button.Pressed, "#approvals-refresh")
+    async def _on_approvals_refresh(self) -> None:
+        await self.action_refresh_approvals()
+
+    @on(Button.Pressed, "#approvals-filter")
+    async def _on_approvals_filter(self) -> None:
+        await self.action_cycle_approval_filter()
+
+    @on(Button.Pressed, "#approvals-review")
+    async def _on_approvals_review(self) -> None:
+        await self.action_review_selected_approval()
+
+    @on(DataTable.RowHighlighted, "#approvals-table")
+    def _on_approval_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._select_approval(str(event.row_key.value))
+
     def action_detach(self) -> None:
         if self.busy:
             self.workers.cancel_group(self, "turn")
 
     async def action_clear_screen(self) -> None:
+        self._preview, self._preview_key = None, None
+        self._preview_text, self._preview_dirty = "", False
         await self._main("#chat", VerticalScroll).remove_children()
+
+    def action_toggle_follow(self) -> None:
+        self._follow = not self._follow
+        if self._follow:
+            self._main("#chat", VerticalScroll).scroll_end(animate=False)
+        self._refresh_bars()
 
     async def action_new_chat(self) -> None:
         if self.busy:

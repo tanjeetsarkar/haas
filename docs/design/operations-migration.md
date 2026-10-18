@@ -80,20 +80,20 @@ provider throttling, slow tools, reconnect storms and Redis/database failover.
 
 | Failure point | CURRENT consequence | TARGET recovery / owner |
 |---|---|---|
-| DB insert succeeds; first enqueue fails | Run may remain `running` with no task | Committed outbox intent retried; stalled admission alert |
+| DB insert succeeds; first enqueue fails | Phase 3: admission commits an outbox intent; the relay retries it | Committed outbox intent retried; stalled admission alert |
 | Secret write succeeds; create fails | Secret key remains until TTL | Admission staging cleanup; no durable raw secrets |
-| Model response received; checkpoint fails | Retry may incur another model call/charge | Stable attempt record, usage uncertainty and bounded reconciliation |
-| Checkpoint succeeds; chord dispatch fails | Run can remain stranded | Invocation/outbox records re-dispatched with dedupe |
-| Tool succeeds; worker dies before result | Redelivery can repeat effect | Destination idempotency/receipt lookup or `unknown` for manual reconciliation |
-| One chord child disappears / backend expires | Callback may never complete | Persist invocation outcomes independently; join reconciler and step deadline |
-| Resume claim succeeds; process crashes before dispatch | Run now running; pending work can be stranded | Decision + state + outbox in one transaction |
-| Stale aggregate/finalizer arrives | General updates have no state-version fencing | Reject old lease epoch/state version and retain audit |
+| Model response received; checkpoint fails | Phase 3: per-attempt `run_steps` + reserved ledger row; lost attempt becomes `uncertain` (counted as spent) and the reconciler requeues with a new epoch | Stable attempt record, usage uncertainty and bounded reconciliation |
+| Checkpoint succeeds; chord dispatch fails | Phase 3: no chords; invocations + signed envelopes are outbox rows retried by the relay | Invocation/outbox records re-dispatched with dedupe |
+| Tool succeeds; worker dies before result | Phase 3: redelivery repeats the same `effect_key` (`Idempotency-Key`); missing outcome → `unknown` after `TOOL_OUTCOME_TIMEOUT_SEC` | Destination idempotency/receipt lookup or `unknown` for manual reconciliation |
+| One chord child disappears / backend expires | Phase 3: outcomes are recorded on `tool_invocations`, independent of the result backend; reconciler marks lost ones `unknown` | Persist invocation outcomes independently; join reconciler and step deadline |
+| Resume claim succeeds; process crashes before dispatch | Phase 3: decision + state + outbox commit in one transaction | Decision + state + outbox in one transaction |
+| Stale aggregate/finalizer arrives | Phase 3: rejected by `lease_epoch`/`state_version` fencing | Reject old lease epoch/state version and retain audit |
 | Run finalizes; thread update fails | Run/thread can disagree | Run + committed thread history transaction with thread version |
-| Final DB update succeeds; event/callback scheduling fails | Missing terminal notification | Durable terminal event + outbox; replay and delivery dispatcher |
+| Final DB update succeeds; event/callback scheduling fails | Phase 3: terminal event + callback intent commit with finalization; callback delivery itself is not yet persisted (P5) | Durable terminal event + outbox; replay and delivery dispatcher |
 | Redis unavailable / at capacity | Broker, results, secrets and stream impacted together | Durable DB state retained; admission backpressure; rebuild projections/reconcile work |
 | PostgreSQL unavailable | No authoritative progress/ownership | Fail closed; do not dispatch unverifiable work; recover leases after restore |
 | Secret TTL expires during approval | Tool sees missing credential/remediation error | Refresh authorized short-lived grant at execution; explicit missing-binding status |
-| Tenant revoked during execution | Current stored policy does not actively stop work | Revocation epoch, grant revoke, fenced dispatch and sandbox termination |
+| Tenant revoked during execution | Phase 3: suspension cancels active runs (fenced); worker-time policy revalidation and sandbox termination remain P4 | Revocation epoch, grant revoke, fenced dispatch and sandbox termination |
 | Callback receiver unavailable | Retry, then log permanent failure | Persist attempts, bounded retries, DLQ, operator-triggered replay |
 
 No recovery job may blindly resubmit side-effecting calls. It must inspect invocation
@@ -302,6 +302,37 @@ Qualify against a **disposable** PostgreSQL 16 database with all migrations appl
 `HAAS_TEST_POSTGRES_DSN=... pytest -q tests/test_phase2_database.py`. The tests deliberately
 create database roles and perform schema cutover; never point them at customer data.
 
+### Phase 3 operator runbook
+
+Migration `0009_durable_workflow` changes run states and adds the workflow tables. Its
+upgrade **refuses while any run is `running` or `input_required`**; its downgrade refuses
+while non-terminal runs or pending outbox messages exist.
+
+1. Disable admission, let active runs finish or cancel them, and decide or cancel paused
+   approvals. Old in-flight Celery chords are not compatible with the new task names.
+2. Generate an Ed25519 envelope keypair with `python -m app.core.envelope` and store both
+   values in the secret manager. Give `HAAS_ENVELOPE_SIGNING_KEY` **only** to the
+   orchestrator and `HAAS_ENVELOPE_VERIFY_KEY` **only** to tool workers. Production
+   startup refuses missing keys and the built-in development keys.
+3. Optionally set `MODEL_PRICING_JSON` for pre-dispatch reservations and tune
+   `LEASE_TTL_SEC`, `APPROVAL_TTL_SEC`, `TOOL_OUTCOME_TIMEOUT_SEC`, `STALL_TIMEOUT_SEC`,
+   `DEFAULT_RUN_DEADLINE_SEC` and `RECONCILE_INTERVAL_SEC` (see `.env.example`).
+4. Run `alembic upgrade head` with the migration login.
+5. Deploy API, orchestrator, tool workers **and the maintenance service** together. The
+   production API refuses to run the relay/reconciler in-process; without the maintenance
+   service, admitted runs stay `queued`. The development profile runs it inside the API.
+6. Upgrade CLI/TUI clients: SSE cursors are now integers (`run-events.v1`); legacy
+   `N-N` cursors are reset to a full replay. Production resumes must bind
+   `batch_id`/`batch_digest`.
+7. Monitor pending `outbox_messages`, `run_recovering` events and `unknown` invocations;
+   unknown effects require operator reconciliation with the destination, never blind retry.
+
+Key rotation: verification accepts exactly one key, so rotation needs a short dispatch
+pause. Stop the maintenance relay, wait until tool queues drain, deploy the new signing key
+to the orchestrator and the matching verify key to tool workers, then restart the relay.
+An envelope that reaches a worker with a mismatched key is rejected without executing;
+its invocation becomes `unknown` after `TOOL_OUTCOME_TIMEOUT_SEC`.
+
 ### Compatibility and rollback
 
 * Preserve baseline `/v1` until authenticated clients and a versioned event/state
@@ -335,11 +366,13 @@ Docker-backed deterministic E2E stack. Relevant existing coverage includes:
 | [Skill policy tests](../../tests/test_skill_policy.py) | Allowlists, readiness, hidden skills and registry drift |
 | [Plugin tests](../../tests/plugins/) | Discovery, pack behaviors and mocked integrations |
 | [Client/TUI tests](../../tests/cli/) | Session, reconnect, approvals and UI behaviors |
-| [E2E driver](../../tests/e2e/run_e2e.py) | Chords/queues, approvals, rejection, ownership, budgets, callbacks and worker config |
+| [Phase 3 workflow tests](../../tests/test_phase3_workflow.py) | Real-PostgreSQL outbox, fencing, crash/redelivery, approvals, cancellation, budgets, events and reconciler |
+| [E2E driver](../../tests/e2e/run_e2e.py) | Queues, digest-bound approvals, durable replay, rejection, ownership, budgets, cancellation, callbacks and worker config |
 
 Identity/API tests and the Phase 2 PostgreSQL suite now cover verified identity, RLS,
-pool cleanup, immutable revisions, thread races and operator cutover. Sandbox/outbox,
-destination effects and the rest of the target qualification remain outstanding.
+pool cleanup, immutable revisions, thread races and operator cutover. The Phase 3 suite
+covers the outbox, leases, crash boundaries and approvals. Sandbox isolation, destination
+receipt lookup and the rest of the target qualification remain outstanding.
 
 ### Target release qualification
 

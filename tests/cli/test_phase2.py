@@ -135,7 +135,7 @@ async def test_agent_draft_keyboard_form_and_role_gate():
         app.identity["capabilities"] = {
             "version": "1",
             "actions": [],
-            "event_schemas": ["redis-stream.v1"],
+            "event_schemas": ["run-events.v1"],
         }
         assert not app._has_admin_role()
 

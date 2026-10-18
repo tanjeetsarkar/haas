@@ -255,6 +255,36 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml down -v
 
+  api-contract:
+    name: API contract (Spectral, AsyncAPI, oasdiff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Spectral lint (OpenAPI style gate)
+        run: npx -y @stoplight/spectral-cli@6 lint docs/openapi-v1.json --ruleset .spectral.yaml --fail-severity=error
+      - name: AsyncAPI validate (streams and webhook contracts)
+        env:
+          ASYNCAPI_METRICS: "false"
+        run: npx -y @asyncapi/cli@6.2.1 validate docs/asyncapi.yaml --fail-severity=error
+      - name: Breaking-change gate (oasdiff)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || ! git cat-file -e "$BASE_SHA:docs/openapi-v1.json" 2>/dev/null; then
+            echo "No base OpenAPI snapshot to compare against; skipping."
+            exit 0
+          fi
+          mkdir -p /tmp/oas
+          git show "$BASE_SHA:docs/openapi-v1.json" > /tmp/oas/base.json
+          docker run --rm -v /tmp/oas:/base:ro -v "$PWD":/rev:ro tufin/oasdiff:v1.33.0 \
+            breaking /base/base.json /rev/docs/openapi-v1.json \
+            --fail-on ERR --err-ignore /rev/docs/api-breaking-allowlist.txt
+
   supply-chain:
     name: Secrets, vulnerabilities and SBOM
     runs-on: ubuntu-latest

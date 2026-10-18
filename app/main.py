@@ -8,14 +8,14 @@ import logging
 import math
 import re
 import secrets
+import time
 import uuid
 from collections.abc import Collection
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Literal, cast
+from typing import Any, AsyncGenerator, Literal
 from uuid import UUID
 
 import asyncpg
-from celery import Task, chord, group
 from fastapi import (
     Depends,
     FastAPI,
@@ -27,7 +27,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis.exceptions import RedisError
 
 from app.core.config import settings, validate_profile_settings
@@ -51,6 +51,13 @@ from app.core.http import (
 from app.core.identity import IdentityAuthenticator, IdentityMiddleware
 from app.core.maintenance import maintenance_loop
 from app.core.observability import configure_logging, configure_observability
+from app.core import openai_compat as oai
+from app.core.output_stream import (
+    OUTPUT_DELTA_EVENT,
+    OUTPUT_DELTA_FEATURE,
+    decode_delta,
+    delta_key,
+)
 from app.core.plugins import registry, resolve_run_allowlist
 from app.core.store import (
     DistributedStore,
@@ -58,20 +65,29 @@ from app.core.store import (
     StoreNotFoundError,
     ThreadOwnershipError,
 )
+from app.core.envelope import sha256_hex
+from app.core.identity import IdentityError, IdentityUnavailable
+from app.core.workflow import (
+    TERMINAL_EVENTS,
+    IdempotencyConflictError,
+    IdempotentReplay,
+    run_error_code,
+)
 from app.core.tenant_policy import (
     TenantPolicyRules,
     TenantPolicy,
     TenantPolicyIntegrityError,
     policy_digest,
 )
-from app.worker.dispatch import signature_for
-from app.worker.tasks import aggregate_step_task, execute_tool_task, llm_step_task
+from app.worker.tasks import make_outbox_publisher
 
 log = logging.getLogger(__name__)
 store = DistributedStore()
 identity_authenticator = IdentityAuthenticator(store, settings)
 
-TERMINAL_STATUSES = ("completed", "failed", "cancelled", "input_required")
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,255}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 
 
@@ -110,6 +126,7 @@ async def lifespan(app: FastAPI):
         settings.plugins_dir.mkdir(parents=True, exist_ok=True)
         registry.discover_from_settings(settings)
         await store.init()
+        store.outbox_publisher = make_outbox_publisher(store)
         if settings.haas_profile == "dev":
             maintenance = asyncio.create_task(
                 maintenance_loop(store), name="haas-maintenance"
@@ -130,6 +147,40 @@ async def lifespan(app: FastAPI):
         await store.close()
 
 
+class RequestIdMiddleware:
+    """Propagates or assigns X-Request-ID; handlers that audit may set their own."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        incoming = next(
+            (
+                value.decode("latin-1")
+                for key, value in scope.get("headers", [])
+                if key.lower() == b"x-request-id"
+            ),
+            "",
+        )
+        request_id = (
+            incoming if REQUEST_ID_RE.fullmatch(incoming) else str(uuid.uuid4())
+        )
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        async def send_with_id(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                if not any(key.lower() == b"x-request-id" for key, _ in headers):
+                    headers.append((b"x-request-id", request_id.encode("latin-1")))
+                    message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_id)
+
+
 app = FastAPI(title=settings.app_name, version="3.0.0", lifespan=lifespan)
 configure_observability(app)
 app.add_middleware(
@@ -144,6 +195,7 @@ app.add_middleware(
     DatabaseTenantMiddleware,
     allow_legacy_dev=settings.haas_profile == "dev",
 )
+app.add_middleware(RequestIdMiddleware)
 app.add_exception_handler(HTTPException, http_exception_problem)
 app.add_exception_handler(RequestValidationError, validation_problem)
 app.add_exception_handler(Exception, unexpected_problem)
@@ -163,11 +215,24 @@ class CreateRunRequest(BaseModel):
     max_cost_usd: float | None = Field(default=None, gt=0.0, le=10.0)
     webhook_url: str | None = None
     secrets: dict[str, str] = Field(default_factory=dict)
+    deadline_sec: int | None = Field(default=None, ge=10, le=86_400)
+    max_tool_invocations: int | None = Field(default=None, ge=1, le=1_000)
 
 
 class ResumeRunRequest(BaseModel):
     approved: bool
-    rejection_reason: str | None = None
+    rejection_reason: str | None = Field(default=None, max_length=2_000)
+    secrets: dict[str, str] = Field(default_factory=dict)
+    batch_id: UUID | None = None
+    batch_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approve", "reject"]
+    batch_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str | None = Field(default=None, max_length=2_000)
     secrets: dict[str, str] = Field(default_factory=dict)
 
 
@@ -529,10 +594,33 @@ async def list_runs(
 async def create_run(
     req: CreateRunRequest,
     request: Request,
+    response: Response,
     x_tenant_id: str = Header(default="default-tenant"),
     traceparent: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     identity = get_authenticated_identity(request)
+    admission: dict[str, Any] | None = None
+    if idempotency_key is not None:
+        if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+            raise HTTPException(
+                422, "Idempotency-Key must be 1-255 URL-safe characters."
+            )
+        admission = {
+            "principal_key": identity.principal_id if identity else "legacy-dev",
+            "idempotency_key": idempotency_key,
+            "request_digest": _admission_digest(req),
+        }
+        previous = await store.find_admission(
+            x_tenant_id, admission["principal_key"], idempotency_key
+        )
+        if previous is not None:
+            if previous["request_digest"] != admission["request_digest"]:
+                raise HTTPException(
+                    409, "Idempotency-Key was already used with a different request."
+                )
+            response.headers["Idempotent-Replayed"] = "true"
+            return previous["response"]
     policy = await _get_tenant_policy(x_tenant_id) if identity else None
     if req.agent_revision_id is not None:
         if policy is None:
@@ -672,6 +760,17 @@ async def create_run(
         )
     history.append({"role": "user", "content": req.prompt})
 
+    result = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "status": "queued",
+        "stream_url": f"/v1/runs/{run_id}/stream",
+        "events_url": f"/v1/runs/{run_id}/events",
+    }
+    if admission is not None:
+        admission["response"] = result
+    # Secrets must exist before admission commits: the outbox relay may dispatch immediately.
+    await store.store_ephemeral_secrets(run_id, req.secrets)
     try:
         await store.create_run(
             run_id=run_id,
@@ -693,25 +792,37 @@ async def create_run(
             if req.agent_revision_id
             else None,
             expected_history_version=req.expected_history_version,
+            admission=admission,
+            deadline_sec=req.deadline_sec,
+            max_tool_invocations=req.max_tool_invocations,
         )
+    except IdempotentReplay as replay:
+        await store.clear_ephemeral_secrets(run_id)
+        response.headers["Idempotent-Replayed"] = "true"
+        return replay.response
+    except IdempotencyConflictError as exc:
+        await store.clear_ephemeral_secrets(run_id)
+        raise HTTPException(
+            409, "Idempotency-Key was already used with a different request."
+        ) from exc
     except StoreConflictError as exc:
+        await store.clear_ephemeral_secrets(run_id)
         raise HTTPException(409, str(exc)) from exc
     except ThreadOwnershipError as exc:
+        await store.clear_ephemeral_secrets(run_id)
         raise HTTPException(404, "Thread not found.") from exc
-    await store.store_ephemeral_secrets(run_id, req.secrets)
-    await store.publish_event(
-        run_id, "run_queued", {"run_id": run_id, "thread_id": thread_id}
-    )
+    except BaseException:
+        await store.clear_ephemeral_secrets(run_id)
+        raise
+    return result
 
-    # Dispatch step 1 to the orchestrator queue
-    cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
 
-    return {
-        "run_id": run_id,
-        "thread_id": thread_id,
-        "status": "running",
-        "stream_url": f"/v1/runs/{run_id}/stream",
-    }
+def _admission_digest(req: CreateRunRequest) -> str:
+    """Canonical request digest; secret values are hashed so they never persist."""
+    body = req.model_dump(mode="json", exclude_unset=True)
+    if "secrets" in body:
+        body["secrets"] = {k: sha256_hex(v) for k, v in sorted(body["secrets"].items())}
+    return sha256_hex(body)
 
 
 @app.post(
@@ -724,10 +835,12 @@ async def cancel_run(
     x_tenant_id: str = Header(default="default-tenant"),
 ) -> dict[str, str]:
     await _get_owned_run(run_id, x_tenant_id)
-    if not await store.cancel_run(run_id, x_tenant_id):
+    outcome = await store.request_cancel(run_id, x_tenant_id)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if outcome == "terminal":
         raise HTTPException(status_code=409, detail="Run is already terminal.")
-    await store.publish_event(run_id, "run_cancelled", {"run_id": run_id})
-    return {"run_id": run_id, "status": "cancelled"}
+    return {"run_id": run_id, "status": outcome}
 
 
 @app.post(
@@ -741,10 +854,11 @@ async def resume_run(
     request: Request,
     response: Response,
     x_tenant_id: str = Header(default="default-tenant"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     """
-    Resumes a paused `input_required` run. The `input_required -> running` transition is a
-    single conditional UPDATE, so two approvers can never double-decide the same batch.
+    Records the decision for the run's pending approval batch. Exactly one decision wins;
+    production clients must bind `batch_id` and `batch_digest` from the approval record.
     """
     run = await _get_owned_run(run_id, x_tenant_id)
     identity = get_authenticated_identity(request)
@@ -757,90 +871,71 @@ async def resume_run(
             status_code=409,
             detail=f"Run status is '{run['status']}', not 'input_required'.",
         )
+    decision = await _decide(
+        request,
+        response,
+        x_tenant_id,
+        run_id=run_id,
+        batch_id=str(req.batch_id) if req.batch_id else None,
+        batch_digest=req.batch_digest,
+        approved=req.approved,
+        reason=req.rejection_reason,
+        secrets=req.secrets,
+        idempotency_key=idempotency_key,
+        require_binding=settings.haas_profile == "prod",
+    )
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "batch_id": decision["batch_id"],
+        "replayed": decision["replayed"],
+        "action": "approved_and_dispatched" if req.approved else "rejected_and_resumed",
+    }
+
+
+async def _decide(
+    request: Request,
+    response: Response,
+    tenant_id: str,
+    *,
+    run_id: str | None,
+    batch_id: str | None,
+    batch_digest: str | None,
+    approved: bool,
+    reason: str | None,
+    secrets: dict[str, str],
+    idempotency_key: str | None,
+    require_binding: bool,
+) -> dict[str, Any]:
+    if idempotency_key is not None and not IDEMPOTENCY_KEY_RE.fullmatch(
+        idempotency_key
+    ):
+        raise HTTPException(422, "Idempotency-Key must be 1-255 URL-safe characters.")
+    identity = get_authenticated_identity(request)
     request_id = str(uuid.uuid4())
     response.headers["X-Request-ID"] = request_id
-    if not await store.claim_resume(
-        run_id,
-        x_tenant_id,
-        actor_principal_id=identity.principal_id if identity else None,
-        request_id=request_id,
-        approved=req.approved,
-        pending_tool_count=len(run["pending_tool_calls"] or []),
-    ):
-        raise HTTPException(
-            status_code=409, detail="Resume already in progress for this run."
+    if secrets and run_id is not None:
+        await store.store_ephemeral_secrets(run_id, secrets)
+    try:
+        decision = await store.decide_approval(
+            tenant_id,
+            run_id=run_id,
+            batch_id=batch_id,
+            batch_digest_value=batch_digest,
+            approved=approved,
+            reason=reason,
+            actor_principal_id=identity.principal_id if identity else None,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            require_binding=require_binding,
         )
-
-    if req.secrets:
-        await store.store_ephemeral_secrets(run_id, req.secrets)
-
-    pending_calls: list[dict[str, Any]] = run["pending_tool_calls"] or []
-    active_skills = set(run["active_skills"])
-    messages = run["messages"]
-
-    if not req.approved:
-        reason = req.rejection_reason or "Rejected by human operator."
-        for tc in pending_calls:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "content": f"Action Denied by Human Operator: {reason}",
-                }
-            )
-        await store.save_checkpoint(
-            run_id,
-            step_count=int(run["step_count"]),
-            messages=messages,
-            active_skills=active_skills,
-            fingerprints=run["fingerprints"],
-            last_step_had_error=True,
-            status="running",
-            pending_tool_calls=None,
-        )
-        await store.publish_event(run_id, "hitl_rejected", {"reason": reason})
-        cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
-        return {"run_id": run_id, "status": "running", "action": "rejected_and_resumed"}
-
-    # Approver decision accepted: fan out the pending tools via Celery Canvas `chord`
-    await store.save_checkpoint(
-        run_id,
-        step_count=int(run["step_count"]),
-        messages=messages,
-        active_skills=active_skills,
-        fingerprints=run["fingerprints"],
-        status="running",
-        pending_tool_calls=None,
-    )
-    allowlist = run.get("skill_allowlist")
-    allowed_keys = registry.resolve_allowed_secrets(active_skills, allowlist)
-    scoped_secrets = await store.get_scoped_secrets(run_id, allowed_keys)
-
-    sigs = []
-    for tc in pending_calls:
-        tool = registry.tools.get(tc["function"]["name"])
-        sigs.append(
-            signature_for(
-                cast(Task, execute_tool_task),
-                run_id=run_id,
-                thread_id=run["thread_id"],
-                tenant_id=run["tenant_id"],
-                traceparent=run["traceparent"],
-                active_skills=sorted(active_skills),
-                skill_allowlist=allowlist,
-                allowed_secrets=sorted(allowed_keys),
-                scoped_secrets=scoped_secrets,
-                tool_call=tc,
-            ).set(queue=tool.queue if tool else "q_tools_fast")
-        )
-    callback = signature_for(cast(Task, aggregate_step_task), run_id=run_id).set(
-        queue="q_orchestrator"
-    )
-    chord(group(sigs))(callback)
-
-    await store.publish_event(run_id, "hitl_approved", {"dispatched_tools": len(sigs)})
-    return {"run_id": run_id, "status": "running", "action": "approved_and_dispatched"}
+    except StoreNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (StoreConflictError, IdempotencyConflictError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if decision["replayed"]:
+        response.headers["Idempotent-Replayed"] = "true"
+    return decision
 
 
 @app.get(
@@ -849,52 +944,188 @@ async def resume_run(
 )
 async def stream_run_events(
     run_id: str,
+    request: Request,
     x_tenant_id: str = Header(default="default-tenant"),
-    last_event_id: str = Header(default="0-0", alias="Last-Event-ID"),
+    last_event_id: str = Header(default="0", alias="Last-Event-ID"),
+    output_deltas: bool = Query(
+        default=False,
+        description=(
+            "Opt in to live `run.output.delta` previews when the server advertises "
+            "`output-deltas.v1`. Deltas carry no SSE id, are never replayed and are "
+            "superseded by `run_completed.output`."
+        ),
+    ),
 ) -> StreamingResponse:
     """
-    Zero-polling SSE endpoint powered by Redis Streams (`XREAD BLOCK`).
-    Works across multiple FastAPI replicas and resumes from `Last-Event-ID`.
+    SSE replay of the durable PostgreSQL event log. `id` is the per-run event sequence;
+    Redis only carries advisory wakeups, so replicas and reconnects never lose events.
     """
     await _get_owned_run(run_id, x_tenant_id)
-    stream_key = f"haas:stream:{run_id}"
+    credential = _bearer_credential(request)
+    deltas_on = output_deltas and settings.output_delta_enabled
 
     async def sse_generator() -> AsyncGenerator[str, None]:
-        cursor = last_event_id if re.fullmatch(r"\d+-\d+", last_event_id) else "0-0"
-        draining = False
+        cursor = int(last_event_id) if last_event_id.isdigit() else 0
+        wake_key = f"haas:wake:{run_id}"
+        wake_cursor = "$"
+        out_key = delta_key(run_id)
+        out_cursor = "0"
+        # (step, attempt) of the in-flight model call; deltas for anything else are stale.
+        live: tuple[int, int] | None = None
+        need_poll = True
+        last_write = last_auth = time.monotonic()
         while True:
-            entries = await store.rds.xread(
-                {stream_key: cursor}, count=50, block=None if draining else 5000
-            )
-            if entries:
-                _, stream_messages = entries[0]
-                for entry_id, fields in stream_messages:
-                    cursor = entry_id
-                    ev_type = fields.get("event_type", "message")
-                    payload = fields.get("payload_json", "{}")
-                    yield f"id: {entry_id}\nevent: {ev_type}\ndata: {payload}\n\n"
-                    if ev_type in ("run_completed", "run_error"):
+            if need_poll:
+                events = await store.list_run_events(run_id, after=cursor, limit=100)
+                for event in events:
+                    cursor = event["sequence"]
+                    last_write = time.monotonic()
+                    data = event["data"]
+                    live = (
+                        (int(data.get("step", 0)), int(data.get("attempt", 1)))
+                        if event["type"] == "step_started"
+                        else None
+                    )
+                    yield (
+                        f"id: {cursor}\nevent: {event['type']}\n"
+                        f"data: {json.dumps(data, default=str)}\n\n"
+                    )
+                    if event["type"] in TERMINAL_EVENTS:
                         return
-                    if ev_type == "input_required":
-                        # Replays of an already-resumed run must keep streaming past old pauses.
+                    if event["type"] == "input_required":
                         run = await store.get_run(run_id)
-                        if not run or run["status"] == "input_required":
+                        # Replays of an already-resumed run keep streaming past old pauses.
+                        if run is None or (
+                            run["status"] == "input_required"
+                            and int(run["event_sequence"]) == cursor
+                        ):
                             return
-                continue
-
-            if draining:
+                if len(events) == 100:
+                    continue
+                run = await store.get_run(run_id)
+                if run is None:
+                    return
+                latest = int(run["event_sequence"])
+                if cursor > latest:
+                    yield (
+                        "event: stream_gap\n"
+                        f"data: {json.dumps({'requested': cursor, 'latest': latest})}\n\n"
+                    )
+                    cursor = latest
+                    continue
+                if cursor >= latest and run["status"] in (
+                    *TERMINAL_STATUSES,
+                    "input_required",
+                ):
+                    return
+            if await request.is_disconnected():
                 return
-            # Idle: once the run can no longer emit events, do one last non-blocking read
-            # (status is committed just before the final event is published).
-            run = await store.get_run(run_id)
-            if not run or run["status"] in TERMINAL_STATUSES:
-                draining = True
+            now = time.monotonic()
+            if credential is not None and now - last_auth >= settings.sse_reauth_sec:
+                last_auth = now
+                try:
+                    await identity_authenticator.authenticate(credential, x_tenant_id)
+                except IdentityError as exc:
+                    yield (
+                        "event: stream_closed\n"
+                        f"data: {json.dumps({'reason': str(exc)})}\n\n"
+                    )
+                    return
+                except IdentityUnavailable:
+                    log.warning("SSE re-authentication unavailable for %s", run_id)
+            if now - last_write >= settings.sse_heartbeat_sec:
+                last_write = now
+                yield ": keep-alive\n\n"
+            streams: dict[Any, Any] = {wake_key: wake_cursor}
+            if deltas_on and live is not None:
+                streams[out_key] = out_cursor
+            try:
+                entries = await store.rds.xread(streams, count=50, block=2000)
+            except RedisError:
+                need_poll = True
+                await asyncio.sleep(1)
+                continue
+            # A timeout re-polls PostgreSQL, so lost wakeups only add latency.
+            need_poll = not entries
+            for key, items in entries or []:
+                if not items:
+                    continue
+                if key == wake_key:
+                    wake_cursor = items[-1][0]
+                    need_poll = True
+                    continue
+                out_cursor = items[-1][0]
+                for _entry_id, fields in items:
+                    delta = decode_delta(fields)
+                    if delta is None or live != (delta["step"], delta["attempt"]):
+                        continue
+                    last_write = time.monotonic()
+                    yield (
+                        f"event: {OUTPUT_DELTA_EVENT}\ndata: {json.dumps(delta)}\n\n"
+                    )
 
     return StreamingResponse(
         sse_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _bearer_credential(request: Request) -> str | None:
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    return (
+        credential.strip()
+        if scheme.lower() == "bearer" and credential.strip()
+        else None
+    )
+
+
+@app.get(
+    "/v1/runs/{run_id}/events",
+    dependencies=[_require_action(Action.RUN_READ)],
+)
+async def list_run_events(
+    run_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Versioned, replayable event envelopes (`schema_version` 1) ordered by sequence."""
+    run = await _get_owned_run(run_id, x_tenant_id)
+    items = await store.list_run_events(run_id, after=after, limit=limit)
+    return {
+        "items": items,
+        "next_after": items[-1]["sequence"] if items else after,
+        "latest_sequence": int(run["event_sequence"]),
+    }
+
+
+@app.get(
+    "/v1/runs/{run_id}/steps",
+    dependencies=[_require_action(Action.RUN_READ)],
+)
+async def list_run_steps(
+    run_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    await _get_owned_run(run_id, x_tenant_id)
+    return {"run_id": run_id, **await store.list_run_steps(run_id)}
+
+
+@app.get(
+    "/v1/runs/{run_id}/usage",
+    dependencies=[_require_action(Action.RUN_READ)],
+)
+async def get_run_usage(
+    run_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    run = await _get_owned_run(run_id, x_tenant_id)
+    return {
+        "run_id": run_id,
+        "budget": await store.run_budget(run),
+        **await store.run_usage(run_id),
+    }
 
 
 @app.get(
@@ -908,6 +1139,21 @@ async def get_run(
 ) -> dict[str, Any]:
     run = await _get_owned_run(run_id, x_tenant_id)
     identity = get_authenticated_identity(request)
+    pending = (
+        await store.pending_approval_batch(run_id)
+        if run["status"] == "input_required"
+        else None
+    )
+    approval = (
+        {
+            "batch_id": pending["batch_id"],
+            "batch_digest": pending["batch_digest"],
+            "expires_at": pending["expires_at"],
+            "decision_endpoint": f"/v1/approvals/{pending['batch_id']}/decision",
+        }
+        if pending
+        else None
+    )
     if (
         identity is not None
         and is_authorized(identity.roles, Action.RUN_APPROVAL_READ)
@@ -919,7 +1165,9 @@ async def get_run(
             "run_id": run["run_id"],
             "status": run["status"],
             "pending_tool_calls": run["pending_tool_calls"],
+            "approval": approval,
         }
+    deadline = run.get("deadline_at")
     return {
         "run_id": run["run_id"],
         "thread_id": run["thread_id"],
@@ -929,7 +1177,84 @@ async def get_run(
         "active_skills": run["active_skills"],
         "pending_tool_calls": run["pending_tool_calls"],
         "result": run["result_text"],
+        "state_version": int(run["state_version"]),
+        "event_sequence": int(run["event_sequence"]),
+        "deadline_at": deadline.isoformat() if deadline is not None else None,
+        "parent_run_id": run.get("parent_run_id"),
+        "traceparent": run.get("traceparent"),
+        "approval": approval,
+        "budget": await store.run_budget(run),
     }
+
+
+@app.get(
+    "/v1/approvals",
+    dependencies=[_require_any_action((Action.RUN_APPROVAL_READ, Action.RUN_READ))],
+)
+async def list_approvals(
+    x_tenant_id: str = Header(default="default-tenant"),
+    status: Literal[
+        "pending", "approved", "rejected", "expired", "cancelled", "all"
+    ] = Query(default="pending"),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """Approval inbox: batches with digest, expiry, tool calls and any recorded decision."""
+    return {
+        "items": await store.list_approval_batches(
+            x_tenant_id, status=None if status == "all" else status, limit=limit
+        )
+    }
+
+
+@app.get(
+    "/v1/approvals/{batch_id}",
+    dependencies=[_require_any_action((Action.RUN_APPROVAL_READ, Action.RUN_READ))],
+)
+async def get_approval(
+    batch_id: UUID,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    batch = await store.get_approval_batch(x_tenant_id, str(batch_id))
+    if batch is None:
+        raise HTTPException(404, "Approval batch not found.")
+    return batch
+
+
+@app.post(
+    "/v1/approvals/{batch_id}/decision",
+    status_code=202,
+    dependencies=[_require_action(Action.RUN_APPROVE)],
+)
+async def decide_approval(
+    batch_id: UUID,
+    req: ApprovalDecisionRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """Digest-bound decision; stale, expired or already-decided batches return 409."""
+    batch = await store.get_approval_batch(x_tenant_id, str(batch_id))
+    if batch is None:
+        raise HTTPException(404, "Approval batch not found.")
+    enforce_approval_separation_of_duties(
+        get_authenticated_identity(request),
+        batch.get("submitted_by_principal_id"),
+    )
+    decision = await _decide(
+        request,
+        response,
+        x_tenant_id,
+        run_id=batch["run_id"],
+        batch_id=str(batch_id),
+        batch_digest=req.batch_digest,
+        approved=req.decision == "approve",
+        reason=req.reason,
+        secrets=req.secrets if batch["status"] == "pending" else {},
+        idempotency_key=idempotency_key,
+        require_binding=True,
+    )
+    return {**decision, "status": "queued"}
 
 
 @app.get(
@@ -1032,9 +1357,20 @@ def identity_capabilities(roles: Collection[str]) -> dict[str, Any]:
         "actions": sorted(
             action.value for action in Action if is_authorized(roles, action)
         ),
-        "event_schemas": ["redis-stream.v1"],
-        "features": ["agent-revisions.v1", "thread-history.v1", "thread-branches.v1"],
-        "durable_replay": False,
+        "event_schemas": [
+            "run-events.v1",
+            *(["run-output-delta.v1"] if settings.output_delta_enabled else []),
+        ],
+        "features": [
+            "agent-revisions.v1",
+            "thread-history.v1",
+            "thread-branches.v1",
+            "approval-batches.v1",
+            "run-inspector.v1",
+            "openai-compat.v1",
+            *([OUTPUT_DELTA_FEATURE] if settings.output_delta_enabled else []),
+        ],
+        "durable_replay": True,
     }
 
 
@@ -1293,3 +1629,433 @@ async def list_audit_events(
         else None
     )
     return {"items": items, "next_cursor": next_cursor}
+
+
+# ---- OpenAI-compatible facade (openai-compat.v1) ----------------------------------------
+
+SETTLED_STATUSES = (*TERMINAL_STATUSES, "input_required")
+
+
+async def _await_settled(run_id: str, timeout: float) -> dict[str, Any] | None:
+    """Waits for a terminal or approval-paused state; Redis wakeups only cut latency."""
+    deadline = time.monotonic() + max(timeout, 0)
+    wake_key, wake_cursor = f"haas:wake:{run_id}", "$"
+    while True:
+        run = await store.get_run(run_id)
+        remaining = deadline - time.monotonic()
+        if run is None or run["status"] in SETTLED_STATUSES or remaining <= 0:
+            return run
+        try:
+            entries = await store.rds.xread(
+                {wake_key: wake_cursor}, count=10, block=int(min(remaining, 2) * 1000)
+            )
+            if entries and entries[0][1]:
+                wake_cursor = entries[0][1][-1][0]
+        except RedisError:
+            await asyncio.sleep(min(remaining, 0.5))
+
+
+async def _facade_submit(
+    req: oai.ChatCompletionRequest | oai.ResponsesRequest,
+    prompt: str,
+    request: Request,
+    response: Response,
+    *,
+    tenant: str,
+    traceparent: str | None,
+    idempotency_key: str | None,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
+    target = oai.parse_model(req.model)
+    fields = oai.run_overrides(req, target)
+    if thread_id is not None:
+        if fields.get("thread_id") not in (None, thread_id):
+            raise oai.facade_error(
+                400,
+                "previous_response_id and haas.thread_id select different threads.",
+                param="previous_response_id",
+            )
+        fields["thread_id"] = thread_id
+    if target.kind == "agent":
+        assert target.value is not None
+        revision_id = await store.resolve_published_agent(
+            tenant, target.value, target.version
+        )
+        if revision_id is None:
+            raise oai.facade_error(
+                404,
+                f"Model {req.model!r} is not a published agent in this tenant.",
+                code="model_not_found",
+                param="model",
+            )
+        fields["agent_revision_id"] = revision_id
+    elif target.kind == "revision":
+        fields["agent_revision_id"] = target.value
+    try:
+        run_request = CreateRunRequest(prompt=prompt, **fields)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        loc = ".".join(str(part) for part in error.get("loc", ()))
+        param = "messages" if loc == "prompt" else f"haas.{loc}" if loc else None
+        raise oai.facade_error(
+            400, f"{param or 'request'}: {error.get('msg')}", param=param
+        ) from exc
+    # Same admission path as POST /v1/runs: policy, budgets, pins and idempotency (SEC-24).
+    return await create_run(
+        run_request,
+        request,
+        response,
+        x_tenant_id=tenant,
+        traceparent=traceparent,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _facade_headers(created: dict[str, Any], response: Response) -> dict[str, str]:
+    headers = {
+        "X-HaaS-Run-Id": created["run_id"],
+        "X-HaaS-Thread-Id": created["thread_id"],
+    }
+    if response.headers.get("Idempotent-Replayed"):
+        headers["Idempotent-Replayed"] = "true"
+    return headers
+
+
+async def _usage(run_id: str) -> tuple[int, int]:
+    return oai.usage_totals((await store.run_usage(run_id))["entries"])
+
+
+async def _approval_info(run: dict[str, Any]) -> dict[str, Any] | None:
+    pending = await store.pending_approval_batch(run["run_id"])
+    if pending is None:
+        return None
+    return {
+        **pending,
+        "decision_endpoint": f"/v1/approvals/{pending['batch_id']}/decision",
+    }
+
+
+async def _unsettled_error(run: dict[str, Any] | None, run_id: str) -> HTTPException:
+    """Maps a non-completed run to an OpenAI-style error that SDKs must not retry."""
+    if run is None:
+        return oai.facade_error(404, "Run not found.", code="run_not_found")
+    meta = oai.haas_metadata(run)
+    status = run["status"]
+    if status == "input_required":
+        meta["approval"] = await _approval_info(run)
+        return oai.facade_error(
+            409,
+            "The run is waiting for human approval. Decide it through the approvals "
+            f"API, then read the result from GET /v1/responses/{run_id}.",
+            code="approval_required",
+            haas=meta,
+            retry=False,
+        )
+    if status == "cancelled":
+        return oai.facade_error(
+            409, "The run was cancelled.", code="run_cancelled", haas=meta, retry=False
+        )
+    if status == "failed":
+        code = run_error_code(run.get("result_text") or "")
+        return oai.facade_error(
+            422 if code.startswith(("budget.", "approval.")) else 502,
+            run.get("result_text") or "The run failed.",
+            code=code,
+            haas=meta,
+            retry=False,
+        )
+    return oai.facade_error(
+        504,
+        "The run is still executing. Poll GET /v1/responses/"
+        f"{run_id} or stream /v1/runs/{run_id}/stream for the result.",
+        code="run_timeout",
+        haas=meta,
+        retry=False,
+    )
+
+
+def _sse_error(exc: HTTPException) -> str:
+    return f"data: {json.dumps(oai.openai_error_body(exc.status_code, exc.detail))}\n\n"
+
+
+async def _settle_with_keepalive(
+    run_id: str,
+) -> AsyncGenerator[dict[str, Any] | None, None]:
+    """Yields None on each heartbeat while waiting, then the settled (or timed-out) run."""
+    deadline = time.monotonic() + settings.openai_facade_wait_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        run = await _await_settled(
+            run_id, max(min(remaining, settings.sse_heartbeat_sec), 0)
+        )
+        if (
+            run is None
+            or run["status"] in SETTLED_STATUSES
+            or time.monotonic() >= deadline
+        ):
+            yield run
+            return
+        yield None
+
+
+@app.post(
+    "/v1/chat/completions",
+    dependencies=[_require_action(Action.RUN_SUBMIT)],
+    tags=["openai-compat"],
+)
+async def openai_chat_completions(
+    req: oai.ChatCompletionRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+    traceparent: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """OpenAI Chat Completions over a HaaS run (text only, n=1, server-side tools)."""
+    oai.reject_unsupported(req)
+    created = await _facade_submit(
+        req,
+        oai.chat_prompt(req),
+        request,
+        response,
+        tenant=x_tenant_id,
+        traceparent=traceparent,
+        idempotency_key=idempotency_key,
+    )
+    run_id, ts = created["run_id"], oai.now()
+    headers = _facade_headers(created, response)
+    if req.stream:
+        include_usage = bool((req.stream_options or {}).get("include_usage"))
+
+        async def chunks() -> AsyncGenerator[str, None]:
+            yield oai.chat_chunk(
+                run_id, req.model, ts, {"role": "assistant", "content": ""}
+            )
+            run: dict[str, Any] | None = None
+            async for run in _settle_with_keepalive(run_id):
+                if run is None:
+                    yield ": keep-alive\n\n"
+            if run is None or run["status"] != "completed":
+                yield _sse_error(await _unsettled_error(run, run_id))
+                yield "data: [DONE]\n\n"
+                return
+            text = run.get("result_text") or ""
+            for start in range(0, len(text), 4096):
+                yield oai.chat_chunk(
+                    run_id, req.model, ts, {"content": text[start : start + 4096]}
+                )
+            yield oai.chat_chunk(run_id, req.model, ts, {}, finish_reason="stop")
+            if include_usage:
+                yield oai.chat_chunk(
+                    run_id, req.model, ts, None, usage=await _usage(run_id)
+                )
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            chunks(),
+            media_type="text/event-stream",
+            headers={**headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    run = await _await_settled(run_id, settings.openai_facade_wait_sec)
+    if run is None or run["status"] != "completed":
+        exc = await _unsettled_error(run, run_id)
+        exc.headers = {**(exc.headers or {}), **headers}
+        raise exc
+    return JSONResponse(
+        oai.chat_completion_body(run, req.model, await _usage(run_id), ts),
+        headers=headers,
+    )
+
+
+async def _response_view(
+    run: dict[str, Any],
+    model: str,
+    *,
+    created: int,
+    previous_response_id: str | None = None,
+) -> dict[str, Any]:
+    return oai.response_body(
+        run,
+        model,
+        await _usage(run["run_id"]),
+        created=created,
+        previous_response_id=previous_response_id,
+        error_code=run_error_code(run.get("result_text") or "")
+        if run["status"] == "failed"
+        else None,
+        approval=await _approval_info(run)
+        if run["status"] == "input_required"
+        else None,
+    )
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[_require_action(Action.RUN_SUBMIT)],
+    tags=["openai-compat"],
+)
+async def openai_create_response(
+    req: oai.ResponsesRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+    traceparent: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> Any:
+    """OpenAI Responses over a HaaS run. The response id is the run id; chaining with
+    `previous_response_id` continues that run's thread. Approval pauses return
+    `status: incomplete` with `incomplete_details.reason = approval_required`."""
+    oai.reject_unsupported(req)
+    thread_id = None
+    if req.previous_response_id is not None:
+        try:
+            previous = await _get_owned_run(req.previous_response_id, x_tenant_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            raise oai.facade_error(
+                404,
+                f"Previous response {req.previous_response_id!r} not found.",
+                code="previous_response_not_found",
+                param="previous_response_id",
+            ) from exc
+        thread_id = previous["thread_id"]
+    created = await _facade_submit(
+        req,
+        oai.responses_prompt(req),
+        request,
+        response,
+        tenant=x_tenant_id,
+        traceparent=traceparent,
+        idempotency_key=idempotency_key,
+        thread_id=thread_id,
+    )
+    run_id, ts = created["run_id"], oai.now()
+    headers = _facade_headers(created, response)
+    view_args = {"created": ts, "previous_response_id": req.previous_response_id}
+    if req.stream and not req.background:
+
+        async def events() -> AsyncGenerator[str, None]:
+            seq = 0
+            first = await store.get_run(run_id)
+            if first is not None:
+                body = await _response_view(first, req.model, **view_args)
+                yield oai.response_event("response.created", seq, response=body)
+            run: dict[str, Any] | None = None
+            async for run in _settle_with_keepalive(run_id):
+                if run is None:
+                    yield ": keep-alive\n\n"
+            if run is None:
+                yield _sse_error(await _unsettled_error(None, run_id))
+                return
+            body = await _response_view(run, req.model, **view_args)
+            if run["status"] == "completed":
+                item = f"msg_{run_id}"
+                for start in range(0, len(body["output_text"]), 4096):
+                    seq += 1
+                    yield oai.response_event(
+                        "response.output_text.delta",
+                        seq,
+                        item_id=item,
+                        output_index=0,
+                        content_index=0,
+                        delta=body["output_text"][start : start + 4096],
+                    )
+                seq += 1
+                yield oai.response_event(
+                    "response.output_text.done",
+                    seq,
+                    item_id=item,
+                    output_index=0,
+                    content_index=0,
+                    text=body["output_text"],
+                )
+            kind = {
+                "completed": "response.completed",
+                "failed": "response.failed",
+                "incomplete": "response.incomplete",
+            }.get(body["status"], "response.in_progress")
+            yield oai.response_event(kind, seq + 1, response=body)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={**headers, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    run = (
+        await store.get_run(run_id)
+        if req.background
+        else await _await_settled(run_id, settings.openai_facade_wait_sec)
+    )
+    if run is None:
+        raise await _unsettled_error(None, run_id)
+    return JSONResponse(
+        await _response_view(run, req.model, **view_args), headers=headers
+    )
+
+
+@app.get(
+    "/v1/responses/{response_id}",
+    dependencies=[_require_action(Action.RUN_READ)],
+    tags=["openai-compat"],
+)
+async def openai_get_response(
+    response_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    run = await _get_owned_run(response_id, x_tenant_id)
+    model = (
+        f"{run['agent_revision_id']}"
+        if run.get("agent_revision_id")
+        else run.get("primary_model") or oai.DEFAULT_MODEL_ID
+    )
+    created = run.get("created_at")  # epoch seconds (DOUBLE PRECISION)
+    return await _response_view(
+        run, str(model), created=int(created) if created is not None else oai.now()
+    )
+
+
+@app.get(
+    "/v1/models",
+    dependencies=[_require_action(Action.RUN_READ)],
+    tags=["openai-compat"],
+)
+async def openai_list_models(
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    """`haas` (tenant defaults) plus every published agent as `agent/<name>[@<version>]`."""
+    data: list[dict[str, Any]] = [
+        {
+            "id": oai.DEFAULT_MODEL_ID,
+            "object": "model",
+            "created": 0,
+            "owned_by": "haas",
+        }
+    ]
+    seen: set[str] = set()
+    for row in await store.list_published_agents(x_tenant_id):
+        created = int(row.get("published_at") or 0)
+        if row["agent_name"] not in seen:
+            seen.add(row["agent_name"])
+            data.append(
+                {
+                    "id": f"agent/{row['agent_name']}",
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "tenant",
+                    "haas": {
+                        "revision_id": row["revision_id"],
+                        "version": row["version"],
+                    },
+                }
+            )
+        data.append(
+            {
+                "id": f"agent/{row['agent_name']}@{row['version']}",
+                "object": "model",
+                "created": created,
+                "owned_by": "tenant",
+                "haas": {"revision_id": row["revision_id"], "version": row["version"]},
+            }
+        )
+    return {"object": "list", "data": data}

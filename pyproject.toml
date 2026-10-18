@@ -40,6 +40,8 @@ dev = [
     "ruff>=0.9.0",
     "pyright>=1.1.390",
     "pip-audit>=2.7.0",
+    "openai>=1.40",
+    "jsonschema>=4.23",
 ]
 tui = ["textual>=0.86"]
 
@@ -72,3 +74,7 @@ exclude = ["plugins/_templates", "tests"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Shared PostgreSQL fixtures are re-exported from test_phase2_database and used as parameters.
+"tests/test_multi_agent_schema.py" = ["F811"]

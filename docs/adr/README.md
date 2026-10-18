@@ -21,7 +21,7 @@ here named `NNNN-short-title.md` using the template below, and are added to the 
 | ADR-13 | Sandbox runtime selection (gVisor / Kata / Firecracker) | Open — roadmap `p4-sandbox-runtime` |
 | [ADR-14](0014-provider-neutral-identity.md) | Provider-neutral identity and secret-manager boundary | Partially accepted — OIDC/API-key contract; secret manager open |
 | ADR-15 | Delegation token format (Biscuit vs macaroons vs signed JSON) | Open — roadmap `a-attenuation-budget` |
-| ADR-16 | Docs portal and SDK generation toolchain | Open — roadmap `d-api-contract` |
+| [ADR-16](0016-api-contract-toolchain.md) | API contract toolchain (OpenAPI 3.1, JSON Schema events, AsyncAPI, Spectral, oasdiff, deprecation headers); docs portal and SDK generator | Partially accepted — contract toolchain accepted; portal/SDK generator open (`d-docs-portal`, `d-sdk-*`) |
 
 ## Template
 

@@ -46,6 +46,9 @@ class MemoryPolicyStore:
     async def store_ephemeral_secrets(self, _run_id: str, _secrets: dict[str, str]):
         pass
 
+    async def clear_ephemeral_secrets(self, _run_id: str):
+        pass
+
     async def create_run(self, **values: Any):
         self.runs.append(values)
 
@@ -54,11 +57,10 @@ class MemoryPolicyStore:
 
 
 class DispatchRecorder:
-    def __init__(self) -> None:
-        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    """Runs are enqueued in the same transaction that creates them (transactional outbox)."""
 
-    def apply_async(self, *args: Any, **kwargs: Any) -> None:
-        self.calls.append((args, kwargs))
+    def __init__(self, store: MemoryPolicyStore) -> None:
+        self.calls = store.runs
 
 
 def _policy_record(rules: TenantPolicyRules) -> dict[str, Any]:
@@ -72,13 +74,12 @@ def _policy_record(rules: TenantPolicyRules) -> dict[str, Any]:
 
 async def _client(monkeypatch: pytest.MonkeyPatch, policy):
     store = MemoryPolicyStore(policy)
-    dispatched = DispatchRecorder()
+    dispatched = DispatchRecorder(store)
 
     async def authenticate(_credential: str, _tenant: str):
         return _IDENTITY
 
     monkeypatch.setattr(main_module, "store", store)
-    monkeypatch.setattr(main_module, "llm_step_task", dispatched)
     monkeypatch.setattr(
         main_module.identity_authenticator, "authenticate", authenticate
     )

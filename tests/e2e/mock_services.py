@@ -76,8 +76,59 @@ def decide(messages: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
+def _stream_chunks(message: dict[str, Any], usage: dict[str, Any]) -> list[str]:
+    """OpenAI-style SSE chunks: content split into fragments, tool calls by index."""
+    chunks: list[dict[str, Any]] = []
+    content = message.get("content") or ""
+    for start in range(0, len(content), 7):
+        chunks.append({"delta": {"content": content[start : start + 7]}})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        arguments = call["function"]["arguments"]
+        half = len(arguments) // 2
+        chunks.append(
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["function"]["name"],
+                                "arguments": arguments[:half],
+                            },
+                        }
+                    ]
+                }
+            }
+        )
+        chunks.append(
+            {
+                "delta": {
+                    "tool_calls": [
+                        {"index": index, "function": {"arguments": arguments[half:]}}
+                    ]
+                }
+            }
+        )
+    frames = [
+        json.dumps({"id": "gen-mock", "choices": [{"index": 0, **chunk}]})
+        for chunk in chunks
+    ]
+    frames.append(
+        json.dumps(
+            {
+                "id": "gen-mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
+    )
+    frames.append(json.dumps({"id": "gen-mock", "choices": [], "usage": usage}))
+    return [f"data: {frame}\n\n" for frame in frames] + ["data: [DONE]\n\n"]
+
+
 @app.post("/v1/chat/completions")
-async def chat(request: Request) -> JSONResponse:
+async def chat(request: Request) -> Any:
     body = await request.json()
     CALLS.append(
         {
@@ -97,16 +148,26 @@ async def chat(request: Request) -> JSONResponse:
     message = decide(body["messages"])
     # extra field real providers add; the harness must not echo it back
     message["reasoning"] = "mock reasoning"
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "cost": 0.002,
+        "prompt_tokens_details": {"cached_tokens": 40},
+    }
+    if body.get("stream"):
+        CALLS[-1]["stream"] = True
+
+        async def frames() -> Any:
+            for frame in _stream_chunks(message, usage):
+                yield frame
+                await asyncio.sleep(0.01)
+
+        return StreamingResponse(frames(), media_type="text/event-stream")
     return JSONResponse(
         {
             "id": "gen-mock",
             "choices": [{"message": message, "finish_reason": "stop"}],
-            "usage": {
-                "prompt_tokens": 100,
-                "completion_tokens": 20,
-                "cost": 0.002,
-                "prompt_tokens_details": {"cached_tokens": 40},
-            },
+            "usage": usage,
         }
     )
 

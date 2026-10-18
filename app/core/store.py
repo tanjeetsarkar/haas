@@ -16,6 +16,14 @@ import redis.asyncio as aioredis
 from app.core.config import settings
 from app.core.database_context import tenant_context
 from app.core.secret_vault import decrypt_secrets, encrypt_secrets
+from app.core.workflow import (
+    Effects,
+    IdempotencyConflictError,
+    IdempotentReplay,
+    WorkflowMixin,
+    decode_run,
+    deadline_from_now,
+)
 
 
 class ThreadOwnershipError(Exception):
@@ -65,7 +73,37 @@ def _loads(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
-class DistributedStore:
+RLS_TABLES = (
+    "tenants",
+    "runs",
+    "threads",
+    "agent_revisions",
+    "memberships",
+    "tenant_api_keys",
+    "tenant_policy_revisions",
+    "audit_events",
+    "admission_requests",
+    "run_steps",
+    "approval_batches",
+    "approval_decisions",
+    "tool_invocations",
+    "run_events",
+    "outbox_messages",
+    "consumer_inbox",
+    "usage_ledger",
+    "delegations",
+    "agent_messages",
+    "workspaces",
+    "workspace_entry_versions",
+    "agent_cards",
+)
+
+
+class _AdmissionRace(Exception):
+    pass
+
+
+class DistributedStore(WorkflowMixin):
     def __init__(self) -> None:
         self.pg_pool: asyncpg.Pool | None = None
         self.redis: aioredis.Redis | None = None
@@ -82,18 +120,18 @@ class DistributedStore:
                     "AND pg_has_role(current_user, $1, 'member') "
                     "AND ($2 OR NOT pg_has_role(current_user, 'haas_execution_service', 'member')) "
                     "AND NOT EXISTS (SELECT 1 FROM pg_class c "
-                    "WHERE c.relname IN ('tenants','runs','threads','agent_revisions','memberships',"
-                    "'tenant_api_keys','tenant_policy_revisions','audit_events') "
+                    "WHERE c.relname = ANY($3::text[]) "
                     "AND pg_has_role(current_user, c.relowner, 'member')) "
-                    "AND (SELECT count(*) = 8 AND bool_and(relrowsecurity AND relforcerowsecurity) "
-                    "FROM pg_class WHERE oid = ANY(ARRAY['runs'::regclass,'threads'::regclass,"
-                    "'agent_revisions'::regclass,'memberships'::regclass,'tenant_api_keys'::regclass,"
-                    "'tenant_policy_revisions'::regclass,'audit_events'::regclass,'tenants'::regclass])) "
+                    "AND (SELECT count(*) = cardinality($3::text[]) "
+                    "AND bool_and(relrowsecurity AND relforcerowsecurity) "
+                    "FROM pg_class WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace "
+                    "AND relname = ANY($3::text[])) "
                     "AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'runs'::regclass "
                     "AND attname = 'tenant_uuid' AND attnotnull) "
                     "FROM pg_roles WHERE rolname = current_user",
                     "haas_execution_service" if service else "haas_tenant_app",
                     service,
+                    list(RLS_TABLES),
                 )
             if not safe:
                 await self.close()
@@ -159,6 +197,7 @@ class DistributedStore:
         execution_fenced: bool = False,
         retention_resolved: bool = False,
     ) -> dict[str, Any]:
+        fx = Effects()
         async with self.connection() as conn:
             async with conn.transaction():
                 tenant = await conn.fetchrow(
@@ -213,9 +252,15 @@ class DistributedStore:
                     int(invalidates_identity),
                     invalidates_identity,
                 )
+                cancelled_runs = 0
+                if target in {"suspended", "offboarding"}:
+                    cancelled_runs = await self._cancel_tenant_runs(
+                        conn, fx, tenant["tenant_id"]
+                    )
         if updated is None:
             raise RuntimeError("Tenant transition did not update the locked tenant.")
-        return dict(updated)
+        await self._after_commit(fx)
+        return {**dict(updated), "cancelled_runs": cancelled_runs}
 
     async def get_active_tenant_policy(
         self, tenant_selector: str
@@ -837,21 +882,6 @@ class DistributedStore:
     async def release_state_lock(self, key: str) -> None:
         await self.rds.delete(f"haas:lock:{key}")
 
-    # --- Redis Streams Real-Time Event Bus (XADD / XREAD) ---
-
-    async def publish_event(
-        self, run_id: str, event_type: str, payload: dict[str, Any]
-    ) -> str:
-        stream_key = f"haas:stream:{run_id}"
-        entry_id = await self.rds.xadd(
-            stream_key,
-            {"event_type": event_type, "payload_json": json.dumps(payload)},
-            maxlen=settings.redis_stream_max_len,
-            approximate=True,
-        )
-        await self.rds.expire(stream_key, 86400)
-        return str(entry_id)
-
     # --- PostgreSQL Thread & Run Persistence ---
 
     async def list_threads(
@@ -978,6 +1008,33 @@ class DistributedStore:
                 limit,
             )
         return [dict(row) for row in rows]
+
+    async def list_published_agents(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT revision_id::text, agent_name, version, "
+                "extract(epoch FROM published_at)::bigint AS published_at "
+                "FROM agent_revisions WHERE tenant_id = resolve_haas_tenant_uuid($1) "
+                "AND state = 'published' ORDER BY agent_name, version DESC LIMIT 500",
+                tenant_id,
+            )
+        return [dict(row) for row in rows]
+
+    async def resolve_published_agent(
+        self, tenant_id: str, agent_name: str, version: int | None
+    ) -> str | None:
+        """Revision id of `agent_name` at `version`, or its latest published version."""
+        async with self.connection() as conn:
+            value = await conn.fetchval(
+                "SELECT revision_id::text FROM agent_revisions "
+                "WHERE tenant_id = resolve_haas_tenant_uuid($1) AND agent_name = $2 "
+                "AND state = 'published' AND ($3::bigint IS NULL OR version = $3) "
+                "ORDER BY version DESC LIMIT 1",
+                tenant_id,
+                agent_name,
+                version,
+            )
+        return value
 
     async def get_agent_revision(
         self, tenant_id: str, revision_id: str
@@ -1154,117 +1211,169 @@ class DistributedStore:
         policy_revision_id: str | None = None,
         agent_revision_id: str | None = None,
         expected_history_version: int | None = None,
+        admission: dict[str, Any] | None = None,
+        deadline_sec: int | None = None,
+        max_tool_invocations: int | None = None,
+        parent_run_id: str | None = None,
     ) -> None:
         now = time.time()
+        fx = Effects()
         if agent_revision_id is not None and policy_revision_id is None:
             raise ValueError("Agent revisions require a pinned tenant policy.")
-        async with self.connection() as conn:
-            async with conn.transaction():
-                if policy_revision_id is not None:
-                    tenant = await conn.fetchrow(
-                        "SELECT tenant_id, active_policy_revision_id FROM tenants "
-                        "WHERE tenant_id = resolve_haas_tenant_uuid($1) "
-                        "AND status = 'active' FOR SHARE",
+        try:
+            async with self.connection() as conn:
+                async with conn.transaction():
+                    if policy_revision_id is not None:
+                        tenant = await conn.fetchrow(
+                            "SELECT tenant_id, active_policy_revision_id FROM tenants "
+                            "WHERE tenant_id = resolve_haas_tenant_uuid($1) "
+                            "AND status = 'active' FOR SHARE",
+                            tenant_id,
+                        )
+                        if (
+                            tenant is None
+                            or str(tenant["active_policy_revision_id"])
+                            != policy_revision_id
+                        ):
+                            raise StoreConflictError(
+                                "Tenant policy changed; retry admission."
+                            )
+                        if agent_revision_id is not None:
+                            pinned = await conn.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM agent_revisions "
+                                "WHERE tenant_id = $1 AND revision_id = $2 "
+                                "AND state = 'published' AND policy_revision_id = $3 "
+                                "AND registry_fingerprint = $4)",
+                                tenant["tenant_id"],
+                                UUID(agent_revision_id),
+                                UUID(policy_revision_id),
+                                registry_fingerprint,
+                            )
+                            if not pinned:
+                                raise StoreConflictError(
+                                    "Agent revision is not eligible for admission."
+                                )
+                    thread = await conn.fetchrow(
+                        "SELECT tenant_id, messages_json, history_version, active_run_id "
+                        "FROM threads WHERE thread_id = $1 "
+                        "AND COALESCE(tenant_uuid::text, tenant_id) "
+                        "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) FOR UPDATE",
+                        thread_id,
                         tenant_id,
                     )
+                    if thread is None:
+                        raise ThreadOwnershipError(thread_id)
+                    if thread["active_run_id"] is not None:
+                        raise StoreConflictError(
+                            "Thread has an active run. Wait, cancel it, or explicitly branch."
+                        )
                     if (
-                        tenant is None
-                        or str(tenant["active_policy_revision_id"])
-                        != policy_revision_id
+                        expected_history_version is not None
+                        and thread["history_version"] != expected_history_version
                     ):
                         raise StoreConflictError(
-                            "Tenant policy changed; retry admission."
+                            "Thread history changed; refresh or branch."
                         )
-                    if agent_revision_id is not None:
-                        pinned = await conn.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM agent_revisions "
-                            "WHERE tenant_id = $1 AND revision_id = $2 "
-                            "AND state = 'published' AND policy_revision_id = $3 "
-                            "AND registry_fingerprint = $4)",
-                            tenant["tenant_id"],
-                            UUID(agent_revision_id),
-                            UUID(policy_revision_id),
-                            registry_fingerprint,
+                    committed = _loads(thread["messages_json"])
+                    if committed and initial_messages[:-1] != committed:
+                        raise StoreConflictError(
+                            "Thread history changed; refresh or branch."
                         )
-                        if not pinned:
-                            raise StoreConflictError(
-                                "Agent revision is not eligible for admission."
-                            )
-                thread = await conn.fetchrow(
-                    "SELECT tenant_id, messages_json, history_version, active_run_id "
-                    "FROM threads WHERE thread_id = $1 "
-                    "AND COALESCE(tenant_uuid::text, tenant_id) "
-                    "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) FOR UPDATE",
-                    thread_id,
-                    tenant_id,
-                )
-                if thread is None:
-                    raise ThreadOwnershipError(thread_id)
-                if thread["active_run_id"] is not None:
-                    raise StoreConflictError(
-                        "Thread has an active run. Wait, cancel it, or explicitly branch."
+                    run_row = await conn.fetchrow(
+                        """
+                    INSERT INTO runs (
+                        run_id, thread_id, tenant_id, traceparent, status,
+                        primary_model, planner_model, active_skills_json,
+                        messages_checkpoint_json, max_steps, max_cost_usd,
+                        webhook_url, created_at, updated_at,
+                        skill_allowlist_json, registry_fingerprint,
+                        submitted_by_principal_id, policy_revision_id,
+                        agent_revision_id, thread_history_version,
+                        next_action, deadline_at, max_tool_invocations, parent_run_id
+                    ) VALUES (
+                        $1, $2, $3, $4, 'queued',
+                        $5, $6, $7::jsonb,
+                        $8::jsonb, $9, $10,
+                        $11, $12, $13,
+                        $14::jsonb, $15, $16, $17, $18, $19,
+                        'step', $20, $21, $22
+                    ) RETURNING *
+                    """,
+                        run_id,
+                        thread_id,
+                        thread["tenant_id"],
+                        traceparent,
+                        primary_model,
+                        planner_model,
+                        json.dumps(sorted(initial_skills)),
+                        json.dumps(initial_messages),
+                        max_steps,
+                        Decimal(str(max_cost_usd)),
+                        webhook_url,
+                        now,
+                        now,
+                        json.dumps(sorted(skill_allowlist))
+                        if skill_allowlist is not None
+                        else None,
+                        registry_fingerprint,
+                        UUID(submitted_by_principal_id)
+                        if submitted_by_principal_id is not None
+                        else None,
+                        UUID(policy_revision_id)
+                        if policy_revision_id is not None
+                        else None,
+                        UUID(agent_revision_id)
+                        if agent_revision_id is not None
+                        else None,
+                        thread["history_version"],
+                        deadline_from_now(
+                            deadline_sec or settings.default_run_deadline_sec
+                        ),
+                        max_tool_invocations or settings.default_max_tool_invocations,
+                        parent_run_id,
                     )
-                if (
-                    expected_history_version is not None
-                    and thread["history_version"] != expected_history_version
-                ):
-                    raise StoreConflictError(
-                        "Thread history changed; refresh or branch."
+                    await self._append_events(
+                        conn,
+                        fx,
+                        thread["tenant_id"],
+                        run_id,
+                        [("run_queued", {"run_id": run_id, "thread_id": thread_id})],
                     )
-                committed = _loads(thread["messages_json"])
-                if committed and initial_messages[:-1] != committed:
-                    raise StoreConflictError(
-                        "Thread history changed; refresh or branch."
+                    await self._enqueue_orchestrate(conn, fx, run_row, "step", 0)
+                    if admission is not None:
+                        stored = await conn.fetchval(
+                            "INSERT INTO admission_requests (tenant_id, principal_key, "
+                            "operation, idempotency_key, request_digest, run_id, response, "
+                            "expires_at) VALUES ($1, $2, 'run.create', $3, $4, $5, $6::jsonb, "
+                            "now() + make_interval(secs => $7)) "
+                            "ON CONFLICT DO NOTHING RETURNING 1",
+                            thread["tenant_id"],
+                            admission["principal_key"],
+                            admission["idempotency_key"],
+                            admission["request_digest"],
+                            run_id,
+                            json.dumps(admission["response"]),
+                            float(settings.idempotency_ttl_sec),
+                        )
+                        if not stored:
+                            raise _AdmissionRace()
+                    await conn.execute(
+                        "UPDATE threads SET active_run_id = $2 WHERE thread_id = $1",
+                        thread_id,
+                        run_id,
                     )
-                await conn.execute(
-                    """
-                INSERT INTO runs (
-                    run_id, thread_id, tenant_id, traceparent, status,
-                    primary_model, planner_model, active_skills_json,
-                    messages_checkpoint_json, max_steps, max_cost_usd,
-                    webhook_url, created_at, updated_at,
-                    skill_allowlist_json, registry_fingerprint,
-                    submitted_by_principal_id, policy_revision_id,
-                    agent_revision_id, thread_history_version
-                ) VALUES (
-                    $1, $2, $3, $4, 'running',
-                    $5, $6, $7::jsonb,
-                    $8::jsonb, $9, $10,
-                    $11, $12, $13,
-                    $14::jsonb, $15, $16, $17, $18, $19
-                )
-                """,
-                    run_id,
-                    thread_id,
-                    thread["tenant_id"],
-                    traceparent,
-                    primary_model,
-                    planner_model,
-                    json.dumps(sorted(initial_skills)),
-                    json.dumps(initial_messages),
-                    max_steps,
-                    Decimal(str(max_cost_usd)),
-                    webhook_url,
-                    now,
-                    now,
-                    json.dumps(sorted(skill_allowlist))
-                    if skill_allowlist is not None
-                    else None,
-                    registry_fingerprint,
-                    UUID(submitted_by_principal_id)
-                    if submitted_by_principal_id is not None
-                    else None,
-                    UUID(policy_revision_id)
-                    if policy_revision_id is not None
-                    else None,
-                    UUID(agent_revision_id) if agent_revision_id is not None else None,
-                    thread["history_version"],
-                )
-                await conn.execute(
-                    "UPDATE threads SET active_run_id = $2 WHERE thread_id = $1",
-                    thread_id,
-                    run_id,
-                )
+        except _AdmissionRace:
+            assert admission is not None
+            previous = await self.find_admission(
+                tenant_id, admission["principal_key"], admission["idempotency_key"]
+            )
+            if (
+                previous is None
+                or previous["request_digest"] != admission["request_digest"]
+            ):
+                raise IdempotencyConflictError(admission["idempotency_key"]) from None
+            raise IdempotentReplay(previous["response"]) from None
+        await self._after_commit(fx)
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         async with self.connection() as conn:
@@ -1273,24 +1382,7 @@ class DistributedStore:
                 "LEFT JOIN tenants t ON t.tenant_id = r.tenant_uuid WHERE r.run_id = $1",
                 run_id,
             )
-        if not row:
-            return None
-        d = dict(row)
-        d["active_skills"] = _loads(d["active_skills_json"])
-        d["messages"] = _loads(d["messages_checkpoint_json"])
-        d["fingerprints"] = _loads(d["fingerprints_json"])
-        # NULL = unrestricted (also the value for runs created before allowlists existed).
-        d["skill_allowlist"] = (
-            _loads(d["skill_allowlist_json"])
-            if d.get("skill_allowlist_json") is not None
-            else None
-        )
-        d["pending_tool_calls"] = (
-            _loads(d["pending_tool_calls_json"])
-            if d["pending_tool_calls_json"]
-            else None
-        )
-        return d
+        return decode_run(row) if row else None
 
     async def list_runs(
         self,
@@ -1319,167 +1411,27 @@ class DistributedStore:
         return [dict(row) for row in rows]
 
     async def cancel_run(self, run_id: str, tenant_id: str) -> bool:
-        async with self.connection() as conn:
-            async with conn.transaction():
-                await conn.fetchrow(
-                    "SELECT t.thread_id FROM threads t JOIN runs r "
-                    "ON r.thread_id = t.thread_id "
-                    "WHERE r.run_id = $1 "
-                    "AND COALESCE(r.tenant_uuid::text, r.tenant_id) "
-                    "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) FOR UPDATE OF t",
-                    run_id,
-                    tenant_id,
-                )
-                row = await conn.fetchrow(
-                    """
-                UPDATE runs
-                SET status = 'cancelled', result_text = 'Run cancelled.',
-                    pending_tool_calls_json = NULL, updated_at = $3
-                WHERE run_id = $1 AND COALESCE(tenant_uuid::text, tenant_id)
-                    = COALESCE(resolve_haas_tenant_uuid($2)::text, $2)
-                  AND status IN ('running', 'input_required')
-                RETURNING run_id, thread_id
-                """,
-                    run_id,
-                    tenant_id,
-                    time.time(),
-                )
-                if row is not None:
-                    await conn.execute(
-                        "UPDATE threads SET active_run_id = NULL "
-                        "WHERE thread_id = $1 AND active_run_id = $2",
-                        row["thread_id"],
-                        run_id,
-                    )
-        if row is None:
-            return False
-        await self.rds.setex(f"haas:cancelled:{run_id}", 604_800, "1")
-        await self.clear_ephemeral_secrets(run_id)
-        return True
+        return await self.request_cancel(run_id, tenant_id) in {
+            "cancelled",
+            "cancelling",
+        }
 
-    async def reap_orphaned_runs(self, stale_before: float) -> list[dict[str, str]]:
+    async def publish_event(
+        self, run_id: str, event_type: str, payload: dict[str, Any]
+    ) -> int:
+        """Append one durable event outside an orchestration transition."""
+        fx = Effects()
         async with self.connection() as conn:
-            rows = await conn.fetch(
-                """
-                WITH locked_threads AS MATERIALIZED (
-                    SELECT t.thread_id FROM threads t
-                    WHERE EXISTS (SELECT 1 FROM runs r
-                        WHERE r.thread_id = t.thread_id
-                          AND r.status = 'running' AND r.updated_at < $1)
-                    ORDER BY t.thread_id FOR UPDATE
-                ), expired AS (
-                UPDATE runs
-                SET status = 'failed', result_text = 'Run expired by orphan reaper.',
-                    pending_tool_calls_json = NULL, updated_at = $2
-                WHERE status = 'running' AND updated_at < $1
-                  AND thread_id IN (SELECT thread_id FROM locked_threads)
-                RETURNING run_id, thread_id
-                ), released AS (
-                    UPDATE threads t SET active_run_id = NULL
-                    FROM expired e WHERE t.thread_id = e.thread_id
-                      AND t.active_run_id = e.run_id
-                )
-                SELECT run_id, thread_id FROM expired
-                """,
-                stale_before,
-                time.time(),
+            row = await conn.fetchrow(
+                "SELECT tenant_id FROM runs WHERE run_id = $1 FOR UPDATE", run_id
             )
-        return [
-            {"run_id": row["run_id"], "thread_id": row["thread_id"]} for row in rows
-        ]
-
-    async def claim_resume(
-        self,
-        run_id: str,
-        tenant_id: str,
-        *,
-        actor_principal_id: str | None,
-        request_id: str,
-        approved: bool,
-        pending_tool_count: int,
-    ) -> bool:
-        """Claim a pending decision and audit authenticated actors atomically."""
-        async with self.connection() as conn:
-            async with conn.transaction():
-                audit_tenant_id: UUID | None = None
-                if actor_principal_id is not None:
-                    audit_tenant_id = await conn.fetchval(
-                        """
-                        SELECT tenant_id FROM tenants
-                        WHERE (slug = $1 OR tenant_id::text = $1) AND status = 'active'
-                        FOR SHARE
-                        """,
-                        tenant_id,
-                    )
-                    if audit_tenant_id is None:
-                        return False
-                row = await conn.fetchrow(
-                    "UPDATE runs SET status = 'running', updated_at = $3 "
-                    "WHERE run_id = $1 AND COALESCE(tenant_uuid::text, tenant_id) "
-                    "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) "
-                    "AND status = 'input_required' "
-                    "RETURNING run_id",
-                    run_id,
-                    tenant_id,
-                    time.time(),
-                )
-                if row is None:
-                    return False
-                if audit_tenant_id is not None and actor_principal_id is not None:
-                    await self._insert_audit_event(
-                        conn,
-                        tenant_id=audit_tenant_id,
-                        actor_principal_id=UUID(actor_principal_id),
-                        action="run.approved" if approved else "run.rejected",
-                        target_type="run",
-                        target_id=run_id,
-                        request_id=UUID(request_id),
-                        details={"pending_tool_count": pending_tool_count},
-                    )
-        return True
-
-    async def save_checkpoint(
-        self,
-        run_id: str,
-        *,
-        step_count: int,
-        messages: list[dict[str, Any]],
-        active_skills: set[str],
-        fingerprints: list[str],
-        cost_delta_usd: float = 0.0,
-        last_step_had_error: bool = False,
-        status: str = "running",
-        pending_tool_calls: list[dict[str, Any]] | None = None,
-    ) -> None:
-        async with self.connection() as conn:
-            await conn.execute(
-                """
-                UPDATE runs
-                SET step_count = $2,
-                    messages_checkpoint_json = $3::jsonb,
-                    active_skills_json = $4::jsonb,
-                    fingerprints_json = $5::jsonb,
-                    total_cost_usd = total_cost_usd + $6,
-                    last_step_had_error = $7,
-                    status = $8,
-                    pending_tool_calls_json = $9::jsonb,
-                    updated_at = $10
-                WHERE run_id = $1
-                  AND status NOT IN ('completed', 'failed', 'cancelled')
-                """,
-                run_id,
-                step_count,
-                json.dumps(messages),
-                json.dumps(sorted(active_skills)),
-                json.dumps(fingerprints[-20:]),
-                Decimal(str(cost_delta_usd)),
-                last_step_had_error,
-                status,
-                json.dumps(pending_tool_calls)
-                if pending_tool_calls is not None
-                else None,
-                time.time(),
+            if row is None:
+                return 0
+            sequence = await self._append_events(
+                conn, fx, row["tenant_id"], run_id, [(event_type, payload)]
             )
+        await self._after_commit(fx)
+        return sequence
 
     async def finalize_run(
         self,
@@ -1490,53 +1442,39 @@ class DistributedStore:
         final_messages: list[dict[str, Any]],
         cost_delta_usd: float = 0.0,
     ) -> bool:
-        now = time.time()
+        """Administrative finalization that bypasses the lease (tests, operator repair)."""
+        fx = Effects()
         async with self.connection() as conn:
-            async with conn.transaction():
-                thread = await conn.fetchrow(
-                    "SELECT * FROM threads WHERE thread_id = $1 FOR UPDATE", thread_id
-                )
-                if thread is None or thread["active_run_id"] != run_id:
-                    return False
-                result = await conn.fetchrow(
-                    """
-                UPDATE runs
-                SET status = $2,
-                    result_text = $3,
-                    messages_checkpoint_json = $4::jsonb,
-                    total_cost_usd = total_cost_usd + $5,
-                    pending_tool_calls_json = NULL,
-                    updated_at = $6
-                WHERE run_id = $1
-                  AND status NOT IN ('completed', 'failed', 'cancelled')
-                  AND thread_id = $7
-                  AND tenant_id = $8
-                  AND thread_history_version = $9
-                RETURNING run_id
-                """,
-                    run_id,
-                    status,
-                    result_text,
-                    json.dumps(final_messages),
-                    Decimal(str(cost_delta_usd)),
-                    now,
-                    thread_id,
-                    thread["tenant_id"],
-                    thread["history_version"],
-                )
-                if result is not None:
-                    await conn.execute(
-                        "UPDATE threads SET active_run_id = NULL, "
-                        "messages_json = CASE WHEN $4 THEN $2::jsonb ELSE messages_json END, "
-                        "history_version = history_version + CASE WHEN $4 THEN 1 ELSE 0 END, "
-                        "updated_at = $3 WHERE thread_id = $1 AND active_run_id = $5",
-                        thread_id,
-                        json.dumps(final_messages),
-                        now,
-                        status == "completed",
-                        run_id,
-                    )
-                else:
-                    return False
-        await self.clear_ephemeral_secrets(run_id)
+            row = await self._lock_run(conn, run_id)
+            if row is None or row["thread_id"] != thread_id:
+                return False
+            thread = await conn.fetchrow(
+                "SELECT active_run_id, history_version FROM threads WHERE thread_id = $1",
+                thread_id,
+            )
+            if (
+                row["status"] in ("completed", "failed", "cancelled")
+                or thread is None
+                or thread["active_run_id"] != run_id
+                or thread["history_version"] != row["thread_history_version"]
+            ):
+                return False
+            event = (
+                ("run_completed", {"output": result_text})
+                if status == "completed"
+                else ("run_cancelled", {"run_id": run_id})
+                if status == "cancelled"
+                else ("run_error", {"error": result_text})
+            )
+            await self._finalize(
+                conn,
+                fx,
+                row,
+                status,
+                result_text,
+                messages=final_messages,
+                cost_delta=Decimal(str(cost_delta_usd)),
+                events=[event],
+            )
+        await self._after_commit(fx)
         return True

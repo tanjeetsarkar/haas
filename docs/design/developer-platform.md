@@ -11,8 +11,11 @@ Phase 2 supplies scoped, cursor-paginated `/v1/agents` and `/v1/threads`,
 version-pinned history/branch operations, immutable published revision admission and
 shared Python client/TUI methods. `/v1/capabilities`, also embedded in `/v1/me`,
 advertises metadata version `1`, authorized actions, feature versions and supported
-`redis-stream.v1` observations. `durable_replay: false` describes the existing finite
-Redis transport honestly; Phase 3 still owns durable events. This metadata is a UI
+event schemas. Phase 3 replaced the finite Redis stream with the durable PostgreSQL run
+event log: the schema is now `run-events.v1` (integer per-run `sequence` SSE ids,
+`Last-Event-ID` replay) and `durable_replay: true`. Phase 3 also advertises
+`approval-batches.v1` and `run-inspector.v1`. Clients that only understand
+`redis-stream.v1` must refuse to connect rather than misinterpret cursors. This metadata is a UI
 compatibility hint, never an authorization grant. Full event schemas, AsyncAPI,
 Spectral/oasdiff and distributable Python/TypeScript SDKs remain Track D work.
 

@@ -55,6 +55,16 @@ approver key to inspect/approve its pending action in the TUI with `/approve <ru
 through the API. The queued run ID is displayed in the chat. Use
 `haas dev seed --rotate-key` to revoke and replace both keys.
 
+### OpenAI-compatible access and API contracts
+
+Existing OpenAI SDKs can target `http://127.0.0.1:18000/v1` with a HaaS API key and
+`model="agent/<published-agent-name>"` (or a policy-allowed model) through
+`/v1/chat/completions`, `/v1/responses` and `/v1/models`. Requests use the same RBAC, tenant
+policy, budgets and approvals as `/v1/runs`; a pending approval returns `409 approval_required`.
+Machine-readable contracts live in [docs/openapi-v1.json](docs/openapi-v1.json),
+[docs/asyncapi.yaml](docs/asyncapi.yaml) and [docs/contracts/](docs/contracts/); see the
+[deprecation policy](docs/api-deprecation-policy.md) and [changelog](docs/api-changelog.md).
+
 ## Repository layout
 
 * [app/](app/): FastAPI API, shared core modules, and Celery workers.
@@ -123,7 +133,12 @@ policy permissions and registry fingerprints. `/threads [search]`, `/threads nex
 See the [terminal guide](docs/tui_usage.md#agent-revisions-and-thread-history) for roles
 and conflict recovery. These use scoped `/v1/agents` and `/v1/threads` APIs through the
 shared Python client, not database access. `/v1/capabilities` and `/v1/me` advertise
-identity-scoped actions and supported event schemas; durable replay is explicitly false.
+identity-scoped actions and supported event schemas (`run-events.v1`, durable replay).
+
+Phase 3 durable workflows add an approval inbox (`Ctrl+4` or `/approvals`) whose decisions
+bind to the reviewed batch digest, a run inspector (`/inspect`, or Inspect in Runs) showing
+state version, budget reservations, steps, tool invocations and usage, and `/events` for
+paging the immutable PostgreSQL event log. SSE reconnects resume from integer sequences.
 
 ## Plugins: skills and tools
 

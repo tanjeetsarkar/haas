@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 from urllib.parse import urlsplit
@@ -84,16 +85,39 @@ async def db():
         tenant_context.reset(token)
         await store.close()
         await owner.execute(
-            "UPDATE runs SET status = 'cancelled' WHERE tenant_uuid = $1 "
-            "AND status IN ('running','input_required')",
-            tenant,
+            "UPDATE runs SET status = 'cancelled', lease_owner = NULL, "
+            "lease_expires_at = NULL WHERE tenant_uuid = ANY($1::uuid[]) "
+            "AND status IN ('queued','running','input_required','cancelling')",
+            [tenant, other],
         )
         await owner.execute(
-            "UPDATE threads SET active_run_id = NULL WHERE tenant_uuid = $1", tenant
+            "UPDATE threads SET active_run_id = NULL WHERE tenant_uuid = ANY($1::uuid[])",
+            [tenant, other],
         )
         await owner.execute(f"DROP OWNED BY {role}")
         await owner.execute(f"DROP ROLE {role}")
         await owner.close()
+
+
+@asynccontextmanager
+async def service_store(owner):
+    """Worker/maintenance store: execution-service role, as in production."""
+    role = f"qa_svc_{uuid4().hex}"
+    await owner.execute(
+        f"CREATE ROLE {role} LOGIN PASSWORD 'phase3-test-only' "
+        "IN ROLE haas_execution_service"
+    )
+    store = DistributedStore()
+    store.pg_pool = await asyncpg.create_pool(
+        DSN, user=role, password="phase3-test-only", min_size=1, max_size=2
+    )
+    store.redis = AsyncMock()
+    try:
+        yield store
+    finally:
+        await store.close()
+        await owner.execute(f"DROP OWNED BY {role}")
+        await owner.execute(f"DROP ROLE {role}")
 
 
 async def admit(store, slug, thread, run, **kwargs):
@@ -166,7 +190,7 @@ async def test_rls_default_deny_foreign_rows_and_pool_reuse(db):
         assert not await conn.fetchval("SELECT current_setting('haas.tenant',true)")
 
 
-async def test_thread_race_branch_stale_completion_cancel_and_reaper(db):
+async def test_thread_race_branch_stale_completion_cancel_and_deadline(db):
     owner, store, slug, _, _, _, principal, _ = db
     thread = f"t_{uuid4().hex}"
     await store.get_or_create_thread_messages(thread, slug)
@@ -201,7 +225,13 @@ async def test_thread_race_branch_stale_completion_cancel_and_reaper(db):
     assert await store.cancel_run(second, slug)
     third = "r_" + uuid4().hex
     await admit(store, slug, thread, third)
-    assert any(row["run_id"] == third for row in await store.reap_orphaned_runs(10**12))
+    await owner.execute(
+        "UPDATE runs SET deadline_at = now() - interval '1 second' WHERE run_id = $1",
+        third,
+    )
+    async with service_store(owner) as service:
+        assert (await service.reconcile())["deadlines"] >= 1
+    assert (await store.get_run(third))["status"] == "failed"
     assert (await store.get_thread(thread, slug))["active_run_id"] is None
 
 
@@ -339,10 +369,7 @@ async def test_api_revision_journey_policy_denials_and_history(db, monkeypatch):
             credential_type="oidc",
         )
 
-    from unittest.mock import Mock
-
     monkeypatch.setattr(main, "store", store)
-    monkeypatch.setattr(main, "llm_step_task", Mock())
     monkeypatch.setattr(main.identity_authenticator, "authenticate", authenticate)
     headers = {"Authorization": "Bearer test-only", "X-Tenant-ID": slug}
     async with httpx.AsyncClient(
@@ -422,7 +449,6 @@ async def test_api_revision_journey_policy_denials_and_history(db, monkeypatch):
 
 async def test_real_api_key_identity_and_admin_queries_under_rls(db, monkeypatch):
     import app.main as main
-    from unittest.mock import Mock
 
     _, store, slug, other_slug, _, _, principal, _ = db
     thread = "legacy_" + uuid4().hex
@@ -438,7 +464,6 @@ async def test_real_api_key_identity_and_admin_queries_under_rls(db, monkeypatch
         request_id=str(uuid4()),
     )
     monkeypatch.setattr(main, "store", store)
-    monkeypatch.setattr(main, "llm_step_task", Mock())
     monkeypatch.setattr(main.identity_authenticator, "store", store)
     headers = {"Authorization": f"Bearer {credential}", "X-Tenant-ID": slug}
     async with httpx.AsyncClient(

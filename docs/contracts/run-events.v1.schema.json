@@ -1,0 +1,604 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haas.dev/schemas/run-events.v1.schema.json",
+  "title": "HaaS run event (run-events.v1)",
+  "description": "Durable, replayable run event envelope. Returned by GET /v1/runs/{run_id}/events (items) and, as `data` only, by the SSE stream /v1/runs/{run_id}/stream where `id` is the sequence and `event` is the type. Compatibility: fields and event types are only ever added within v1; consumers must ignore unknown fields and unknown event types.",
+  "type": "object",
+  "required": [
+    "sequence",
+    "event_id",
+    "schema_version",
+    "type",
+    "run_id",
+    "occurred_at",
+    "data"
+  ],
+  "properties": {
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Gap-free per-run sequence; use as SSE Last-Event-ID / `after` cursor."
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "type": {
+      "enum": [
+        "approval_expired",
+        "hitl_approved",
+        "hitl_rejected",
+        "input_required",
+        "run_cancelled",
+        "run_cancelling",
+        "run_completed",
+        "run_error",
+        "run_queued",
+        "run_recovering",
+        "step_started",
+        "tool_dispatched",
+        "tool_result"
+      ]
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "approval_expired"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/approval_expired"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "hitl_approved"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/hitl_approved"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "hitl_rejected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/hitl_rejected"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "input_required"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/input_required"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_cancelled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_cancelled"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_cancelling"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_cancelling"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_completed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_completed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_error"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_error"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_queued"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_queued"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run_recovering"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/run_recovering"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "step_started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/step_started"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool_dispatched"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/tool_dispatched"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "tool_result"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/tool_result"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "run_queued": {
+      "type": "object",
+      "description": "Run admitted and durably queued.",
+      "required": [
+        "run_id",
+        "thread_id"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "step_started": {
+      "type": "object",
+      "description": "A model step began; (step, attempt) identifies the live model call for output deltas.",
+      "required": [
+        "step",
+        "attempt",
+        "model"
+      ],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "model": {
+          "type": "string"
+        },
+        "reserved_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "active_skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unlocked_tools_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "tool_dispatched": {
+      "type": "object",
+      "description": "A tool invocation was handed to an executor queue.",
+      "required": [
+        "invocation_id",
+        "tool",
+        "tool_call_id",
+        "queue",
+        "effect_key"
+      ],
+      "properties": {
+        "invocation_id": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "queue": {
+          "type": "string"
+        },
+        "effect_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "tool_result": {
+      "type": "object",
+      "description": "A tool outcome was recorded. `unknown` means the effect may have happened and was not retried.",
+      "required": [
+        "invocation_id",
+        "tool",
+        "tool_call_id",
+        "status",
+        "is_error"
+      ],
+      "properties": {
+        "invocation_id": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "unknown",
+            "cancelled"
+          ]
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "preview": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "input_required": {
+      "type": "object",
+      "description": "The run paused for human approval of a tool batch.",
+      "required": [
+        "batch_id",
+        "batch_digest",
+        "step",
+        "pending_tool_calls",
+        "decision_endpoint"
+      ],
+      "properties": {
+        "batch_id": {
+          "type": "string"
+        },
+        "batch_digest": {
+          "type": "string"
+        },
+        "step": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pending_tool_calls": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "decision_endpoint": {
+          "type": "string"
+        },
+        "resume_endpoint": {
+          "type": "string"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": true
+    },
+    "hitl_approved": {
+      "type": "object",
+      "description": "An approver approved the pending batch.",
+      "required": [
+        "batch_id",
+        "dispatched_tools"
+      ],
+      "properties": {
+        "batch_id": {
+          "type": "string"
+        },
+        "dispatched_tools": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "hitl_rejected": {
+      "type": "object",
+      "description": "An approver rejected the pending batch.",
+      "required": [
+        "batch_id",
+        "reason"
+      ],
+      "properties": {
+        "batch_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "approval_expired": {
+      "type": "object",
+      "description": "The approval window elapsed without a decision.",
+      "required": [
+        "run_id"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "run_recovering": {
+      "type": "object",
+      "description": "The reconciler re-dispatched a stalled run.",
+      "required": [
+        "action",
+        "attempt",
+        "reason"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "step",
+            "aggregate",
+            "decision",
+            "none"
+          ]
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "enum": [
+            "lease_expired",
+            "queue_stalled"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "run_cancelling": {
+      "type": "object",
+      "description": "Cancellation requested; waiting for in-flight tools.",
+      "required": [
+        "run_id",
+        "outstanding_tools"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "outstanding_tools": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "run_completed": {
+      "type": "object",
+      "description": "Terminal: the run finished successfully. `output` is authoritative.",
+      "required": [
+        "output"
+      ],
+      "properties": {
+        "output": {
+          "type": "string"
+        },
+        "steps_used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_cost_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cached_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "run_error": {
+      "type": "object",
+      "description": "Terminal: the run failed.",
+      "required": [
+        "error",
+        "code"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Human-readable; do not parse."
+        },
+        "code": {
+          "enum": [
+            "budget.max_steps",
+            "budget.max_cost",
+            "budget.max_tool_invocations",
+            "budget.deadline",
+            "approval.expired",
+            "recovery.exhausted",
+            "execution.failed",
+            "run.failed"
+          ],
+          "description": "Stable machine code; new codes may be added (treat unknown as run.failed)."
+        }
+      },
+      "additionalProperties": true
+    },
+    "run_cancelled": {
+      "type": "object",
+      "description": "Terminal: the run was cancelled.",
+      "required": [
+        "run_id"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "x-terminal-types": [
+    "run_cancelled",
+    "run_completed",
+    "run_error"
+  ],
+  "x-stream-control-events": {
+    "stream_gap": "SSE only, no id: requested cursor is ahead of the log ({requested, latest}).",
+    "stream_closed": "SSE only, no id: the stream ended because credentials were revoked ({reason})."
+  }
+}

@@ -27,6 +27,25 @@ class PendingCall:
 
 
 @dataclass
+class ApprovalBinding:
+    """The server-issued identity of a pending approval; decisions are bound to it."""
+
+    batch_id: str
+    batch_digest: str
+    expires_at: str | None = None
+
+    @classmethod
+    def parse(cls, data: Any) -> ApprovalBinding | None:
+        if not isinstance(data, dict):
+            return None
+        batch_id, digest = data.get("batch_id"), data.get("batch_digest")
+        if not isinstance(batch_id, str) or not isinstance(digest, str):
+            return None
+        expires = data.get("expires_at")
+        return cls(batch_id, digest, expires if isinstance(expires, str) else None)
+
+
+@dataclass
 class Decision:
     approved: bool
     reason: str | None = None
@@ -57,6 +76,10 @@ class ChatSession:
     thread_cursor: str | None = None
     thread_search: str = ""
     agent_cursor: str | None = None
+    pending_approval: ApprovalBinding | None = None
+    # Request advisory live output deltas; only enabled when the server advertises them.
+    output_deltas: bool = False
+    live_output: bool = True
 
     def __post_init__(self) -> None:
         self.client.set_credential(self.settings.credential)
@@ -141,10 +164,13 @@ class ChatSession:
             if res is not None:
                 await res
 
-        cursor = "0-0"
+        cursor = "0"
         while True:
             paused: SSEEvent | None = None
-            async for ev in self.client.stream_events(run_id, cursor):
+            self.pending_approval = None
+            async for ev in self.client.stream_events(
+                run_id, cursor, output_deltas=self.output_deltas and self.live_output
+            ):
                 if ev.id:
                     cursor = ev.id
                 if ev.event == "step_started":
@@ -167,6 +193,7 @@ class ChatSession:
                     return TurnResult("cancelled", "Run cancelled.", cost, run_id)
                 if ev.event == "input_required":
                     paused = ev
+                    self.pending_approval = ApprovalBinding.parse(ev.data)
             if paused is None:
                 run = await self.client.get_run(run_id)
                 if run["status"] == "input_required":
@@ -185,6 +212,7 @@ class ChatSession:
                     paused = SSEEvent(
                         "input_required", {"pending_tool_calls": pending_calls}
                     )
+                    self.pending_approval = ApprovalBinding.parse(run.get("approval"))
                 else:
                     cost = float(run.get("total_cost_usd") or 0.0)
                     self._record_cost(run_id, cost)
@@ -218,16 +246,23 @@ class ChatSession:
             decision = await on_approval(calls)
             if decision is None:
                 return TurnResult("paused", run_id=run_id)
+            binding = self.pending_approval
             try:
                 await self.client.resume(
                     run_id,
                     decision.approved,
                     decision.reason,
                     secrets=self.settings.secrets,
+                    batch_id=binding.batch_id if binding else None,
+                    batch_digest=binding.batch_digest if binding else None,
                 )
             except HaasAPIError as exc:
-                if exc.status != 409:  # 409: another operator already resumed it
+                # 409: already decided elsewhere, or the batch changed since review; the
+                # durable event log shows which, so keep following from the cursor.
+                if exc.status != 409:
                     raise
+            finally:
+                self.pending_approval = None
 
 
 @dataclass
@@ -257,7 +292,20 @@ COMMAND_HELP: list[tuple[str, str]] = [
     ("/profile [name]", "Switch to a saved environment profile"),
     ("/admin", "Open role-authorized tenant administration and audit"),
     ("/approve <run-id>", "Review and resolve a pending run approval as an approver"),
+    (
+        "/approvals [STATUS]",
+        "Approval inbox: pending (default), approved, rejected, expired, all",
+    ),
+    (
+        "/inspect [run-id]",
+        "Run inspector: state, budget, steps, tool invocations and usage",
+    ),
+    (
+        "/events [run-id] [after] [type=TEXT]",
+        "Page or search the durable, replayable run event log",
+    ),
     ("/status", "Connection, thread, models, budgets, secrets (names only)"),
+    ("/live [on|off]", "Advisory live output preview (when the server offers it)"),
     ("/skills", "List installed skills"),
     ("/tools", "List registered tools (⚠ = needs approval)"),
     ("/preload [skills…|clear]", "Skills activated up-front on every run"),
@@ -399,9 +447,25 @@ async def handle_command(session: ChatSession, line: str) -> CommandResult:
                 else ""
             )
             return err(str(exc) + recovery)
+    elif cmd in {"/approvals", "/inspect", "/events"}:
+        try:
+            out.lines = await _inspection_command(session, cmd, args)
+        except HaasAPIError as exc:
+            return err(str(exc))
+        except ValueError as exc:
+            return err(str(exc))
     elif cmd == "/help":
         width = max(len(c) for c, _ in COMMAND_HELP)
         out.lines = [f"{c.ljust(width)}  {d}" for c, d in COMMAND_HELP]
+    elif cmd == "/live":
+        if args and args[0] not in ("on", "off"):
+            return err("Usage: /live [on|off]")
+        if args:
+            session.live_output = args[0] == "on"
+        offered = "offered" if session.output_deltas else "not offered by this server"
+        out.lines = [
+            f"Live output preview: {'on' if session.live_output else 'off'} ({offered})."
+        ]
     elif cmd == "/clear":
         out.clear = True
     elif cmd == "/new":
@@ -509,3 +573,168 @@ async def handle_command(session: ChatSession, line: str) -> CommandResult:
     else:
         return err(f"Unknown command {cmd}. Type /help.")
     return out
+
+
+APPROVAL_STATUSES = ("pending", "approved", "rejected", "expired", "cancelled", "all")
+EVENT_SEARCH_PAGE = 500
+
+
+def _money(value: Any) -> str:
+    try:
+        return f"${float(value or 0):.4f}"
+    except (TypeError, ValueError):
+        return "$?"
+
+
+def format_budget(budget: dict[str, Any]) -> list[str]:
+    """Settled, uncertain and reserved spend against each ceiling."""
+    lines = [
+        f"cost        settled {_money(budget.get('settled_usd'))} · "
+        f"uncertain {_money(budget.get('uncertain_usd'))} · "
+        f"reserved {_money(budget.get('reserved_usd'))} / "
+        f"max {_money(budget.get('max_cost_usd'))} "
+        f"(remaining {_money(budget.get('remaining_usd'))})",
+        f"steps       {budget.get('steps_used', 0)} / {budget.get('max_steps', '?')}",
+    ]
+    if budget.get("max_tool_invocations") is not None:
+        lines.append(
+            f"tools       {budget.get('tool_invocations_used', 0)} / "
+            f"{budget['max_tool_invocations']}"
+        )
+    if budget.get("deadline_at"):
+        lines.append(f"deadline    {budget['deadline_at']}")
+    return lines
+
+
+def format_approval(item: dict[str, Any]) -> list[str]:
+    calls = item.get("tool_calls") or []
+    names = (
+        ", ".join(str(c.get("name", "?")) for c in calls if isinstance(c, dict)) or "-"
+    )
+    decision = item.get("decision") or {}
+    state = str(item.get("status", "?"))
+    if item.get("expired"):
+        state += " (expired)"
+    lines = [
+        f"{item.get('batch_id')}  {state}  run {item.get('run_id')} "
+        f"step {item.get('step_number')}",
+        f"    tools: {names}",
+        f"    digest {str(item.get('batch_digest', ''))[:16]}…  "
+        f"expires {item.get('expires_at')}",
+    ]
+    if decision:
+        lines.append(
+            f"    decided {decision.get('decision')} by {decision.get('decided_by')} "
+            f"at {decision.get('decided_at')}"
+            + (f": {decision['reason']}" if decision.get("reason") else "")
+        )
+    return lines
+
+
+async def _inspection_command(
+    session: ChatSession, cmd: str, args: list[str]
+) -> list[str]:
+    client = session.client
+    if cmd == "/approvals":
+        status = args[0].lower() if args else "pending"
+        if len(args) > 1 or status not in APPROVAL_STATUSES:
+            raise ValueError(f"Usage: /approvals [{'|'.join(APPROVAL_STATUSES)}]")
+        data = await client.list_approvals(status=status)
+        lines: list[str] = []
+        for item in data.get("items", []):
+            lines.extend(format_approval(item))
+        return lines or [f"No {status} approvals."]
+
+    type_filter = None
+    if cmd == "/events":
+        filters = [a for a in args if a.startswith("type=")]
+        if len(filters) > 1 or (filters and not filters[0][5:]):
+            raise ValueError("Usage: /events [RUN_ID] [AFTER_SEQUENCE] [type=TEXT]")
+        if filters:
+            type_filter = filters[0][5:].lower()
+            args = [a for a in args if a != filters[0]]
+    run_id = args[0] if args and not args[0].isdigit() else session.last_run_id
+    rest = args[1:] if args and not args[0].isdigit() else args
+    if not run_id:
+        raise ValueError(f"Usage: {cmd} RUN_ID (no current run in this session)")
+    if cmd == "/events":
+        if len(rest) > 1 or (rest and not rest[0].isdigit()):
+            raise ValueError("Usage: /events [RUN_ID] [AFTER_SEQUENCE] [type=TEXT]")
+        data = await client.run_events(
+            run_id,
+            after=int(rest[0]) if rest else 0,
+            limit=EVENT_SEARCH_PAGE if type_filter else 100,
+        )
+        events = [
+            e
+            for e in data.get("items", [])
+            if not type_filter or type_filter in str(e.get("type", "")).lower()
+        ]
+        lines = [
+            f"{e.get('sequence'):>5}  {e.get('occurred_at')}  {e.get('type')}  "
+            f"{json.dumps(e.get('data'), ensure_ascii=True, default=str)[:160]}"
+            for e in events
+        ] or [
+            f"No {type_filter!r} events in this page."
+            if type_filter
+            else "No events after that sequence."
+        ]
+        if data.get("next_after", 0) < data.get("latest_sequence", 0):
+            suffix = f" type={type_filter}" if type_filter else ""
+            lines.append(f"More: /events {run_id} {data['next_after']}{suffix}")
+        return lines
+
+    if rest:
+        raise ValueError("Usage: /inspect [RUN_ID]")
+    run = await client.get_run(run_id)
+    steps = await client.run_steps(run_id)
+    usage = await client.run_usage(run_id)
+    lines = [
+        f"run         {run.get('run_id')}  [{run.get('status')}]",
+        f"thread      {run.get('thread_id')}",
+        f"state       version {run.get('state_version')} · "
+        f"events {run.get('event_sequence')}"
+        + (f" · parent {run['parent_run_id']}" if run.get("parent_run_id") else ""),
+    ]
+    if run.get("traceparent"):
+        lines.append(f"trace       {run['traceparent']}")
+    budget = usage.get("budget") or run.get("budget")
+    if isinstance(budget, dict):
+        lines.extend(format_budget(budget))
+    approval = run.get("approval")
+    if isinstance(approval, dict):
+        lines.append(
+            f"approval    batch {approval.get('batch_id')} "
+            f"expires {approval.get('expires_at')}"
+        )
+    lines.append("steps:")
+    for st in steps.get("steps", []):
+        lines.append(
+            f"  #{st.get('step_number')}.{st.get('attempt')}  {st.get('status'):<16} "
+            f"{st.get('model') or '-'}  {_money(st.get('cost_usd'))}"
+            + ("" if st.get("cost_reported", True) else " (unreported)")
+            + (f"  error: {st['error']}" if st.get("error") else "")
+        )
+    lines.append("tool invocations:")
+    for inv in steps.get("invocations", []):
+        lines.append(
+            f"  #{inv.get('step_number')}.{inv.get('ordinal')}  "
+            f"{inv.get('tool_name')}  {inv.get('status')}  "
+            f"effect {str(inv.get('effect_key') or '')[:12]}"
+        )
+        if inv.get("status") == "unknown":
+            lines.append(
+                "    outcome unknown: the effect may have happened and HaaS never re-executes "
+                f"it. Reconcile with the destination using effect key "
+                f"{inv.get('effect_key')}."
+            )
+    entries = usage.get("entries", [])
+    lines.append(
+        f"usage ledger: {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+    )
+    for entry in entries:
+        lines.append(
+            f"  {entry.get('unit')}  {entry.get('quantity')}  "
+            f"{_money(entry.get('cost_usd'))}  {entry.get('settlement_status')}"
+        )
+    return lines

@@ -102,7 +102,7 @@ async def cutover(conn: asyncpg.Connection) -> None:
         await conn.execute("SELECT pg_advisory_xact_lock(7300002)")
         await conn.execute("LOCK TABLE threads, runs IN ACCESS EXCLUSIVE MODE")
         if await conn.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM runs WHERE status IN ('running','input_required'))"
+            "SELECT EXISTS (SELECT 1 FROM runs WHERE status IN ('queued','running','input_required','cancelling'))"
         ):
             raise ValueError("Drain active and paused runs before cutover.")
         counts = await report(conn)

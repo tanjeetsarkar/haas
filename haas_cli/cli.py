@@ -44,10 +44,9 @@ def _dev_root() -> Path:
     cwd = Path.cwd().resolve()
     candidates = (cwd, *cwd.parents, Path(__file__).resolve().parents[1])
     for candidate in candidates:
-        if (
-            (candidate / "docker-compose.yml").is_file()
-            and (candidate / "tests/e2e/docker-compose.e2e.yml").is_file()
-        ):
+        if (candidate / "docker-compose.yml").is_file() and (
+            candidate / "tests/e2e/docker-compose.e2e.yml"
+        ).is_file():
             return candidate
     raise ValueError("Run `haas dev` from a HaaS source checkout.")
 

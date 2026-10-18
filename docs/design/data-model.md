@@ -149,8 +149,8 @@ policy/revision pins and branch ancestry; historical `NOT VALID` constraints are
 at cutover. The active policy pointer is tenant-aware.
 Policy revisions and audit events are protected from updates and deletes by database
 triggers. Agent bodies are immutable from draft creation; validation and publication
-are guarded forward-only transitions. Immutable approval-decision, run-event, invocation, artifact and
-usage-ledger tables do not yet exist.
+are guarded forward-only transitions. Phase 3 durable workflow tables are described
+[below](#phase-3-durable-workflow-tables); artifact tables do not yet exist.
 
 ### Current column semantics
 
@@ -162,7 +162,9 @@ usage-ledger tables do not yet exist.
 | Tenant policy | Versioned JSONB rules with a SHA-256 digest; model providers/models, plugin digest+skill grants, exact webhook hosts, maximum budgets and retention class |
 | Active policy | Nullable tenant pointer with a composite FK preventing cross-tenant activation; absent policy denies authenticated run admission |
 | API credentials | Tenant-scoped key prefix and SHA-256 hash; raw key is never stored |
-| `status` on runs | Check constraint: `running`, `input_required`, `completed`, `failed`, `cancelled`; future workflow states require a migration |
+| `status` on runs | Check constraint (migration 0009): `queued`, `running`, `input_required`, `cancelling`, `completed`, `failed`, `cancelled` |
+| Workflow fencing on runs | `state_version`, `lease_epoch`, `lease_owner`, `lease_expires_at`, `next_action`, `recovery_attempts`, `event_sequence`; every transition is a CAS on version + epoch |
+| Budgets on runs | `deadline_at`, `budget_reserved_usd` (NUMERIC), `max_tool_invocations`, `tool_invocations_used`; `parent_run_id` reserved for Track A child runs |
 | `messages_json`, `messages_checkpoint_json` | Required JSONB, default empty array; full message snapshots |
 | `active_skills_json`, `fingerprints_json` | Required JSONB arrays; stored fingerprint history limited to last 20 on checkpoint |
 | `pending_tool_calls_json` | Nullable JSONB containing entire paused batch |
@@ -171,8 +173,8 @@ usage-ledger tables do not yet exist.
 | `submitted_by_principal_id` | Nullable FK added by migration 0003; null on legacy/development-header runs |
 | `policy_revision_id` | Nullable FK added by migration 0004; authenticated runs pin the immutable policy revision used at admission |
 | `audit_events` | Migration 0005 stores tenant-scoped actor, action, target, request ID and minimized JSON details; rows are append-only |
-| `total_cost_usd`, `max_cost_usd` | NUMERIC after cutover, synchronized NUMERIC shadows during expansion; finite nonnegative observed cost and positive budget; not a reservation/settlement ledger |
-| `max_steps`, `step_count` | Defaults 15 and 0; persisted step count can lag terminal reported step |
+| `total_cost_usd`, `max_cost_usd` | NUMERIC after cutover, synchronized NUMERIC shadows during expansion; finite nonnegative settled cost and positive budget; reservations live in `usage_ledger` |
+| `max_steps`, `step_count` | Defaults 15 and 0; per-attempt detail lives in `run_steps` |
 | `last_step_had_error` | Required boolean, default false |
 | Timestamps | Legacy Unix seconds retained alongside synchronized TIMESTAMPTZ fields, required after cutover |
 | Optional text | `result_text`, `webhook_url`, `registry_fingerprint` |
@@ -191,15 +193,51 @@ contain sensitive content. Runtime groups have no grants on them. The schema-own
 explicit administrator policies; execution/maintenance has deliberately cross-tenant,
 narrow table grants, while the API login has tenant-scoped policies only.
 
+### Phase 3 durable workflow tables
+
+Migration `0009_durable_workflow` adds run-child tables keyed by the run's tenant alias
+and `run_id`, with `tenant_uuid` copied from the run, forced RLS for the API login and
+narrow grants for the execution-service login. `run_events` and `approval_decisions` are
+append-only (update/delete triggers).
+
+```mermaid
+erDiagram
+    runs ||--o{ run_steps : attempts
+    runs ||--o{ tool_invocations : invokes
+    runs ||--o{ approval_batches : pauses
+    approval_batches ||--o| approval_decisions : "decided once"
+    approval_batches ||--o{ tool_invocations : covers
+    runs ||--o{ run_events : "sequence"
+    runs ||--o{ outbox_messages : intents
+    runs ||--o{ consumer_inbox : dedup
+    runs ||--o{ usage_ledger : "reserve/settle"
+    runs ||--o| admission_requests : "Idempotency-Key"
+```
+
+| Table | Purpose / key constraints |
+|---|---|
+| `admission_requests` | Tenant + principal + operation + `Idempotency-Key` → request digest and stored receipt; same key/different digest is a conflict |
+| `run_steps` | One row per step attempt with `lease_epoch`, model, reserved vs settled cost, tokens and status (`model_running`, `abandoned`, …) |
+| `tool_invocations` | Per call: `arguments_digest`, unique `effect_key`, queue, status (`awaiting_approval` → `approved`/`denied` → `dispatched` → `succeeded`/`failed`/`unknown`/`cancelled`), attempt, epoch, batch link |
+| `approval_batches` | Exact pending calls, `batch_digest`, `run_state_version`, `expires_at`, status `pending`/`approved`/`rejected`/`expired`/`cancelled` |
+| `approval_decisions` | Immutable decision, attributed actor, reason, request/idempotency IDs |
+| `run_events` | Per-run gapless `sequence`, `event_id`, `schema_version`, `type`, payload; SSE and `/events` replay source |
+| `outbox_messages` | Task intents (tool intents carry signed envelopes) committed with transitions; unique `dedup_key`; relay claims with `SKIP LOCKED`, bounded attempts (`OUTBOX_MAX_ATTEMPTS`) |
+| `consumer_inbox` | `(consumer, tenant_id, message_id)` deduplication of at-least-once deliveries; pruned after `INBOX_RETENTION_SEC` |
+| `usage_ledger` | Unique `(tenant_id, source_attempt_key, unit)`; finite NUMERIC quantity/cost; `reserved`/`settled`/`released`/`uncertain` settlement with pricing revision |
+
+The 0009 downgrade refuses while non-terminal runs exist and restores the Phase 2 status
+constraint; drain work first.
+
 ## 2. Nonrelational state (CURRENT)
 
 | Location / key | Shape / purpose | Lifetime / guarantee |
 |---|---|---|
 | Redis DB 0 `haas:secrets:{run_id}` | JSON dictionary of caller secret values | Default 3,600-second SETEX; re-supply replaces dictionary and resets TTL; cleared at finalization |
-| Redis DB 0 `haas:stream:{run_id}` | Stream entries: `event_type`, `payload_json` | Approximate MAXLEN, default 1,000; expiry reset to 86,400 seconds on every publish |
+| Redis DB 0 `haas:wake:{run_id}` | Advisory SSE wakeup entries (no event data) | Approximate MAXLEN 50, 86,400-second expiry; loss only delays SSE polling, events live in `run_events` |
 | Redis DB 0 `haas:lock:{key}` | Generic NX lock helper | Default 15 seconds; helper exists but is not a general fenced run lease |
-| Redis DB 1 Celery transport | Serialized JSON tasks / chord signatures | Redis visibility timeout 600 seconds; at-least-once/redelivery exposure |
-| Redis DB 2 Celery result backend | Tool results, chord bookkeeping | Configured result expiry 3,600 seconds |
+| Redis DB 1 Celery transport | Outbox-relayed tasks; tool tasks carry signed execution envelopes | Redis visibility timeout 600 seconds; redelivery deduplicated by `consumer_inbox` and fencing |
+| Redis DB 2 Celery result backend | Not used for workflow correctness; outcomes are recorded on `tool_invocations` | Configured result expiry 3,600 seconds |
 | Per-process registry | Plugins, schemas, skills, handlers, diagnostics | Startup snapshot; local fingerprint |
 | Shared scratchpad volume | Oversized observations named from tool/call ID | No implemented tenant prefix, object authorization, expiry or cleanup policy |
 
@@ -571,6 +609,19 @@ UUIDs are not authorization. Target timestamps use `TIMESTAMPTZ`; identifiers,
 trace IDs and provider request IDs are separate fields.
 
 ## 4a. Proposed marketplace and multi-agent ERD (TARGET)
+
+> **Implementation status.** The tenant-owned multi-agent half is implemented by migration
+> `0011_multi_agent_schema`: `runs.root_run_id`/`depth`/`delegation_id` (lineage derived from
+> the parent by trigger and frozen afterwards; depth ≤ 32), `delegations` (terms immutable;
+> only status/settlement/returned budget update), `agent_messages` (`hacp/1`, same-tree only,
+> `consumed_at` set once), `workspaces` (one per root run) and `workspace_entry_versions`
+> (append-only, `version = current + 1` CAS, path validation), and `agent_cards` (published
+> revisions only). All use forced RLS with the `tenant_boundary`/`execution_service`/
+> `schema_administrator` policies and are included in the production startup RLS check.
+> Differences from the ERD: tree tables key runs by the tenant alias (`tenant_id`, `run_id`)
+> like other workflow tables and copy `tenant_uuid` from the root run; workspace entries hold
+> either bounded inline content or an artifact reference (no artifacts table exists yet).
+> Marketplace tables (`PUBLISHER` … `INSTALLATION`, `CAPABILITY_GRANT`) remain TARGET for Track M.
 
 Extends §3–§4 for the [marketplace](marketplace.md) and [multi-agent](multi-agent.md) designs.
 The same composite-key, RLS and immutability constraints apply. `PUBLISHER`, `LISTING`,

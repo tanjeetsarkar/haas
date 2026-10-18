@@ -10,14 +10,21 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core.openai_compat import is_facade_path, openai_error_body
+
 
 def problem_response(
     status: int,
-    detail: str,
+    detail: Any,
     *,
     instance: str,
     errors: list[dict[str, Any]] | None = None,
 ) -> JSONResponse:
+    if is_facade_path(instance):
+        # OpenAI SDKs parse `{"error": {...}}`; keep the status, change only the envelope.
+        return JSONResponse(openai_error_body(status, detail), status_code=status)
+    if not isinstance(detail, str):
+        detail = json.dumps(detail)
     body: dict[str, Any] = {
         "type": "about:blank",
         "title": HTTPStatus(status).phrase,
@@ -33,8 +40,10 @@ def problem_response(
 async def http_exception_problem(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, HTTPException):
         raise exc
-    detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
-    return problem_response(exc.status_code, detail, instance=request.url.path)
+    response = problem_response(exc.status_code, exc.detail, instance=request.url.path)
+    for key, value in (exc.headers or {}).items():
+        response.headers[key] = value
+    return response
 
 
 async def validation_problem(request: Request, exc: Exception) -> JSONResponse:
@@ -48,6 +57,18 @@ async def validation_problem(request: Request, exc: Exception) -> JSONResponse:
         }
         for error in exc.errors()
     ]
+    if is_facade_path(request.url.path):
+        first = errors[0] if errors else {"loc": [], "msg": "Invalid request."}
+        loc = [str(part) for part in first["loc"] if part != "body"]
+        return problem_response(
+            400,
+            {
+                "message": f"{'.'.join(loc) or 'body'}: {first['msg']}",
+                "code": "invalid_request",
+                "param": ".".join(loc) or None,
+            },
+            instance=request.url.path,
+        )
     return problem_response(
         422, "Request validation failed.", instance=request.url.path, errors=errors
     )

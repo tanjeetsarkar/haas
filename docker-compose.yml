@@ -94,6 +94,8 @@ services:
     environment:
       <<: *app-env
       HAAS_WORKER_ROLE: orchestrator
+      # Ed25519 seed that signs tool envelopes; blank = development key (dev profile only).
+      HAAS_ENVELOPE_SIGNING_KEY: ${HAAS_ENVELOPE_SIGNING_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-sk-or-v1-replace-me}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       DEFAULT_PRIMARY_MODEL: ${DEFAULT_PRIMARY_MODEL:-deepseek/deepseek-chat-v3-0324}
@@ -105,7 +107,8 @@ services:
       haas-api:
         condition: service_healthy
 
-  # Isolated tool worker: NO OpenRouter key, no PostgreSQL DSN, dropped capabilities, read-only rootfs
+  # Isolated tool worker: NO OpenRouter key, no PostgreSQL DSN, no signing key,
+  # dropped capabilities, read-only rootfs
   worker-tools:
     image: haas-distributed:3.0.0
     command: >
@@ -117,6 +120,8 @@ services:
     environment:
       HAAS_PROFILE: ${HAAS_PROFILE:-dev}
       HAAS_WORKER_ROLE: tools
+      # Verify-only public key: tool workers can check, never mint, dispatch envelopes.
+      HAAS_ENVELOPE_VERIFY_KEY: ${HAAS_ENVELOPE_VERIFY_KEY:-}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2

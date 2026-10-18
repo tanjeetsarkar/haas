@@ -21,8 +21,9 @@ with a structured JSON draft form and explicit active-run/version conflict recov
 Versioned identity-scoped capability metadata drives administration visibility; older
 servers without metadata retain the role-based compatibility path, and unsupported
 advertised versions/event schemas are rejected. These are Chat commands, not new
-dedicated visual workspaces. Marketplace consent, distributed-agent inspection,
-durable timelines and operator workflows remain roadmap work.
+dedicated visual workspaces. T3 adds the approval inbox workspace (`Ctrl+4`), a run
+inspector (budget, steps, invocations, usage) and `/events` over the durable event log.
+Marketplace consent, distributed-agent inspection and operator workflows remain roadmap work.
 
 The target is an **agent mission control terminal**: a welcoming chat for first-time users,
 a precise execution workbench for developers, and an authorized control surface for

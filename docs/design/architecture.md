@@ -37,13 +37,14 @@ flowchart TB
     packs["Read-only plugin packs<br/>native Python + skills + endpoint manifests"]
     subgraph compose["Docker Compose network"]
         api["FastAPI<br/>2 Uvicorn processes"]
-        orch["Celery orchestrator<br/>q_orchestrator; concurrency 8"]
+        orch["Celery orchestrator<br/>q_orchestrator; concurrency 8<br/>leases + fenced transitions; envelope signing key"]
+        maint["Maintenance service<br/>outbox relay + reconciler<br/>(in-process in dev profile)"]
         tools["Celery tools<br/>q_tools_fast + q_tools_sandbox<br/>same service; concurrency 8"]
-        pg[("PostgreSQL 16<br/>tenant registry + revisions<br/>RLS threads + runs")]
+        pg[("PostgreSQL 16<br/>tenant registry + revisions<br/>RLS threads + runs<br/>steps, invocations, approvals,<br/>run_events, outbox, inbox, usage ledger")]
         subgraph redis["One Redis 7.4 instance"]
-            r0[("DB 0<br/>SSE streams + secret values")]
+            r0[("DB 0<br/>SSE wakeups + secret values")]
             r1[("DB 1<br/>Celery broker")]
-            r2[("DB 2<br/>results + chord coordination")]
+            r2[("DB 2<br/>Celery results; not workflow state")]
         end
         scratch[("Shared scratchpad volume")]
         flower["Flower<br/>localhost:5555"]
@@ -53,17 +54,16 @@ flowchart TB
     callback["Run callback receiver"]
     client -->|"trusted local access or gateway"| gateway
     gateway -->|"tenant header; API :8000"| api
-    api -->|"read / checkpoint / resume claim"| pg
-    api -->|"secrets + run_queued + SSE XREAD"| r0
-    api -->|"first step / approved chord"| r1
-    r1 -->|"model + aggregation + callback tasks"| orch
-    orch -->|"checkpoint / finalization"| pg
-    orch -->|"events + scoped secret read"| r0
+    api -->|"admission / decision / cancel txn + outbox; SSE replay"| pg
+    api -->|"secrets; SSE wakeup wait"| r0
+    maint -->|"claim outbox SKIP LOCKED; reconcile leases"| pg
+    maint -->|"publish relayed tasks"| r1
+    r1 -->|"orchestrate + outcome + callback tasks"| orch
+    orch -->|"fenced transitions + events + outbox"| pg
+    orch -->|"wakeups + scoped secret read"| r0
     orch -->|"model HTTPS; provider key"| provider
-    orch -->|"tool chord + next step"| r1
-    r1 -->|"tool task + scoped secret values"| tools
-    tools -->|"outcomes"| r2
-    r2 -->|"chord completion"| orch
+    r1 -->|"signed tool envelope + scoped secret values"| tools
+    tools -->|"outcome task"| r1
     tools -->|"HTTP / MCP / native effects"| endpoints
     orch -->|"unsigned terminal POST"| callback
     tools -->|"oversized observations"| scratch
@@ -72,6 +72,7 @@ flowchart TB
     packs -->|"import / discover"| tools
     flower -->|"monitor"| r1
     flower -->|"inspect results"| r2
+    tools -.->|"unused for outcomes"| r2
 ```
 
 **Boundary qualifications:**
@@ -84,6 +85,9 @@ flowchart TB
   Compose. This credential separation is not network enforcement: services share the
   Compose network, Redis credentials are not separated, and default settings exist.
 * Redis DB numbers separate keyspaces, not principals, hosts or fault domains.
+* Tool workers hold only the Ed25519 envelope *verify* key: they can check but not mint
+  dispatch authority. A compromised Redis can delay or replay messages, but fencing,
+  `consumer_inbox` deduplication and envelope expiry stop stale or forged execution.
 * `q_tools_sandbox` is routing metadata, not a separate sandbox.
 * Native handlers can perform filesystem/network operations according to process
   privileges. URL validation applies only where handlers actually call it.

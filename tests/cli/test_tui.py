@@ -17,7 +17,9 @@ from haas_cli.tui.app import (
     PromptInput,
 )
 
-from fake_haas import FakeHaas
+from fake_haas import BATCH_DIGEST, BATCH_ID, FakeHaas
+
+BOUND = {"batch_id": BATCH_ID, "batch_digest": BATCH_DIGEST}
 
 
 def make_app(
@@ -237,7 +239,9 @@ async def test_authenticated_submitter_cannot_approve_own_run():
         await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen))
         assert app.screen.query_one("#approve", Button).disabled
         assert app.screen.query_one("#reject", Button).disabled
-        assert "separate approver credential" in str(app.screen.query(".error-box")[0].render())
+        assert "separate approver credential" in str(
+            app.screen.query(".error-box")[0].render()
+        )
         await pilot.press("y")
         assert isinstance(app.screen, ApprovalScreen)
         await pilot.press("n")
@@ -263,7 +267,7 @@ async def test_approver_can_review_and_approve_known_pending_run(monkeypatch):
         await app._run_command("/approve run_1")
         assert len(screens) == 1
         assert [call.name for call in screens[0].calls] == ["prepare_refund_batch"]
-        assert fake.resumes == [{"approved": True, "secrets": {}}]
+        assert fake.resumes == [{"approved": True, "secrets": {}, **BOUND}]
 
 
 async def test_approve_command_rejects_unauthorized_identity():
@@ -296,6 +300,7 @@ async def test_approver_can_reject_or_leave_pending(monkeypatch):
     fake.roles = ["approver"]
     app = make_app(fake, credential="hk_test_approver")
     async with app.run_test(size=(120, 40)):
+
         async def reject(screen):
             assert isinstance(screen, ApprovalScreen)
             return Decision(False, "not today")
@@ -303,7 +308,12 @@ async def test_approver_can_reject_or_leave_pending(monkeypatch):
         monkeypatch.setattr(app, "push_screen_wait", reject)
         await app._run_command("/approve run_1")
         assert fake.resumes == [
-            {"approved": False, "secrets": {}, "rejection_reason": "not today"}
+            {
+                "approved": False,
+                "secrets": {},
+                "rejection_reason": "not today",
+                **BOUND,
+            }
         ]
 
         fake.resumes.clear()
@@ -354,6 +364,7 @@ async def test_approval_flow_reject_with_reason():
             "approved": False,
             "secrets": {"TOK": "supersecretvalue"},
             "rejection_reason": "not today",
+            **BOUND,
         }
 
 

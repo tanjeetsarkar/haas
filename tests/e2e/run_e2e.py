@@ -44,7 +44,7 @@ def start(prompt: str, *, traceparent: str | None = None, **extra) -> str:
     return r.json()["run_id"]
 
 
-def stream(run_id: str, last_id: str = "0-0", tenant: dict | None = None) -> list[dict]:
+def stream(run_id: str, last_id: str = "0", tenant: dict | None = None) -> list[dict]:
     events: list[dict] = []
     with httpx.stream(
         "GET",
@@ -123,6 +123,29 @@ def scenario_happy_path() -> None:
         st["status"] == "input_required" and st["pending_tool_calls"],
         "status input_required with pending calls",
     )
+    check(
+        all(e["id"].isdigit() for e in ev1)
+        and [int(e["id"]) for e in ev1] == sorted(int(e["id"]) for e in ev1),
+        "SSE ids are monotonic durable sequences",
+    )
+    gate = ev1[-1]["data"]
+    approval = st.get("approval") or {}
+    check(
+        approval.get("batch_id") == gate.get("batch_id")
+        and approval.get("batch_digest") == gate.get("batch_digest"),
+        "run exposes the reviewed approval batch binding",
+    )
+    inbox = httpx.get(f"{API}/v1/approvals?status=pending", headers=TENANT).json()
+    check(
+        any(item["batch_id"] == gate["batch_id"] for item in inbox["items"]),
+        "approval appears in the tenant inbox",
+    )
+    stale = httpx.post(
+        f"{API}/v1/approvals/{gate['batch_id']}/decision",
+        headers=TENANT,
+        json={"decision": "approve", "batch_digest": "0" * 64},
+    )
+    check(stale.status_code == 409, "stale batch digest cannot approve")
 
     # Tenant isolation
     other = {"X-Tenant-ID": "someone-else"}
@@ -142,7 +165,16 @@ def scenario_happy_path() -> None:
     with ThreadPoolExecutor(2) as pool:
         codes = sorted(
             f.result().status_code
-            for f in [pool.submit(resume, run_id, True) for _ in range(2)]
+            for f in [
+                pool.submit(
+                    resume,
+                    run_id,
+                    True,
+                    batch_id=gate["batch_id"],
+                    batch_digest=gate["batch_digest"],
+                )
+                for _ in range(2)
+            ]
         )
     check(codes == [202, 409], f"double approval -> exactly one winner {codes}")
 
@@ -174,8 +206,29 @@ def scenario_happy_path() -> None:
     )
     check(resume(run_id, True).status_code == 409, "resume on completed run -> 409")
 
-    full = stream(run_id)  # full replay from 0-0 on a finished run must terminate
+    full = stream(run_id)  # full replay from 0 on a finished run must terminate
     check(kinds(full)[-1] == "run_completed", "full replay of finished run terminates")
+    check(
+        kinds(full) == kinds(ev1) + kinds(ev2) + kinds(ev3),
+        "durable replay reproduces the live event sequence",
+    )
+    page = httpx.get(f"{API}/v1/runs/{run_id}/events?after=0&limit=500", headers=TENANT)
+    check(
+        page.status_code == 200
+        and [i["type"] for i in page.json()["items"]] == kinds(full),
+        "event log endpoint matches SSE replay",
+    )
+    steps = httpx.get(f"{API}/v1/runs/{run_id}/steps", headers=TENANT).json()
+    check(
+        steps["invocations"]
+        and all(i["status"] in {"succeeded", "failed"} for i in steps["invocations"]),
+        "every tool invocation reached a durable outcome",
+    )
+    usage = httpx.get(f"{API}/v1/runs/{run_id}/usage", headers=TENANT).json()
+    check(
+        usage["entries"] and usage["budget"] is not None,
+        "usage ledger and budget are inspectable",
+    )
 
 
 def scenario_reject() -> None:

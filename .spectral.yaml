@@ -1,0 +1,36 @@
+# API style gate for docs/openapi-v1.json (run in CI: `npx @stoplight/spectral-cli lint`).
+# Starts from spectral:oas and adds HaaS conventions; errors fail CI, warnings are advisory.
+extends:
+  - [spectral:oas, recommended]
+rules:
+  # FastAPI emits tags/descriptions per route; info.contact/license are set at publish time.
+  info-contact: off
+  oas3-api-servers: off
+  # Missing tags/descriptions stay warnings until the d-api-ergonomics pass closes them.
+  haas-paths-versioned:
+    description: Public paths live under /v1 (health probes and metrics excepted).
+    severity: error
+    given: $.paths
+    then:
+      field: '@key'
+      function: pattern
+      functionOptions:
+        match: '^/(v1/|healthz$|readyz$|livez$|metrics$)'
+  haas-paths-lowercase:
+    description: Path segments are lowercase (no camelCase) for SDK generation.
+    severity: error
+    given: $.paths
+    then:
+      field: '@key'
+      function: pattern
+      functionOptions:
+        notMatch: '/[^/{}]*[A-Z][^/{}]*'
+  haas-operation-id-snake:
+    description: operationIds are generated snake_case (stable SDK method names).
+    severity: error
+    given: $.paths[*][get,put,post,delete,patch]
+    then:
+      field: operationId
+      function: pattern
+      functionOptions:
+        match: '^[a-z][a-z0-9_]*$'

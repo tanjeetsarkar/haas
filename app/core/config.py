@@ -94,6 +94,48 @@ class Settings(BaseSettings):
     max_identical_tool_calls: int = 2
     redis_stream_max_len: int = 1000
 
+    # Durable workflow (Phase 3). Times are seconds.
+    lease_ttl_sec: int = Field(default=300, gt=0)
+    approval_ttl_sec: int = Field(default=86_400, gt=0)
+    tool_outcome_timeout_sec: int = Field(default=600, gt=0)
+    stall_timeout_sec: int = Field(default=120, gt=0)
+    default_run_deadline_sec: int = Field(default=3_600, gt=0)
+    default_max_tool_invocations: int = Field(default=100, gt=0)
+    max_recovery_attempts: int = Field(default=3, ge=0)
+    outbox_max_attempts: int = Field(default=8, gt=0)
+    idempotency_ttl_sec: int = Field(default=86_400, gt=0)
+    inbox_retention_sec: int = Field(default=604_800, gt=0)
+    reconcile_interval_sec: int = Field(default=10, gt=0)
+    model_call_attempts: int = Field(default=3, gt=0)
+    # Reservation charged before a model call when no model pricing is configured.
+    default_step_reservation_usd: float = Field(default=0.001, ge=0.0)
+    # JSON {"<model>": {"input_per_mtok": 0.5, "output_per_mtok": 1.5}}.
+    model_pricing_json: str = ""
+    reservation_output_tokens: int = Field(default=2_048, gt=0)
+    pricing_revision: str = "static-v1"
+    sse_heartbeat_sec: float = Field(default=15.0, gt=0)
+    sse_reauth_sec: float = Field(default=60.0, gt=0)
+    # Optional live `run.output.delta` previews (Redis, best effort, never authoritative).
+    output_delta_enabled: bool = False
+    output_delta_flush_chars: int = Field(default=48, ge=1, le=4_096)
+    output_delta_flush_ms: int = Field(default=60, ge=0, le=5_000)
+    output_delta_max_chars_per_step: int = Field(default=64_000, ge=1, le=1_000_000)
+    output_delta_buffer: int = Field(default=2_000, ge=10, le=100_000)
+    # OpenAI-compatible facade: how long a blocking call waits for a run to settle.
+    openai_facade_wait_sec: float = Field(default=120.0, gt=0, le=900)
+    envelope_signing_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_ENVELOPE_SIGNING_KEY", "envelope_signing_key"
+        ),
+    )
+    envelope_verify_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "HAAS_ENVELOPE_VERIFY_KEY", "envelope_verify_key"
+        ),
+    )
+
     # Comma-separated hostnames exempt from the SSRF private-address check
     # (local development / integration tests only).
     ssrf_allowed_hosts: str = ""
@@ -131,6 +173,26 @@ class Settings(BaseSettings):
         lists = self.tenant_allowlists()
         return lists.get(tenant_id, lists.get("*"))
 
+    def model_pricing(self) -> dict[str, dict[str, float]]:
+        if not self.model_pricing_json.strip():
+            return {}
+        data = json.loads(self.model_pricing_json)
+        if not isinstance(data, dict) or not all(
+            isinstance(v, dict)
+            and all(
+                k in {"input_per_mtok", "output_per_mtok"}
+                and isinstance(n, (int, float))
+                and n >= 0
+                for k, n in v.items()
+            )
+            for v in data.values()
+        ):
+            raise ValueError(
+                "MODEL_PRICING_JSON must map models to non-negative "
+                "input_per_mtok/output_per_mtok prices"
+            )
+        return data
+
     @property
     def ssrf_allowlist(self) -> set[str]:
         return {
@@ -158,11 +220,7 @@ def validate_profile_settings(
         errors.append(
             "HAAS_OIDC_ISSUER, HAAS_OIDC_AUDIENCE and HAAS_OIDC_JWKS_URL must be configured together"
         )
-    if (
-        role == "api"
-        and config.haas_profile == "prod"
-        and not configured_oidc_values
-    ):
+    if role == "api" and config.haas_profile == "prod" and not configured_oidc_values:
         errors.append(
             "HAAS_OIDC_ISSUER, HAAS_OIDC_AUDIENCE and HAAS_OIDC_JWKS_URL "
             "are required for production API identity."
@@ -206,6 +264,22 @@ def validate_profile_settings(
         "sk-or-v1-replace-me",
     ):
         errors.append("OPENROUTER_API_KEY must be configured in production")
+    from app.core.envelope import DEV_SIGNING_SEED_B64, dev_verify_key_b64
+
+    if role == "orchestrator":
+        if not config.envelope_signing_key:
+            errors.append("HAAS_ENVELOPE_SIGNING_KEY is required in production")
+        elif config.envelope_signing_key == DEV_SIGNING_SEED_B64:
+            errors.append("HAAS_ENVELOPE_SIGNING_KEY must not use the development key")
+    if role == "tools":
+        if not config.envelope_verify_key:
+            errors.append("HAAS_ENVELOPE_VERIFY_KEY is required in production")
+        elif config.envelope_verify_key == dev_verify_key_b64():
+            errors.append("HAAS_ENVELOPE_VERIFY_KEY must not use the development key")
+    try:
+        config.model_pricing()
+    except ValueError as exc:
+        errors.append(str(exc))
     if config.flower_enabled and (
         ":" not in config.flower_basic_auth
         or config.flower_basic_auth == "admin:change-me"

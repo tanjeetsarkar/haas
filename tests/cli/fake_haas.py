@@ -37,14 +37,33 @@ PLUGINS = {
 }
 
 
+BATCH_ID = "11111111-2222-3333-4444-555555555555"
+BATCH_DIGEST = "ab" * 32
+TRACEPARENT = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+
+
 def ev(idx: int, event: str, data: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    return (f"{idx}-0", event, data)
+    return (str(idx), event, data)
 
 
 def sse(events: list[tuple[str, str, dict[str, Any]]]) -> str:
     return "".join(
         f"id: {i}\nevent: {e}\ndata: {json.dumps(d)}\n\n" for i, e, d in events
     )
+
+
+def delta(step: int, attempt: int, call: int, text: str) -> str:
+    data = {
+        "schema": "run-output-delta.v1",
+        "step": step,
+        "attempt": attempt,
+        "call": call,
+        "index": 0,
+        "text": text,
+        "final": False,
+        "truncated": False,
+    }
+    return f"event: run.output.delta\ndata: {json.dumps(data)}\n\n"
 
 
 PRE_PAUSE = [
@@ -78,6 +97,9 @@ PRE_PAUSE = [
         "input_required",
         {
             "step": 2,
+            "batch_id": BATCH_ID,
+            "batch_digest": BATCH_DIGEST,
+            "expires_at": "2030-01-01T00:00:00+00:00",
             "pending_tool_calls": [
                 {
                     "id": "c2",
@@ -142,6 +164,20 @@ SIMPLE = [
 ]
 
 
+BUDGET = {
+    "max_cost_usd": 0.3,
+    "settled_usd": 0.001,
+    "uncertain_usd": 0.0,
+    "reserved_usd": 0.001,
+    "remaining_usd": 0.298,
+    "max_steps": 15,
+    "steps_used": 2,
+    "max_tool_invocations": 20,
+    "tool_invocations_used": 1,
+    "deadline_at": "2030-01-01T00:00:00+00:00",
+}
+
+
 class FakeHaas:
     def __init__(self, script: str = "approval", healthy: bool = True) -> None:
         self.script = script
@@ -150,6 +186,8 @@ class FakeHaas:
         self.resumes: list[dict[str, Any]] = []
         self.cancelled: list[str] = []
         self.stream_headers: list[dict[str, str]] = []
+        self.stream_params: list[dict[str, str]] = []
+        self.features: list[str] | None = None
         self.after_pause: list | None = None
         self.run_status = "input_required"
         self.list_error: str | None = None
@@ -160,6 +198,28 @@ class FakeHaas:
         self.identity_headers: list[dict[str, str]] = []
         self.roles = ["submitter"]
         self.admin_requests: list[tuple[str, str, Any]] = []
+        self.approval_queries: list[dict[str, str]] = []
+        self.decisions: list[tuple[str, dict[str, Any]]] = []
+        self.approval_batches: list[dict[str, Any]] = [
+            {
+                "batch_id": BATCH_ID,
+                "run_id": "run_1",
+                "thread_id": "thd_1",
+                "step_number": 2,
+                "batch_digest": BATCH_DIGEST,
+                "status": "pending",
+                "expired": False,
+                "expires_at": "2030-01-01T00:00:00+00:00",
+                "tool_calls": [
+                    {
+                        "id": "c2",
+                        "name": "prepare_refund_batch",
+                        "arguments": '{"invoice_ids": ["inv_3002"]}',
+                    }
+                ],
+                "decision": None,
+            }
+        ]
         self.pending_tool_calls: Any = [
             {
                 "id": "c2",
@@ -194,6 +254,18 @@ class FakeHaas:
                     "roles": self.roles,
                     "credential_type": "api_key",
                     "environment": self.environment,
+                    **(
+                        {
+                            "capabilities": {
+                                "version": "1",
+                                "actions": ["run:submit", "run:read"],
+                                "event_schemas": ["run-events.v1"],
+                                "features": self.features,
+                            }
+                        }
+                        if self.features is not None
+                        else {}
+                    ),
                 },
             )
         if self.auth_rejected and path.startswith("/v1/"):
@@ -204,7 +276,9 @@ class FakeHaas:
             body = json.loads(request.content) if request.content else None
             self.admin_requests.append((request.method, path, body))
             if path == "/v1/admin/memberships" and request.method == "GET":
-                result = {"items": [{"principal_id": "principal-1", "role": "submitter"}]}
+                result = {
+                    "items": [{"principal_id": "principal-1", "role": "submitter"}]
+                }
             elif path == "/v1/admin/api-keys" and request.method == "POST":
                 result = {
                     "key_id": "key-1",
@@ -276,7 +350,22 @@ class FakeHaas:
             return httpx.Response(202, json={"run_id": run_id, "status": "cancelled"})
         if path.endswith("/stream"):
             self.stream_headers.append(dict(request.headers))
-            cursor = request.headers.get("last-event-id", "0-0")
+            self.stream_params.append(dict(request.url.params))
+            cursor = request.headers.get("last-event-id", "0")
+            if self.script == "live":
+                live_deltas = request.url.params.get("output_deltas") == "true"
+                body = sse(SIMPLE[:2]) + (
+                    delta(1, 1, 1, "Hel")
+                    + delta(1, 1, 1, "lo wor")
+                    + delta(1, 1, 2, "Hello there")
+                    if live_deltas
+                    else ""
+                )
+                return httpx.Response(
+                    200,
+                    content=body + sse(SIMPLE[2:]),
+                    headers={"content-type": "text/event-stream"},
+                )
             base = (
                 []
                 if self.script == "no_events"
@@ -284,11 +373,119 @@ class FakeHaas:
                 if self.script == "simple"
                 else PRE_PAUSE + (self.after_pause or [])
             )
-            events = [
-                e for e in base if int(e[0].split("-")[0]) > int(cursor.split("-")[0])
-            ]
+            events = [e for e in base if int(e[0]) > int(cursor)]
             return httpx.Response(
                 200, content=sse(events), headers={"content-type": "text/event-stream"}
+            )
+        if path == "/v1/approvals":
+            self.approval_queries.append(dict(request.url.params))
+            status = request.url.params.get("status", "pending")
+            items = [b for b in self.approval_batches if status in ("all", b["status"])]
+            return httpx.Response(200, json={"items": items})
+        if path.startswith("/v1/approvals/"):
+            batch_id = path.split("/")[3]
+            batch = next(
+                (b for b in self.approval_batches if b["batch_id"] == batch_id), None
+            )
+            if batch is None:
+                return httpx.Response(404, json={"detail": "Approval batch not found."})
+            if path.endswith("/decision"):
+                body = json.loads(request.content)
+                self.decisions.append((batch_id, body))
+                if body["batch_digest"] != batch["batch_digest"]:
+                    return httpx.Response(
+                        409, json={"detail": "Batch digest mismatch."}
+                    )
+                batch["status"] = (
+                    "approved" if body["decision"] == "approve" else "rejected"
+                )
+                batch["decision"] = {
+                    "decision": batch["status"],
+                    "decided_by": "principal-1234",
+                    "reason": body.get("reason"),
+                    "decided_at": "2030-01-01T00:00:00+00:00",
+                }
+                return httpx.Response(
+                    202, json={"run_id": batch["run_id"], "status": "queued"}
+                )
+            return httpx.Response(200, json=batch)
+        if path.endswith("/events") and path.startswith("/v1/runs/"):
+            after = int(request.url.params.get("after", "0"))
+            items = [
+                {
+                    "sequence": int(i),
+                    "type": e,
+                    "occurred_at": "2030-01-01T00:00:00+00:00",
+                    "data": d,
+                }
+                for i, e, d in PRE_PAUSE
+                if int(i) > after
+            ][:2]
+            return httpx.Response(
+                200,
+                json={
+                    "items": items,
+                    "next_after": items[-1]["sequence"] if items else after,
+                    "latest_sequence": len(PRE_PAUSE),
+                },
+            )
+        if path.endswith("/steps") and path.startswith("/v1/runs/"):
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "run_1",
+                    "steps": [
+                        {
+                            "step_number": 1,
+                            "attempt": 1,
+                            "status": "tools_dispatched",
+                            "model": "m/primary",
+                            "cost_usd": 0.001,
+                            "cost_reported": True,
+                        },
+                        {
+                            "step_number": 2,
+                            "attempt": 1,
+                            "status": "failed",
+                            "model": "m/primary",
+                            "cost_usd": 0,
+                            "cost_reported": False,
+                            "error": "boom",
+                        },
+                    ],
+                    "invocations": [
+                        {
+                            "step_number": 1,
+                            "ordinal": 0,
+                            "tool_name": "query_revenue_metrics",
+                            "status": "succeeded",
+                            "effect_key": "f" * 64,
+                        },
+                        {
+                            "step_number": 1,
+                            "ordinal": 1,
+                            "tool_name": "send_email",
+                            "status": "unknown",
+                            "effect_key": "e" * 64,
+                        },
+                    ],
+                },
+            )
+        if path.endswith("/usage") and path.startswith("/v1/runs/"):
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "run_1",
+                    "budget": BUDGET,
+                    "entries": [
+                        {
+                            "unit": "model_tokens",
+                            "quantity": 120,
+                            "cost_usd": 0.001,
+                            "settlement_status": "settled",
+                        }
+                    ],
+                },
             )
         if path.startswith("/v1/runs/"):
             if path.endswith("/stream"):
@@ -308,6 +505,17 @@ class FakeHaas:
                     "result": "Run cancelled."
                     if self.run_status == "cancelled"
                     else "done",
+                    "state_version": 7,
+                    "event_sequence": 5,
+                    "traceparent": TRACEPARENT,
+                    "budget": BUDGET,
+                    "approval": {
+                        "batch_id": BATCH_ID,
+                        "batch_digest": BATCH_DIGEST,
+                        "expires_at": "2030-01-01T00:00:00+00:00",
+                    }
+                    if self.run_status == "input_required"
+                    else None,
                 },
             )
         return httpx.Response(404, json={"detail": "nope"})

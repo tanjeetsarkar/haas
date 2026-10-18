@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haas.dev/schemas/run-output-delta.v1.schema.json",
+  "title": "HaaS live output delta (run-output-delta.v1)",
+  "description": "Advisory, live-only assistant text fragments sent as SSE `event: output_delta` (no `id`) on /v1/runs/{run_id}/stream?output_deltas=true when the `output-deltas.v1` capability is advertised. Deltas are never replayed and never authoritative: reset on a new (step, attempt, call) and replace with run_completed.output.",
+  "type": "object",
+  "required": [
+    "schema",
+    "step",
+    "attempt",
+    "call",
+    "index",
+    "text",
+    "final",
+    "truncated"
+  ],
+  "properties": {
+    "schema": {
+      "const": "run-output-delta.v1"
+    },
+    "step": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "call": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "index": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic fragment index within (step, attempt, call)."
+    },
+    "text": {
+      "type": "string"
+    },
+    "final": {
+      "type": "boolean",
+      "description": "Last fragment of this model call."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "Per-step preview cap reached; further text arrives only in run_completed.output."
+    }
+  },
+  "additionalProperties": true
+}

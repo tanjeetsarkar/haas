@@ -10,15 +10,20 @@ services:
     environment:
       HAAS_PROFILE: prod
       POSTGRES_DSN: ${HAAS_WORKER_POSTGRES_DSN:-}
+      HAAS_ENVELOPE_SIGNING_KEY: ${HAAS_ENVELOPE_SIGNING_KEY:-}
   worker-tools:
     environment:
       HAAS_PROFILE: prod
+      HAAS_ENVELOPE_VERIFY_KEY: ${HAAS_ENVELOPE_VERIFY_KEY:-}
   migrate:
     environment:
       HAAS_PROFILE: prod
       POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:-}
       MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:-}
       HAAS_OIDC_ISSUER: ${HAAS_OIDC_ISSUER:-}
+  # Reconciler + transactional-outbox relay (execution-service DB role). It publishes
+  # already-signed envelopes and scoped secrets to Celery, so it needs the broker and
+  # the secret vault but never the signing key or model credentials.
   maintenance:
     image: haas-distributed:3.0.0
     command: python -m app.maintenance_service
@@ -26,7 +31,11 @@ services:
       HAAS_PROFILE: prod
       POSTGRES_DSN: ${HAAS_WORKER_POSTGRES_DSN:-}
       REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
       HAAS_SECRET_ENCRYPTION_KEY: ${HAAS_SECRET_ENCRYPTION_KEY:-}
     depends_on:
+      redis:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully

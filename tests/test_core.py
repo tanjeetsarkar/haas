@@ -258,10 +258,12 @@ async def test_mcp_request_shape_and_json_response():
         )
 
     reg, ctx = _mcp_registry(handler)
+    ctx.effect_key = "e" * 64
     tool = reg.tools["lookup"]
     out = await tool.handler(ctx, tool.args_schema.model_validate({"customer": "acme"}))
     assert out == "hello"
     h, b = seen["headers"], seen["body"]
+    assert h["idempotency-key"] == h["x-haas-effect-key"] == "e" * 64
     assert b["id"] != ctx.run_id and len(b["id"]) == 32
     assert (
         h["mcp-protocol-version"] == "2026-07-28"
@@ -274,8 +276,10 @@ async def test_mcp_request_shape_and_json_response():
         b["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
     )
     assert b["params"]["arguments"] == {"customer": "acme"}
+    ctx.effect_key = ""
     await tool.handler(ctx, tool.args_schema.model_validate({"customer": "other"}))
     assert len(request_ids) == 2 and request_ids[0] != request_ids[1]
+    assert "idempotency-key" not in seen["headers"]
 
 
 async def test_mcp_sse_response_and_errors():

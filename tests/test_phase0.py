@@ -19,7 +19,6 @@ from app.core.observability import JsonRedactingFormatter
 from app.core.secret_vault import decrypt_secrets, encrypt_secrets
 from app.main import CreateRunRequest, _decode_cursor, _encode_cursor, app
 import app.main as main_module
-from app.core.store import DistributedStore
 
 
 def test_secret_envelope_is_authenticated_and_run_scoped(monkeypatch):
@@ -218,47 +217,34 @@ def test_scratchpad_gc_removes_only_expired_regular_text_files(tmp_path):
     assert fresh.exists() and unrelated.exists()
 
 
-def test_orphan_reaper_updates_only_rows_returned_by_atomic_update():
-    from contextlib import asynccontextmanager
+def test_maintenance_cycle_reconciles_then_relays_outbox(tmp_path, monkeypatch):
+    from app.core import maintenance
 
-    class Connection:
-        query = ""
-        params: tuple = ()
+    calls: list[str] = []
 
-        @asynccontextmanager
-        async def transaction(self):
-            yield
+    class Store:
+        async def reconcile(self):
+            calls.append("reconcile")
+            return {"leases_recovered": 1}
 
-        async def execute(self, *_args):
-            return "SELECT 1"
+        async def relay_outbox(self, *, limit: int):
+            calls.append(f"relay:{limit}")
+            return 2
 
-        async def fetch(self, query, *params):
-            self.query = query
-            self.params = params
-            return [{"run_id": "run_stale", "thread_id": "thread_stale"}]
-
-    class Pool:
-        def __init__(self):
-            self.connection = Connection()
-
-        def acquire(self):
-            return self
-
-        async def __aenter__(self):
-            return self.connection
-
-        async def __aexit__(self, *args):
-            return None
-
-    async def reap():
-        store = DistributedStore()
-        store.pg_pool = Pool()
-        return await store.reap_orphaned_runs(123.0), store.pg_pool
-
-    reaped, pool = asyncio.run(reap())
-    assert reaped == [{"run_id": "run_stale", "thread_id": "thread_stale"}]
-    assert "WHERE status = 'running' AND updated_at < $1" in pool.connection.query
-    assert pool.connection.params[0] == 123.0
+    stale = tmp_path / "old.txt"
+    stale.write_text("x")
+    os.utime(stale, (0, 0))
+    monkeypatch.setattr(maintenance.settings, "scratchpad_dir", tmp_path)
+    counts = asyncio.run(maintenance.maintenance_cycle(Store(), collect_garbage=True))
+    assert calls == ["reconcile", "relay:500"]
+    assert counts == {
+        "leases_recovered": 1,
+        "outbox_relayed": 2,
+        "removed_scratchpad_files": 1,
+    }
+    calls.clear()
+    counts = asyncio.run(maintenance.maintenance_cycle(Store(), collect_garbage=False))
+    assert "removed_scratchpad_files" not in counts
 
 
 def test_json_logs_redact_credentials():

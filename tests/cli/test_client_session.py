@@ -7,7 +7,9 @@ from haas_cli.client import HaasAPIError, HaasClient, SSEParser
 from haas_cli.config import ChatSettings, secrets_from_env
 from haas_cli.session import ChatSession, Decision, handle_command
 
-from fake_haas import FakeHaas
+from fake_haas import BATCH_DIGEST, BATCH_ID, FakeHaas
+
+BOUND = {"batch_id": BATCH_ID, "batch_digest": BATCH_DIGEST}
 
 
 def feed_all(text: str):
@@ -116,13 +118,13 @@ async def test_stream_reconnects_from_last_event_id():
 
                 class Boom(httpx.SyncByteStream, httpx.AsyncByteStream):
                     async def __aiter__(self):
-                        yield b'id: 1-0\nevent: step_started\ndata: {"step": 1}\n\n'
+                        yield b'id: 1\nevent: step_started\ndata: {"step": 1}\n\n'
                         raise httpx.ReadError("dropped")
 
                 return httpx.Response(200, stream=Boom())
             return httpx.Response(
                 200,
-                content='id: 2-0\nevent: run_completed\ndata: {"output": "ok"}\n\n',
+                content='id: 2\nevent: run_completed\ndata: {"output": "ok"}\n\n',
             )
         raise AssertionError(req.url)
 
@@ -131,7 +133,7 @@ async def test_stream_reconnects_from_last_event_id():
     )
     got = [e.event async for e in c.stream_events("run_1")]
     assert got == ["step_started", "run_completed"]
-    assert calls == ["0-0", "1-0"]
+    assert calls == ["0", "1"]
 
 
 async def test_stream_gives_up_after_max_reconnects():
@@ -182,9 +184,9 @@ async def test_turn_with_approval_resumes_from_pause_cursor():
     result = await session.run_turn("go", lambda e: seen.append(e.event), on_approval)
     assert result.status == "completed" and "Refund prepared" in result.output
     assert asked == [["prepare_refund_batch"]]
-    assert fake.resumes == [{"approved": True, "secrets": {"K": "v"}}]
+    assert fake.resumes == [{"approved": True, "secrets": {"K": "v"}, **BOUND}]
     assert fake.created[0]["secrets"] == {"K": "v"}
-    assert fake.stream_headers[-1]["last-event-id"] == "5-0"  # resumed after the pause
+    assert fake.stream_headers[-1]["last-event-id"] == "5"  # resumed after the pause
     assert seen.count("input_required") == 1 and seen[-1] == "run_completed"
     assert session.settings.thread_id == "thd_1"
     assert session.total_cost_usd == pytest.approx(0.0123)

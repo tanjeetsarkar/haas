@@ -5,11 +5,16 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import socket
+import time
+from decimal import Decimal
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 import redis.asyncio as aioredis
-from celery import Task, chord, group
+from celery import Task
 from pydantic import ValidationError
 
 from app.core.config import settings
@@ -19,11 +24,24 @@ from app.core.context import (
     ToolRemediationError,
     validate_safe_outbound_url,
 )
-from app.core.llm import OpenRouterGateway, repair_tool_json
+from app.core.envelope import (
+    EnvelopeError,
+    arguments_digest,
+    sign_envelope,
+    verify_envelope,
+)
+from app.core.llm import CompletionResult, OpenRouterGateway, repair_tool_json
+from app.core.output_stream import DeltaPublisher
 from app.core.plugins import registry
 from app.core.store import DistributedStore
+from app.core.workflow import (
+    UNKNOWN_OUTCOME,
+    Lease,
+    LeaseLostError,
+    Publisher,
+    effect_key,
+)
 from app.worker.celery_app import celery_app
-from app.worker.dispatch import signature_for
 
 log = logging.getLogger("haas.tasks")
 
@@ -31,19 +49,12 @@ gateway = OpenRouterGateway(settings.openrouter_api_key, settings.openrouter_bas
 
 # Workers open one short-lived pool per task, so keep it small.
 TASK_POOL_MAX = 3
+EFFECT_TTL_SEC = 7 * 86_400
 
 
 def _run_async(coro: Any) -> Any:
     """Executes an async coroutine cleanly inside a Celery worker process."""
     return asyncio.run(coro)
-
-
-async def _is_cancelled(run_id: str) -> bool:
-    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        return bool(await redis.exists(f"haas:cancelled:{run_id}"))
-    finally:
-        await redis.aclose()
 
 
 def _bound_observation(tool_name: str, call_id: str, raw_text: str) -> str:
@@ -76,345 +87,616 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, httpx.HTTPError)
 
 
-async def _fail_run(run_id: str, message: str) -> None:
-    """Terminal failure path so a crashed step never leaves a run stuck in `running`."""
-    store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX, service=True)
-    try:
-        run = await store.get_run(run_id)
-        if not run or run["status"] in ("completed", "failed", "cancelled"):
-            return
-        committed = await store.finalize_run(
-            run_id, run["thread_id"], "failed", message, run["messages"]
-        )
-        if not committed:
-            return
-        await store.publish_event(run_id, "run_error", {"error": message})
-        if run["webhook_url"]:
-            cast(Task, deliver_webhook_task).apply_async(
-                args=[
-                    run["webhook_url"],
-                    {"run_id": run_id, "status": "failed", "error": message},
-                ],
+# ---------------------------------------------------------------- outbox publishing
+
+
+def make_outbox_publisher(store: DistributedStore) -> Publisher:
+    """Turns committed outbox rows into broker messages; every message is safe to duplicate."""
+
+    async def publish(message: dict[str, Any]) -> None:
+        message_id = str(message["message_id"])
+        payload = message["payload"]
+        destination = message["destination"]
+        if destination == "orchestrator":
+            cast(Task, orchestrate_task).apply_async(
+                kwargs={
+                    "message_id": message_id,
+                    "run_id": payload["run_id"],
+                    "action": payload["action"],
+                    "expected_state_version": int(payload["expected_state_version"]),
+                },
                 queue="q_orchestrator",
+                task_id=message_id,
             )
-    finally:
-        await store.close()
+        elif destination == "tool":
+            # Secrets stay in the encrypted Redis vault until the moment of dispatch.
+            scoped = await store.get_scoped_secrets(
+                str(message["run_id"]), set(payload.get("secret_keys") or [])
+            )
+            cast(Task, execute_tool_task).apply_async(
+                kwargs={"envelope": payload["envelope"], "scoped_secrets": scoped},
+                queue=payload["queue"],
+                task_id=message_id,
+            )
+        elif destination == "webhook":
+            cast(Task, deliver_webhook_task).apply_async(
+                args=[payload["url"], payload["body"]],
+                queue="q_orchestrator",
+                task_id=message_id,
+            )
+        else:
+            raise ValueError(f"Unknown outbox destination {destination!r}.")
+
+    return publish
 
 
-@celery_app.task(
-    name="haas.llm_step_task", bind=True, queue="q_orchestrator", max_retries=2
-)
-def llm_step_task(self, run_id: str) -> dict[str, Any]:
-    try:
-        return _run_async(_async_llm_step(self, run_id))
-    except Exception as exc:
-        if _is_retryable(exc) and self.request.retries < self.max_retries:
-            raise self.retry(exc=exc, countdown=2 ** (self.request.retries + 1))
-        log.exception("llm_step_task failed for %s", run_id)
-        _run_async(
-            _fail_run(run_id, f"Orchestrator step failed: {type(exc).__name__}: {exc}")
-        )
-        return {"status": "failed", "reason": str(exc)}
-
-
-async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
+async def _open_store() -> DistributedStore:
     store = DistributedStore()
     await store.init(pool_max=TASK_POOL_MAX, service=True)
-    try:
-        run = await store.get_run(run_id)
-        if not run or run["status"] != "running":
-            return {"status": "aborted", "reason": "Run not in running state"}
+    store.outbox_publisher = make_outbox_publisher(store)
+    return store
 
-        step = int(run["step_count"]) + 1
-        max_steps = int(run["max_steps"])
-        if step > max_steps:
-            msg = f"Exceeded max_steps budget ({max_steps})."
-            committed = await store.finalize_run(
-                run_id, run["thread_id"], "failed", msg, run["messages"]
+
+# ---------------------------------------------------------------- orchestration
+
+
+def estimate_step_cost(
+    model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> Decimal:
+    """Pre-dispatch reservation; conservative when the model has a configured price."""
+    price = settings.model_pricing().get(model)
+    if not price:
+        return Decimal(str(settings.default_step_reservation_usd))
+    prompt_tokens = (len(json.dumps(messages)) + len(json.dumps(tools))) / 3
+    usd = (
+        prompt_tokens * price.get("input_per_mtok", 0)
+        + settings.reservation_output_tokens * price.get("output_per_mtok", 0)
+    ) / 1_000_000
+    return Decimal(str(round(usd, 8))) or Decimal(
+        str(settings.default_step_reservation_usd)
+    )
+
+
+def _delta_publisher(
+    redis: Any, run: dict[str, Any], *, step: int, attempt: int, call: int
+) -> DeltaPublisher | None:
+    if not settings.output_delta_enabled or redis is None:
+        return None
+    return DeltaPublisher(
+        redis,
+        run["run_id"],
+        step=step,
+        attempt=attempt,
+        call=call,
+        flush_chars=settings.output_delta_flush_chars,
+        flush_ms=settings.output_delta_flush_ms,
+        max_chars=settings.output_delta_max_chars_per_step,
+        buffer=settings.output_delta_buffer,
+    )
+
+
+async def _call_model(
+    run: dict[str, Any],
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    redis: Any = None,
+    step: int = 0,
+    step_attempt: int = 0,
+) -> CompletionResult:
+    attempts = max(1, settings.model_call_attempts)
+    async with httpx.AsyncClient() as http_client:
+        for attempt in range(1, attempts + 1):
+            # Each provider call restarts the preview; clients reset on a new `call`.
+            publisher = _delta_publisher(
+                redis, run, step=step, attempt=step_attempt, call=attempt
             )
-            if not committed:
-                return {
-                    "status": "aborted",
-                    "reason": "Thread claim is no longer current",
-                }
-            await store.publish_event(run_id, "run_error", {"error": msg})
-            await _maybe_webhook(
-                run, {"run_id": run_id, "status": "failed", "error": msg}
-            )
-            return {"status": "failed", "reason": msg}
-
-        active_skills = set(run["active_skills"])
-        messages: list[dict[str, Any]] = run["messages"]
-        fingerprints: list[str] = run["fingerprints"]
-
-        chosen_model = gateway.select_model_for_step(
-            step=step,
-            last_step_had_error=bool(run["last_step_had_error"]),
-            primary_model=run["primary_model"],
-            planner_model=run["planner_model"],
-        )
-        skill_allowlist: list[str] | None = run.get("skill_allowlist")
-        tools_payload = registry.resolve_sorted_tool_schemas(
-            active_skills, skill_allowlist
-        )
-
-        # API and workers load plugins independently (rolling restarts, stale mounts); flag it.
-        drift = bool(
-            run.get("registry_fingerprint")
-            and run["registry_fingerprint"] != registry.fingerprint
-        )
-        if drift:
-            log.warning(
-                "registry drift on %s: run created with %s, this worker has %s",
-                run_id,
-                run["registry_fingerprint"],
-                registry.fingerprint,
-            )
-
-        await store.publish_event(
-            run_id,
-            "step_started",
-            {
-                "step": step,
-                "model": chosen_model,
-                "active_skills": sorted(active_skills),
-                "unlocked_tools_count": len(tools_payload),
-                **({"registry_drift": True} if drift else {}),
-            },
-        )
-
-        async with httpx.AsyncClient() as http_client:
             try:
-                completion = await gateway.chat_completion(
+                result = await gateway.chat_completion(
                     http_client,
-                    model=chosen_model,
+                    model=model,
                     messages=messages,
-                    tools=tools_payload,
+                    tools=tools,
                     traceparent=run["traceparent"],
+                    on_delta=publisher.push if publisher else None,
                 )
+                if publisher is not None:
+                    await publisher.flush(final=True)
+                return result
             except httpx.HTTPStatusError as exc:
                 # Some reasoning models reject tool schemas; degrade to the primary model.
                 if (
                     exc.response.status_code in (400, 404)
-                    and chosen_model != run["primary_model"]
+                    and model != run["primary_model"]
                 ):
                     log.warning(
                         "Model %s rejected request (%s); falling back",
-                        chosen_model,
+                        model,
                         exc.response.status_code,
                     )
-                    chosen_model = run["primary_model"]
-                    completion = await gateway.chat_completion(
-                        http_client,
-                        model=chosen_model,
-                        messages=messages,
-                        tools=tools_payload,
-                        traceparent=run["traceparent"],
-                    )
-                else:
+                    model = run["primary_model"]
+                    continue
+                if not _is_retryable(exc) or attempt == attempts:
                     raise
+            except httpx.HTTPError:
+                if attempt == attempts:
+                    raise
+            await asyncio.sleep(min(2**attempt, 10) / 2)
+    raise RuntimeError("Model call attempts exhausted.")
 
-        current_run = await store.get_run(run_id)
-        if not current_run or current_run["status"] != "running":
-            return {"status": "aborted", "reason": "Run is no longer active"}
 
-        assistant_msg = completion.assistant_message
-        messages.append(assistant_msg)
-        new_total_cost = float(run["total_cost_usd"]) + completion.cost_usd
+def _tool_call_arguments(tc: dict[str, Any]) -> str:
+    raw = tc["function"].get("arguments")
+    if raw is None:
+        return ""
+    return raw if isinstance(raw, str) else json.dumps(raw, sort_keys=True)
 
-        # Branch A: model finished without tool calls
-        tool_calls = assistant_msg.get("tool_calls") or []
-        if not tool_calls:
-            final_text = assistant_msg.get("content") or ""
-            committed = await store.finalize_run(
-                run_id,
-                run["thread_id"],
-                "completed",
-                final_text,
-                messages,
-                cost_delta_usd=completion.cost_usd,
-            )
-            if not committed:
-                return {
-                    "status": "aborted",
-                    "reason": "Thread claim is no longer current",
-                }
-            await store.publish_event(
-                run_id,
-                "run_completed",
-                {
-                    "output": final_text,
-                    "steps_used": step,
-                    "total_cost_usd": round(new_total_cost, 6),
-                    "cached_tokens": completion.cached_tokens,
-                },
-            )
-            await _maybe_webhook(
-                run, {"run_id": run_id, "status": "completed", "output": final_text}
-            )
-            return {"status": "completed", "run_id": run_id}
 
-        # USD budget check before executing tools
-        if new_total_cost > float(run["max_cost_usd"]):
-            err = f"Exceeded max_cost_usd budget (${new_total_cost:.4f} > ${float(run['max_cost_usd']):.4f})."
-            committed = await store.finalize_run(
-                run_id,
-                run["thread_id"],
-                "failed",
-                err,
-                messages,
-                cost_delta_usd=completion.cost_usd,
-            )
-            if not committed:
-                return {
-                    "status": "aborted",
-                    "reason": "Thread claim is no longer current",
-                }
-            await store.publish_event(run_id, "run_error", {"error": err})
-            await _maybe_webhook(
-                run, {"run_id": run_id, "status": "failed", "error": err}
-            )
-            return {"status": "failed", "reason": err}
+def build_invocation(
+    lease: Lease,
+    run: dict[str, Any],
+    *,
+    step: int,
+    ordinal: int,
+    tool_call_id: str,
+    tool_name: str,
+    arguments: str,
+    invocation_id: str | None = None,
+) -> dict[str, Any]:
+    """Builds the signed, idempotent tool envelope for one tool call."""
+    active_skills = set(run["active_skills"])
+    allowlist = run.get("skill_allowlist")
+    tool = registry.tools.get(tool_name)
+    queue = tool.queue if tool else "q_tools_fast"
+    plugin = registry.plugins.get(tool.plugin_id) if tool and tool.plugin_id else None
+    secret_keys = sorted(registry.resolve_allowed_secrets(active_skills, allowlist))
+    key = effect_key(lease.tenant_id, lease.run_id, step, ordinal, tool_call_id)
+    invocation_id = invocation_id or str(uuid4())
+    digest = arguments_digest(tool_name, arguments)
+    now = time.time()
+    body = {
+        "invocation_id": invocation_id,
+        "effect_key": key,
+        "tenant_id": lease.tenant_id,
+        "run_id": lease.run_id,
+        "thread_id": lease.thread_id,
+        "step": step,
+        "ordinal": ordinal,
+        "tool_call": {"id": tool_call_id, "name": tool_name, "arguments": arguments},
+        "arguments_digest": digest,
+        "queue": queue,
+        "active_skills": sorted(active_skills),
+        "skill_allowlist": sorted(allowlist) if allowlist is not None else None,
+        "allowed_secrets": secret_keys,
+        "plugin_digest": plugin.digest if plugin is not None else "",
+        "traceparent": run["traceparent"],
+        "lease_epoch": lease.epoch,
+        "issued_at": now,
+        "expires_at": now + settings.tool_outcome_timeout_sec,
+    }
+    return {
+        "invocation_id": invocation_id,
+        "ordinal": ordinal,
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "queue": queue,
+        "arguments": arguments,
+        "arguments_digest": digest,
+        "effect_key": key,
+        "envelope": sign_envelope(body),
+        "secret_keys": secret_keys,
+        "requires_approval": bool(tool and tool.requires_approval),
+    }
 
-        # Branch B: Human-in-the-Loop gate — suspend the workflow (zero worker hold)
-        approval_needed = [
-            tc
-            for tc in tool_calls
-            if (t := registry.tools.get(tc["function"]["name"])) and t.requires_approval
-        ]
-        if approval_needed:
-            await store.save_checkpoint(
-                run_id,
-                step_count=step,
-                messages=messages,
-                active_skills=active_skills,
-                fingerprints=fingerprints,
-                cost_delta_usd=completion.cost_usd,
-                status="input_required",
-                pending_tool_calls=tool_calls,
-            )
-            await store.publish_event(
-                run_id,
-                "input_required",
-                {
-                    "step": step,
-                    "pending_tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "name": tc["function"]["name"],
-                            "arguments": tc["function"].get("arguments"),
-                        }
-                        for tc in tool_calls
-                    ],
-                    "resume_endpoint": f"/v1/runs/{run_id}/resume",
-                },
-            )
-            return {"status": "input_required", "run_id": run_id}
 
-        # Branch C: parallel tool fan-out via Celery Canvas `chord`
-        await store.save_checkpoint(
-            run_id,
-            step_count=step,
-            messages=messages,
-            active_skills=active_skills,
-            fingerprints=fingerprints,
-            cost_delta_usd=completion.cost_usd,
-            status="running",
+@celery_app.task(name="haas.orchestrate", bind=True, queue="q_orchestrator")
+def orchestrate_task(
+    self,
+    *,
+    message_id: str,
+    run_id: str,
+    action: str,
+    expected_state_version: int,
+) -> dict[str, Any]:
+    owner = f"{socket.gethostname()}:{os.getpid()}:{self.request.id or message_id}"
+    return _run_async(
+        _orchestrate(message_id, run_id, action, expected_state_version, owner)
+    )
+
+
+async def _orchestrate(
+    message_id: str,
+    run_id: str,
+    action: str,
+    expected_state_version: int,
+    owner: str,
+) -> dict[str, Any]:
+    store = await _open_store()
+    try:
+        acquired = await store.acquire_lease(
+            message_id=message_id,
+            run_id=run_id,
+            action=action,
+            expected_state_version=expected_state_version,
+            owner=owner,
         )
-
-        allowed_secret_keys = registry.resolve_allowed_secrets(
-            active_skills, skill_allowlist
-        )
-        scoped_secrets = await store.get_scoped_secrets(run_id, allowed_secret_keys)
-
-        tool_signatures = []
-        for tc in tool_calls:
-            fn_name = tc["function"]["name"]
-            reg_tool = registry.tools.get(fn_name)
-            target_queue = reg_tool.queue if reg_tool else "q_tools_fast"
-
-            await store.publish_event(
-                run_id,
-                "tool_dispatched",
-                {"tool_call_id": tc["id"], "tool": fn_name, "queue": target_queue},
+        if acquired is None:
+            return {"status": "skipped", "run_id": run_id}
+        lease, run = acquired
+        try:
+            if action == "aggregate":
+                run = await _aggregate(store, lease, run)
+            elif action == "decision":
+                decided = await _decision(store, lease, run)
+                if decided is None:
+                    return {"status": "dispatched", "run_id": run_id}
+                run = decided
+            return await _step(store, lease, run)
+        except LeaseLostError:
+            return {"status": "aborted", "reason": "lease lost", "run_id": run_id}
+        except Exception as exc:
+            log.exception("orchestration %s failed for %s", action, run_id)
+            await store.fail_with_lease(
+                lease, f"Orchestrator step failed: {type(exc).__name__}: {exc}"
             )
-            tool_signatures.append(
-                signature_for(
-                    cast(Task, execute_tool_task),
-                    run_id=run_id,
-                    thread_id=run["thread_id"],
-                    tenant_id=run["tenant_id"],
-                    traceparent=run["traceparent"],
-                    active_skills=sorted(active_skills),
-                    skill_allowlist=skill_allowlist,
-                    allowed_secrets=sorted(allowed_secret_keys),
-                    scoped_secrets=scoped_secrets,
-                    tool_call=tc,
-                ).set(queue=target_queue)
-            )
-
-        callback_sig = signature_for(
-            cast(Task, aggregate_step_task), run_id=run_id
-        ).set(queue="q_orchestrator")
-        chord(group(tool_signatures))(callback_sig)
-        return {"status": "dispatched_chord", "tool_count": len(tool_signatures)}
+            return {"status": "failed", "reason": str(exc)}
     finally:
         await store.close()
 
 
-async def _maybe_webhook(run: dict[str, Any], payload: dict[str, Any]) -> None:
-    if run.get("webhook_url"):
-        cast(Task, deliver_webhook_task).apply_async(
-            args=[run["webhook_url"], payload], queue="q_orchestrator"
+async def _step(
+    store: DistributedStore, lease: Lease, run: dict[str, Any]
+) -> dict[str, Any]:
+    run_id = lease.run_id
+    step = int(run["step_count"]) + 1
+    active_skills = set(run["active_skills"])
+    messages: list[dict[str, Any]] = run["messages"]
+    skill_allowlist: list[str] | None = run.get("skill_allowlist")
+    model = gateway.select_model_for_step(
+        step=step,
+        last_step_had_error=bool(run["last_step_had_error"]),
+        primary_model=run["primary_model"],
+        planner_model=run["planner_model"],
+    )
+    tools_payload = registry.resolve_sorted_tool_schemas(active_skills, skill_allowlist)
+    ticket = await store.begin_step(
+        lease,
+        step=step,
+        model=model,
+        estimate_usd=estimate_step_cost(model, messages, tools_payload),
+    )
+    if ticket is None:
+        return {"status": "failed", "reason": "budget", "run_id": run_id}
+
+    # API and workers load plugins independently (rolling restarts, stale mounts); flag it.
+    drift = bool(
+        run.get("registry_fingerprint")
+        and run["registry_fingerprint"] != registry.fingerprint
+    )
+    if drift:
+        log.warning(
+            "registry drift on %s: run created with %s, this worker has %s",
+            run_id,
+            run["registry_fingerprint"],
+            registry.fingerprint,
         )
+    await store.emit_step_started(
+        lease,
+        {
+            "step": step,
+            "attempt": ticket.attempt,
+            "model": model,
+            "active_skills": sorted(active_skills),
+            "unlocked_tools_count": len(tools_payload),
+            "reserved_usd": float(ticket.reserved_usd),
+            **({"registry_drift": True} if drift else {}),
+        },
+    )
+    try:
+        completion = await _call_model(
+            run,
+            model,
+            messages,
+            tools_payload,
+            redis=store.redis,
+            step=step,
+            step_attempt=ticket.attempt,
+        )
+    except Exception as exc:
+        log.exception("model call failed for %s", run_id)
+        await store.fail_step(
+            lease, ticket, f"Orchestrator step failed: {type(exc).__name__}: {exc}"
+        )
+        return {"status": "failed", "reason": str(exc)}
+
+    assistant_msg = completion.assistant_message
+    messages.append(assistant_msg)
+    tool_calls: list[dict[str, Any]] = assistant_msg.get("tool_calls") or []
+    outcome: dict[str, Any]
+    if not tool_calls:
+        outcome = {"kind": "complete", "text": assistant_msg.get("content") or ""}
+    else:
+        invocations = [
+            build_invocation(
+                lease,
+                run,
+                step=step,
+                ordinal=ordinal,
+                tool_call_id=tc["id"],
+                tool_name=tc["function"]["name"],
+                arguments=_tool_call_arguments(tc),
+            )
+            for ordinal, tc in enumerate(tool_calls)
+        ]
+        outcome = {
+            "kind": "approval"
+            if any(inv["requires_approval"] for inv in invocations)
+            else "dispatch",
+            "tool_calls": tool_calls,
+            "invocations": invocations,
+        }
+    kind = await store.commit_step(
+        lease,
+        ticket,
+        cost_usd=completion.cost_usd,
+        cost_reported=completion.cost_reported,
+        prompt_tokens=completion.prompt_tokens,
+        completion_tokens=completion.completion_tokens,
+        cached_tokens=completion.cached_tokens,
+        messages=messages,
+        outcome=outcome,
+    )
+    return {"status": kind, "run_id": run_id, "step": step}
+
+
+async def _aggregate(
+    store: DistributedStore, lease: Lease, run: dict[str, Any]
+) -> dict[str, Any]:
+    """Merges recorded tool outcomes in ordinal order and applies the circuit breaker."""
+    outcomes = await store.load_step_outcomes(lease, int(run["step_count"]))
+    messages: list[dict[str, Any]] = run["messages"]
+    active_skills: set[str] = set(run["active_skills"])
+    fingerprints: list[str] = list(run["fingerprints"])
+    events: list[tuple[str, dict[str, Any]]] = []
+    any_error = False
+    window = settings.max_identical_tool_calls + 1
+    for item in outcomes:
+        if item["status"] in {"denied", "cancelled"} and not item["outcome"]:
+            continue
+        result = item["outcome"]
+        name = item["tool_name"]
+        active_skills.update(result.get("activated_skills") or [])
+        fp = result.get("fingerprint") or _fingerprint(name, item["arguments"])
+        fingerprints.append(fp)
+        if len(fingerprints) >= window and all(x == fp for x in fingerprints[-window:]):
+            content = (
+                f"Circuit Breaker Triggered: Identical call to '{name}' "
+                f"repeated {window} times consecutively. Change parameters or strategy."
+            )
+            is_err = True
+        else:
+            content = str(result.get("content", UNKNOWN_OUTCOME))
+            is_err = bool(result.get("is_error", item["status"] != "succeeded"))
+        any_error = any_error or is_err
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": item["tool_call_id"],
+                "name": name,
+                "content": content,
+            }
+        )
+        events.append(
+            (
+                "tool_result",
+                {
+                    "tool_call_id": item["tool_call_id"],
+                    "tool": name,
+                    "status": item["status"],
+                    "invocation_id": item["invocation_id"],
+                    "is_error": is_err,
+                    "preview": content[:300],
+                },
+            )
+        )
+    await store.commit_aggregate(
+        lease,
+        messages=messages,
+        active_skills=sorted(active_skills),
+        fingerprints=fingerprints,
+        had_error=any_error,
+        events=events,
+    )
+    return {
+        **run,
+        "messages": messages,
+        "active_skills": sorted(active_skills),
+        "fingerprints": fingerprints[-20:],
+        "last_step_had_error": any_error,
+    }
+
+
+async def _decision(
+    store: DistributedStore, lease: Lease, run: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Applies a recorded approval decision; returns the run to continue, or None."""
+    batch = await store.load_decided_batch(lease)
+    if batch is None:
+        await store.fail_with_lease(lease, "Approval decision record is missing.")
+        return None
+    if batch["status"] == "approved":
+        invocations = [
+            build_invocation(
+                lease,
+                run,
+                step=int(batch["step"]),
+                ordinal=int(inv["ordinal"]),
+                tool_call_id=inv["tool_call_id"],
+                tool_name=inv["tool_name"],
+                arguments=inv["arguments"],
+                invocation_id=inv["invocation_id"],
+            )
+            for inv in batch["invocations"]
+        ]
+        await store.dispatch_approved(lease, invocations)
+        return None
+    reason = batch["reason"] or "Rejected by human operator."
+    messages: list[dict[str, Any]] = run["messages"]
+    for inv in batch["invocations"]:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": inv["tool_call_id"],
+                "name": inv["tool_name"],
+                "content": f"Action Denied by Human Operator: {reason}",
+            }
+        )
+    await store.commit_aggregate(
+        lease,
+        messages=messages,
+        active_skills=list(run["active_skills"]),
+        fingerprints=list(run["fingerprints"]),
+        had_error=True,
+        events=[],
+    )
+    return {**run, "messages": messages, "last_step_had_error": True}
+
+
+@celery_app.task(
+    name="haas.record_tool_outcome",
+    bind=True,
+    queue="q_orchestrator",
+    max_retries=5,
+)
+def record_tool_outcome_task(
+    self,
+    *,
+    run_id: str,
+    invocation_id: str,
+    status: str,
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return _run_async(_record_outcome(run_id, invocation_id, status, outcome))
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            log.exception("tool outcome for %s could not be recorded", invocation_id)
+            return {"status": "dropped"}
+        raise self.retry(exc=exc, countdown=2 ** (self.request.retries + 1))
+
+
+async def _record_outcome(
+    run_id: str, invocation_id: str, status: str, outcome: dict[str, Any]
+) -> dict[str, Any]:
+    store = await _open_store()
+    try:
+        recorded = await store.record_tool_outcome(
+            run_id=run_id, invocation_id=invocation_id, status=status, outcome=outcome
+        )
+        return {"status": "recorded" if recorded else "duplicate"}
+    finally:
+        await store.close()
+
+
+# ---------------------------------------------------------------- tool execution
 
 
 @celery_app.task(name="haas.execute_tool_task", bind=True)
 def execute_tool_task(
     self,
     *,
-    run_id: str,
-    thread_id: str,
-    tenant_id: str,
-    traceparent: str,
-    active_skills: list[str],
-    allowed_secrets: list[str],
-    scoped_secrets: dict[str, str],
-    tool_call: dict[str, Any],
-    skill_allowlist: list[str] | None = None,
+    envelope: dict[str, Any],
+    scoped_secrets: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Runs on `worker-tools` (`q_tools_fast` or `q_tools_sandbox`).
-    Has no OpenRouter credentials and no PostgreSQL access.
+    Has no OpenRouter credentials and no PostgreSQL access; trusts only the signed envelope.
     """
-    cancelled = _run_async(_is_cancelled(run_id))
-    if cancelled:
-        tc = tool_call
-        name = tc["function"]["name"]
-        return _outcome(
-            tc["id"],
-            name,
-            _fingerprint(name, tc["function"].get("arguments", "{}")),
-            set(active_skills),
-            "Run was cancelled before tool execution.",
-            True,
-        )
-    return _run_async(
-        _async_execute_tool(
-            run_id=run_id,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            traceparent=traceparent,
-            active_skills=set(active_skills),
-            allowed_secrets=set(allowed_secrets),
-            scoped_secrets=scoped_secrets,
-            tool_call=tool_call,
-            skill_allowlist=set(skill_allowlist)
-            if skill_allowlist is not None
-            else None,
-        )
+    try:
+        body = verify_envelope(envelope)
+    except EnvelopeError as exc:
+        log.warning("rejected tool envelope: %s", exc)
+        return {"status": "rejected", "reason": str(exc)}
+    status, outcome = _run_async(_execute_envelope(body, scoped_secrets or {}))
+    cast(Task, record_tool_outcome_task).apply_async(
+        kwargs={
+            "run_id": body["run_id"],
+            "invocation_id": body["invocation_id"],
+            "status": status,
+            "outcome": outcome,
+        },
+        queue="q_orchestrator",
     )
+    return {"status": status, "invocation_id": body["invocation_id"]}
+
+
+async def _execute_envelope(
+    body: dict[str, Any], scoped_secrets: dict[str, str]
+) -> tuple[str, dict[str, Any]]:
+    call = body["tool_call"]
+    name, call_id, raw_args = call["name"], call["id"], call["arguments"]
+    fp = _fingerprint(name, raw_args)
+    skills = set(body.get("active_skills") or [])
+    key = body["effect_key"]
+    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        if await redis.exists(f"haas:cancelled:{body['run_id']}"):
+            return "cancelled", _outcome(
+                call_id,
+                name,
+                fp,
+                skills,
+                "Run was cancelled before tool execution.",
+                True,
+            )
+        if not await redis.set(
+            f"haas:effect:{key}", body["invocation_id"], nx=True, ex=EFFECT_TTL_SEC
+        ):
+            cached = await redis.get(f"haas:effect-result:{key}")
+            if cached:
+                status, outcome = json.loads(cached)
+                return status, outcome
+            # A previous delivery started this effect and never recorded a result.
+            return "unknown", _outcome(call_id, name, fp, skills, UNKNOWN_OUTCOME, True)
+        tool = registry.tools.get(name)
+        plugin = (
+            registry.plugins.get(tool.plugin_id) if tool and tool.plugin_id else None
+        )
+        expected = body.get("plugin_digest") or ""
+        if expected and (plugin is None or plugin.digest != expected):
+            outcome = _outcome(
+                call_id,
+                name,
+                fp,
+                skills,
+                f"Tool Error: plugin revision for '{name}' changed since dispatch.",
+                True,
+            )
+        else:
+            allowlist = body.get("skill_allowlist")
+            outcome = await _async_execute_tool(
+                run_id=body["run_id"],
+                thread_id=body["thread_id"],
+                tenant_id=body["tenant_id"],
+                traceparent=body["traceparent"],
+                active_skills=skills,
+                allowed_secrets=set(body.get("allowed_secrets") or []),
+                scoped_secrets=scoped_secrets,
+                tool_call={
+                    "id": call_id,
+                    "function": {"name": name, "arguments": raw_args},
+                },
+                skill_allowlist=set(allowlist) if allowlist is not None else None,
+                effect_key=key,
+            )
+        status = "failed" if outcome["is_error"] else "succeeded"
+        await redis.setex(
+            f"haas:effect-result:{key}", EFFECT_TTL_SEC, json.dumps([status, outcome])
+        )
+        return status, outcome
+    finally:
+        await redis.aclose()
 
 
 def _outcome(
@@ -441,6 +723,7 @@ async def _async_execute_tool(
     scoped_secrets: dict[str, str],
     tool_call: dict[str, Any],
     skill_allowlist: set[str] | None = None,
+    effect_key: str = "",
 ) -> dict[str, Any]:
     tc_id = tool_call["id"]
     fn_name = tool_call["function"]["name"]
@@ -484,6 +767,7 @@ async def _async_execute_tool(
             allowed_secrets=allowed_secrets,
             _scoped_secrets=scoped_secrets,
             http_client=http_client,
+            effect_key=effect_key,
         )
         args = (ctx, validated_args) if tool.injects_context else (validated_args,)
         try:
@@ -525,93 +809,6 @@ async def _async_execute_tool(
                 f"Runtime Error in '{fn_name}' ({type(exc).__name__}): {exc}",
                 True,
             )
-
-
-@celery_app.task(name="haas.aggregate_step_task", queue="q_orchestrator")
-def aggregate_step_task(
-    tool_outcomes: list[dict[str, Any]], run_id: str
-) -> dict[str, Any]:
-    """
-    Celery chord callback: merges parallel tool outputs, enforces the identical-call
-    circuit breaker, checkpoints the updated state, and triggers the next `llm_step_task`.
-    """
-    try:
-        return _run_async(_async_aggregate_step(tool_outcomes, run_id))
-    except Exception as exc:
-        log.exception("aggregate_step_task failed for %s", run_id)
-        _run_async(
-            _fail_run(run_id, f"Aggregation failed: {type(exc).__name__}: {exc}")
-        )
-        return {"status": "failed", "reason": str(exc)}
-
-
-async def _async_aggregate_step(
-    tool_outcomes: list[dict[str, Any]], run_id: str
-) -> dict[str, Any]:
-    store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX, service=True)
-    try:
-        run = await store.get_run(run_id)
-        if not run or run["status"] != "running":
-            return {"status": "aborted"}
-
-        messages: list[dict[str, Any]] = run["messages"]
-        active_skills: set[str] = set(run["active_skills"])
-        fingerprints: list[str] = run["fingerprints"]
-        any_error = False
-
-        for outcome in tool_outcomes:
-            active_skills.update(outcome.get("activated_skills", []))
-            fp = outcome["fingerprint"]
-            fingerprints.append(fp)
-
-            window = settings.max_identical_tool_calls + 1
-            if len(fingerprints) >= window and all(
-                x == fp for x in fingerprints[-window:]
-            ):
-                content = (
-                    f"Circuit Breaker Triggered: Identical call to '{outcome['name']}' "
-                    f"repeated {window} times consecutively. Change parameters or strategy."
-                )
-                is_err = True
-            else:
-                content = outcome["content"]
-                is_err = bool(outcome["is_error"])
-
-            any_error = any_error or is_err
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": outcome["tool_call_id"],
-                    "name": outcome["name"],
-                    "content": content,
-                }
-            )
-            await store.publish_event(
-                run_id,
-                "tool_result",
-                {
-                    "tool_call_id": outcome["tool_call_id"],
-                    "tool": outcome["name"],
-                    "is_error": is_err,
-                    "preview": content[:300],
-                },
-            )
-
-        await store.save_checkpoint(
-            run_id,
-            step_count=int(run["step_count"]),
-            messages=messages,
-            active_skills=active_skills,
-            fingerprints=fingerprints,
-            last_step_had_error=any_error,
-            status="running",
-        )
-
-        cast(Task, llm_step_task).apply_async(args=[run_id], queue="q_orchestrator")
-        return {"status": "continued", "run_id": run_id}
-    finally:
-        await store.close()
 
 
 @celery_app.task(

@@ -15,15 +15,19 @@ to mutually untrusted customers.
 | `GET /readyz` | None | 200/503 with dependency checks | Checks PostgreSQL and Redis; not provider, queue or worker health |
 | `GET /healthz` | None | 200/503 with dependency checks | Backward-compatible alias for `/readyz` |
 | `GET /v1/runs?limit=20&cursor=…` | Tenant | 200 `items` + opaque `next_cursor` | Descending keyset pagination, tenant scoped |
-| `POST /v1/runs/{run_id}/cancel` | Tenant | 202 cancelled / 409 terminal | Cancellation is durable; in-flight external side effects may not be interruptible |
-| `POST /v1/runs` | Create body below | 202 run/thread/status/stream URL | Writes `running`, publishes queued event, schedules work |
+| `POST /v1/runs/{run_id}/cancel` | Tenant | 202 `cancelled` or `cancelling` / 409 terminal | Fenced; `cancelling` until outstanding tool outcomes are recorded; in-flight external side effects may not be interruptible |
+| `POST /v1/runs` | Create body below; optional `Idempotency-Key` | 202 run/thread/`queued`/stream/events URLs | Admission, run, first event and dispatch outbox row commit atomically; same key + same body replays (`Idempotent-Replayed: true`), different body → 409 |
 | `GET /v1/runs/{id}` | Tenant header | 200 run projection | Foreign/absent run → 404; no full conversation returned |
-| `GET /v1/runs/{id}/stream` | Tenant header; optional `Last-Event-ID` | 200 `text/event-stream` | Ownership before stream; no per-event reauthorization |
-| `POST /v1/runs/{id}/resume` | Resume body below | 202 action receipt | 404 ownership; 409 if not paused or claim lost |
+| `GET /v1/runs/{id}/stream` | Tenant header; optional integer `Last-Event-ID` | 200 `text/event-stream` | Durable replay; heartbeats; periodic bearer re-authentication (see §3) |
+| `GET /v1/runs/{id}/events` · `/steps` · `/usage` | Tenant header | 200 | Paged event log; step attempts + tool invocations; budget + usage ledger |
+| `POST /v1/runs/{id}/resume` | Resume body below; optional `Idempotency-Key` | 202 action receipt | 404 ownership; 409 if not paused, batch/digest stale or another decision won |
+| `GET /v1/approvals?status=pending\|approved\|rejected\|expired\|cancelled\|all` · `GET /v1/approvals/{batch_id}` | Tenant header | 200 | Tenant approval inbox with exact calls, digest, expiry and decision history |
+| `POST /v1/approvals/{batch_id}/decision` | `{"decision":"approve\|reject","batch_digest":…,"reason"?,"secrets"?}` | 202 | Digest-bound, immutable decision; requires `run:approve` and separation of duties |
 | `GET /v1/plugins` | Tenant header | 200 registry projection | Skills filtered by tenant; plugin/tool metadata is global |
 
-No tenant/member/agent administration, run listing, cancel, artifact, durable audit or
-webhook-delivery administration endpoints exist yet.
+Tenant/member/agent administration, threads and audit APIs are documented in the
+[developer platform design](developer-platform.md) and the OpenAPI snapshot. Artifact
+and webhook-delivery administration endpoints do not exist yet.
 
 ### Create body
 
@@ -36,7 +40,9 @@ webhook-delivery administration endpoints exist yet.
 | `primary_model` | String / null | Defaults from server settings; no tenant model allowlist today |
 | `planner_model` | String / null | Defaults from server settings |
 | `max_steps` | Integer / 15 by default | 1-50 |
-| `max_cost_usd` | Number / 0.30 by default | Greater than 0, at most 10; observed guard, not hard ceiling |
+| `max_cost_usd` | Number / 0.30 by default | Greater than 0, at most 10; a pre-dispatch reservation (`MODEL_PRICING_JSON`) refuses steps that would exceed it, and settled cost is enforced after each step |
+| `deadline_sec` | Integer / `DEFAULT_RUN_DEADLINE_SEC` | 10-86400; the reconciler fails runs past their deadline |
+| `max_tool_invocations` | Integer / server default | 1-1000; counted before dispatch |
 | `webhook_url` | String / null | Checked by URL guard at admission and DNS-checked on delivery |
 | `secrets` | String-to-string map / `{}` | Stored in Redis outside conversation; can expire before resume |
 
@@ -50,8 +56,9 @@ Example 202 response:
 {
   "run_id": "run_example",
   "thread_id": "thd_example",
-  "status": "running",
-  "stream_url": "/v1/runs/run_example/stream"
+  "status": "queued",
+  "stream_url": "/v1/runs/run_example/stream",
+  "events_url": "/v1/runs/run_example/events"
 }
 ```
 
@@ -66,7 +73,9 @@ and `result`. The persisted pending calls use provider tool-call structure
 {
   "approved": true,
   "rejection_reason": null,
-  "secrets": {}
+  "secrets": {},
+  "batch_id": "6f1c…",
+  "batch_digest": "<64 hex chars from input_required or GET /v1/runs/{id}.approval>"
 }
 ```
 
@@ -75,10 +84,13 @@ model; it does not cancel the run. A nonempty `secrets` dictionary **replaces** 
 stored dictionary, so send all still-needed values. Approval is for the entire
 pending batch, not an individual tool.
 
-Approved receipt: `{"run_id":"run_example","status":"running","action":"approved_and_dispatched"}`.
+Approved receipt: `{"run_id":"run_example","status":"queued","batch_id":"…","replayed":false,"action":"approved_and_dispatched"}`.
 Rejected receipt uses `action: "rejected_and_resumed"`.
-There is no approval ID, expected version, expiration or authenticated approver
-attribution in the current contract.
+`batch_id`/`batch_digest` bind the decision to the exact calls the approver reviewed; the
+production profile rejects unbound resumes. Decisions are immutable, attributed to the
+authenticated approver, expire after `APPROVAL_TTL_SEC`, and exactly one concurrent
+decision wins (others get 409). Approved calls are dispatched under signed, expiring
+execution envelopes with stable `effect_key`s for downstream idempotency.
 
 ## 2. Current usage recipes
 
@@ -153,21 +165,29 @@ For a run using an approval-required capability, inspect status and verify the
 arguments/destination before submitting a decision:
 
 ```bash
+APPROVAL=$(curl --fail-with-body -sS -H "X-Tenant-ID: $TENANT" \
+  "$BASE_URL/v1/runs/$RUN_ID" | jq -c '.approval')
+BATCH_ID=$(jq -r .batch_id <<<"$APPROVAL")
 curl --fail-with-body -sS -H "X-Tenant-ID: $TENANT" \
-  "$BASE_URL/v1/runs/$RUN_ID" | jq '.status, .pending_tool_calls'
+  "$BASE_URL/v1/approvals/$BATCH_ID" | jq '.tool_calls, .batch_digest, .expires_at'
 
-curl --fail-with-body -sS -X POST "$BASE_URL/v1/runs/$RUN_ID/resume" \
+jq -n --arg d "$(jq -r .batch_digest <<<"$APPROVAL")" \
+  '{decision: "approve", batch_digest: $d}' |
+curl --fail-with-body -sS -X POST "$BASE_URL/v1/approvals/$BATCH_ID/decision" \
   -H "X-Tenant-ID: $TENANT" -H 'Content-Type: application/json' \
-  -d '{"approved":true}'
+  -H "Idempotency-Key: approve-$BATCH_ID" --data-binary @-
 
-# Alternative decision, only while a run is paused:
-# {"approved":false,"rejection_reason":"Destination or amount not authorized."}
+# Alternative decision, only while the batch is pending:
+# {"decision":"reject","batch_digest":"…","reason":"Destination or amount not authorized."}
 ```
 
-A second concurrent resume should receive 409 after one claimant wins. That only
-protects the status claim; it is not a guarantee that dispatch/effects survive every
-crash exactly once. After resume reconnect SSE. Long pauses can require re-supplying
-the complete secret dictionary.
+Exactly one concurrent decision wins; others receive 409, as does a digest that no
+longer matches the pending batch. The decision, its outbox dispatch rows and the
+`hitl_approved` event commit atomically, and each approved call carries a stable
+`effect_key`. If a tool worker is lost after dispatch, the reconciler records an
+explicit `unknown` outcome rather than silently re-executing a non-idempotent effect.
+After deciding, reconnect SSE from the last processed id. Long pauses can require
+re-supplying the complete secret dictionary in the decision.
 
 ### 2.5 TUI
 
@@ -182,11 +202,13 @@ currently expose the REST `skills` or `webhook_url` fields.
 
 ## 3. SSE observation pattern (CURRENT)
 
-SSE is a replayable **run-event** stream, not a token-by-token model completion stream.
-Each frame carries Redis's stream entry ID:
+SSE is a replayable **run-event** stream (`run-events.v1`), not a token-by-token model
+completion stream. Every frame is read from the durable PostgreSQL `run_events` log, and
+its `id` is the run's monotonically increasing integer `sequence`. Redis only carries
+advisory wakeups, so a lost wakeup, API replica restart or reconnect never loses events.
 
 ```text
-id: 1770000000000-0
+id: 2
 event: step_started
 data: {"step":1,"model":"example/planner","active_skills":["weather"],"unlocked_tools_count":3}
 
@@ -198,34 +220,39 @@ The model and tool count above are illustrative, not asserted defaults.
 |---|---|
 | `run_queued` | `run_id`, `thread_id` |
 | `step_started` | Step, model, active skills, unlocked count; optional `registry_drift` |
-| `tool_dispatched` | Tool call ID, tool name, target queue; emitted on ordinary ungated dispatch |
+| `tool_dispatched` | Tool call ID, tool name, target queue (also emitted for approved calls) |
 | `tool_result` | Tool call ID/name, error flag, first 300 observation characters |
-| `input_required` | Step, flattened pending calls and resume endpoint |
-| `hitl_approved` | Number of dispatched tools; separate per-tool dispatch events are not emitted by resume |
-| `hitl_rejected` | Rejection reason |
-| `run_completed` | Output, reported steps used, observed USD total, cached tokens |
-| `run_error` | Error summary |
+| `input_required` | Step, `batch_id`, `batch_digest`, `expires_at`, pending calls, resume and decision endpoints |
+| `hitl_approved` / `hitl_rejected` | Recorded decision for the batch (rejection includes the reason) |
+| `approval_expired` | The batch expired undecided (`APPROVAL_TTL_SEC`); the run fails |
+| `run_cancelling` | Cancel accepted while tools are outstanding (`outstanding_tools`) |
+| `run_recovering` | Reconciler action (`action`, `attempt`, `reason`) after a lost or stalled step |
+| `run_completed` | Output, steps used, observed USD total, cached tokens |
+| `run_error` / `run_cancelled` | Terminal failure (including budget/deadline denials) or cancellation |
 
-Reconnect with the last processed ID, preserving application-side deduplication:
+Reconnect with the last processed ID; events are delivered at most once per cursor:
 
 ```bash
 # Replace this illustrative cursor with the last successfully processed SSE id.
-LAST_EVENT_ID=1770000000000-0
+LAST_EVENT_ID=7
 curl --fail-with-body -N -H "X-Tenant-ID: $TENANT" \
   -H "Last-Event-ID: $LAST_EVENT_ID" "$BASE_URL/v1/runs/$RUN_ID/stream"
 ```
 
-Constraints:
+Semantics:
 
-* Invalid cursor syntax becomes `0-0`; old/pruned cursors do not get an explicit gap error.
-* Streams are approximately capped and expire 24 hours after the last event.
-  An expired stream cannot reconstruct lost events from PostgreSQL today.
-* Terminal completion/error closes the stream. A pause event closes it if the run is
-  still paused; stale pause events can be streamed past if already resumed.
-* Idle terminal detection performs a final nonblocking read, but does not synthesize
-  a missing terminal event. Use GET status if the stream ends without one.
-* There is no application heartbeat frame; configure proxy idle timeouts appropriately.
-* The CLI reconnects on transport failure, but returns to its caller on a pause.
+* A missing or non-integer `Last-Event-ID` replays from the start (`0`). The full log is
+  retained with the run, so replay after any delay reproduces the same sequence.
+* A cursor ahead of the latest sequence receives a synthetic `stream_gap` frame
+  (`requested`, `latest`, no `id`) and continues from `latest`.
+* Terminal events close the stream. `input_required` closes it only while that pause is
+  still the run's latest state; replays of resumed runs stream past old pauses.
+* Idle streams receive `: keep-alive` comments every `SSE_HEARTBEAT_SEC` (default 15 s).
+* Bearer-authenticated streams are re-authenticated every `SSE_REAUTH_SEC`; a revoked or
+  expired credential receives `stream_closed` (`reason`) and the stream ends.
+* `GET /v1/runs/{id}/events?after=N&limit=M` pages the same log (`items`, `next_after`,
+  `latest_sequence`) for pull-based consumers; `/steps` and `/usage` expose step
+  attempts, tool invocations and the budget/usage ledger.
 * HTTP clients must send headers. Browser `EventSource` cannot generally attach
   arbitrary bearer/tenant headers; use an authenticated same-origin cookie session
   or a fetch-based SSE client in the target, not secrets embedded in URLs.
@@ -263,6 +290,10 @@ destination checks; the manifest guard is not a universal network sandbox.
 
 * Request body is the validated arguments dictionary, excluding absent/null fields.
 * Headers include JSON content type, JSON/SSE accept and `traceparent`.
+* Durable tool invocations also send `Idempotency-Key` and `X-HaaS-Effect-Key` set to
+  the invocation's stable `effect_key`. A redelivered task (for example after a tool worker
+  crash) repeats the same key; receivers that perform side effects should deduplicate on it.
+  Native handlers read the same value from `ctx.effect_key`.
 * If `secret_key` is configured, the same secret is used for bearer authorization and
   `X-HaaS-Signature-256: sha256=<hex>`.
 * The HMAC input is the UTF-8 encoding of Python
@@ -353,8 +384,9 @@ run admission fails closed when no valid active tenant policy exists.
 Development examples continue to use the local-only `X-Tenant-ID` compatibility path.
 The terminal [agent/history guide](../tui_usage.md#agent-revisions-and-thread-history)
 and generated [OpenAPI contract](../openapi-v1.json) describe the additive current API.
-Idempotency keys, durable events, secret-binding references and signed terminal callbacks
-in the target journey above remain later-phase work.
+Phase 3 adds `Idempotency-Key` admission/decisions, the durable run-event log, digest-bound
+approvals, fenced cancellation and budget reservations. Secret-binding references and
+signed terminal callbacks in the target journey above remain later-phase work.
 
 ### Execution envelope
 

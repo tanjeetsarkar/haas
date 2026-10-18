@@ -208,52 +208,70 @@ while emergency revocation also stops affected in-flight work through policy epo
 
 ## 5. Agent execution layer
 
-### 5.1 Current lifecycle
+### 5.1 Current lifecycle (Phase 3)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> running: create and enqueue first model step
-    running --> running: checkpoint / tools / aggregate / next step
-    running --> input_required: any tool in batch needs approval
-    input_required --> running: approved and dispatch whole batch
-    input_required --> running: rejected and append denial outcomes
-    running --> completed: model returns no tool calls
-    running --> failed: step budget / tool-branch cost guard / task failure
+    [*] --> queued: admission + run_queued event + dispatch outbox (one transaction)
+    queued --> running: step lease acquired (lease_epoch + 1, budget reservation)
+    running --> queued: tool outcomes all recorded → aggregate continuation
+    running --> input_required: exact approval batch persisted (digest, expiry)
+    input_required --> queued: immutable decision + continuation outbox
+    input_required --> failed: approval expires / deadline
+    queued --> cancelled: authorized cancel / tenant suspension
+    input_required --> cancelled: authorized cancel / tenant suspension
+    running --> cancelled: cancel with no outstanding tool invocation
+    running --> cancelling: cancel while tool invocations are dispatched
+    cancelling --> cancelled: outstanding outcomes recorded or marked unknown
+    running --> completed: result + usage + terminal event transaction
+    running --> failed: budget / deadline / unrecoverable error
     completed --> [*]
     failed --> [*]
+    cancelled --> [*]
 ```
 
-**CURRENT:** there is no persisted `queued` state: creation writes `running` and emits
-`run_queued`. `input_required` is a pause, not business completion; the current stream
-can close there. `cancelled` is recognized by readers/failure guards but has no
-implemented public transition. Client detachment does not cancel execution.
+PostgreSQL is the workflow authority. Every transition is a compare-and-set on
+`(run_id, state_version, lease_epoch)` that commits its `run_events` rows and `outbox`
+intents in the same transaction; a relay (`SELECT … FOR UPDATE SKIP LOCKED`) publishes
+those intents to Celery after commit, and consumers deduplicate deliveries through
+`consumer_inbox`. Celery and Redis therefore carry only redeliverable messages. Client
+detachment does not cancel execution; `input_required` is a pause, not completion.
 
-1. Create resolves the tenant skill list and a requested narrowing, validates preload
-   and callback URL, loads or creates an owned thread, and appends the user's prompt.
-2. Store caller secrets separately in Redis, insert run checkpoint, publish
-   `run_queued`, then enqueue the first `llm_step_task`.
-3. A model step loads the checkpoint, checks the next step count, resolves active tool
-   schemas, warns on registry drift and emits `step_started`.
-4. The planner model is selected on step 1 or after a tool error; otherwise the primary
-   model is selected. A planner 400/404 response falls back to primary.
-5. No tool calls means completion. Otherwise check observed USD cost, then either
-   pause the whole batch for approval or checkpoint and dispatch a Celery chord.
-6. Each tool worker verifies the tool is unlocked, repairs/parses JSON, validates
-   Pydantic arguments, constructs context and runs the handler under a timeout.
-7. Aggregation merges activated skills and tool messages, reports results, records
-   repeated-call fingerprints, checkpoints and enqueues the next model step.
-8. Completion updates run and thread history, clears the Redis secret value, publishes
-   the terminal event and schedules an optional callback. Failure does not advance
-   the thread's reusable history.
+1. Admission resolves the tenant skill list/narrowing, validates preload and callback,
+   claims thread ownership and (optionally) an `Idempotency-Key` with a request digest,
+   then writes the run as `queued` with its deadline and budgets atomically.
+2. Caller secrets are stored separately in encrypted Redis before admission commits.
+3. An orchestrator delivery acquires the step lease (new `lease_epoch`), records a
+   `run_steps` attempt and reserves the conservative model cost in `usage_ledger`
+   before calling the model. Stale leases cannot write: every write is fenced.
+4. Planner/primary selection is unchanged (planner on step 1 or after a tool error).
+5. No tool calls completes the run. Otherwise each call becomes a `tool_invocations`
+   row with an `arguments_digest` and stable `effect_key`. Approval-required batches
+   persist an `approval_batches` row and pause; others are dispatched under signed,
+   expiring Ed25519 execution envelopes that tool workers verify with a public key only.
+6. Tool workers record outcomes through the fenced invocation record, independent of
+   the Celery result backend. The last outcome queues the aggregate continuation.
+7. Completion updates run and thread history, settles usage, clears secrets, emits the
+   terminal event and schedules an optional callback in one transaction + outbox.
+8. A separate maintenance service relays the outbox and runs the reconciler: expired
+   leases are requeued with a `run_recovering` event and new epoch (bounded attempts),
+   dispatched invocations without outcomes become `unknown` after
+   `TOOL_OUTCOME_TIMEOUT_SEC`, approvals and deadlines expire, and stale inbox rows
+   are pruned. Unknown effects are never silently re-executed.
 
 ### 5.2 Current limits and semantics
 
-* Step cap: default 15; API range 1-50. Final completion reports the used step in its
-  event, but the stored `step_count` is the last checkpoint and can lag that final step.
-* Cost cap: default USD 0.30; API range greater than zero through USD 10. It checks
-  observed cost after a model response **only if tool calls exist**. A final-text
-  response can complete over budget. No reservation, hard spend ceiling or tool fee
-  accounting exists; absent provider cost is treated as zero.
+* Step cap: default 15; API range 1-50, checked before each step lease.
+* Cost cap: default USD 0.30; API range greater than zero through USD 10. Each model
+  step reserves a conservative cost from `MODEL_PRICING_JSON` before dispatch and is
+  refused if spent + reserved + estimate would exceed the cap; observed cost is settled
+  per attempt and enforced after every step, including final-text responses. Models
+  without configured pricing reserve zero, so the post-step check is the only guard.
+  Reservations of abandoned attempts become `uncertain` and count as spent, so a lost
+  model response can never silently free budget.
+* Deadline (`deadline_sec`, default `DEFAULT_RUN_DEADLINE_SEC`) and tool-invocation
+  count (`max_tool_invocations`) are enforced durably. Artifact-byte and egress quotas
+  arrive with the Phase 4 artifact service and egress proxy.
 * Tool timeout: default 25 seconds. Sync handlers use `asyncio.to_thread`; timeout
   is not proof the underlying thread/effect was stopped.
 * Tool output: default 4,000-character observation bound; larger raw output is spilled
@@ -262,13 +280,12 @@ implemented public transition. Client detachment does not cancel execution.
   changes the observation **after execution**. It neither prevents that effect
   nor guarantees eventual termination independently of the step cap.
 * Secret scope: union of allowed secrets for effective active skills, not a separate
-  credential set per individual tool. Skill activation affects subsequent batches;
-  sibling tools do not inherit an activation until aggregation.
-* Approval: any approval-required tool pauses **all** calls from that response.
-  A conditional status update permits one resume claimant, but not exactly-once
-  downstream dispatch. Resume-provided secrets replace the Redis dictionary, not merge it.
-* Models/tools are nondeterministic. Deterministic catalog ordering is not deterministic
-  agent behavior or reproducible side effects.
+  credential set per individual tool. Decision-provided secrets replace the dictionary.
+* Approval: any approval-required tool pauses **all** calls from that response as one
+  batch with a digest over the exact calls. Decisions are immutable, attributed,
+  separation-of-duties checked, expire, and exactly one concurrent decision wins.
+* Delivery is at least once; downstream exactly-once effects require destinations to
+  honour the `effect_key`. Models/tools remain nondeterministic.
 
 ### 5.3 Target lifecycle and concurrency
 
@@ -335,11 +352,12 @@ storage and target relationships.
 |---|---|---|
 | Invalid body / skill narrowing / unsafe callback | 422 | Typed validation error, no admission |
 | Foreign or absent run/thread | 404 | Same, after verified identity |
-| Resume not paused / already claimed | 409 | Same plus decision version/digest validation |
+| Resume not paused / already decided / stale digest | 409 | Same |
 | Invalid tool arguments / domain failure | Tool error observation; planner on next step | Structured sanitized failure with risk-aware retry policy |
 | Retryable model HTTP failure | Up to two task retries with backoff | Bounded retry + jitter + circuit breaker + usage reconciliation |
 | Callback exhausts retries | Logged permanent failure | Persisted delivery failure, DLQ, operator replay |
-| Broker fails after DB checkpoint | Request/task can fail with state already committed | Outbox eventual dispatch; reconciler detects stalled intents |
+| Broker fails after DB checkpoint | Outbox row stays pending; relay retries and the reconciler requeues stalled leases | Same, with alerting on relay lag |
+| Worker lost mid-step / mid-tool | Lease expiry → `run_recovering` + new epoch; undispatched outcomes → `unknown` | Same plus sandbox teardown (Phase 4) |
 | Registry drift | Warn and emit flag; continue | Execute pinned revision or block with explicit incompatibility |
 
 Avoid exposing provider responses, tokens, raw exception strings, prompts and tool

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haas.dev/schemas/run-terminal-webhook.v1.schema.json",
+  "title": "HaaS terminal-run webhook body (run-terminal-webhook.v1)",
+  "description": "POSTed once per terminal run (deduplicated by run) to the run's webhook_url. Delivery is at-least-once: deduplicate on run_id.",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "run-terminal-webhook.v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "output": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    },
+    "code": {
+      "enum": [
+        "budget.max_steps",
+        "budget.max_cost",
+        "budget.max_tool_invocations",
+        "budget.deadline",
+        "approval.expired",
+        "recovery.exhausted",
+        "execution.failed",
+        "run.failed"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "output"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "error",
+          "code"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true
+}

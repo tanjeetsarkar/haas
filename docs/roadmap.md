@@ -136,15 +136,15 @@ deploying these changes: follow the [operator runbook](design/operations-migrati
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p3-outbox-relay | Transactional outbox, SKIP LOCKED relay, consumer inbox | p2-schema-expand | TM-16 | ⬜ |
-| p3-leases-fencing | Lease epoch + state version CAS; signed execution envelope | p3-outbox-relay | SEC-07, TM-22 | ⬜ |
-| p3-steps-invocations | Step attempts, invocation `effect_key`, outcomes independent of result backend, `unknown` | p3-leases-fencing | SEC-07 | ⬜ |
-| p3-approvals-v2 | Batch digest, expiry, approver RBAC, idempotent immutable decisions, `waiting_approval` | p1-rbac, p3-steps-invocations | SEC-06 | ⬜ |
-| p3-cancellation | Fenced cancel, suspension revocation, cascade hooks | p3-leases-fencing | FR-13, SEC-12 | ⬜ |
-| p3-admission-idempotency | `Idempotency-Key` with request digest | p3-outbox-relay | FR-01 | ⬜ |
-| p3-budget-ledger | Pre-dispatch reservations, NUMERIC ledger, deadline/tool/artifact/egress quotas | p3-steps-invocations | TM-12 | ⬜ |
-| p3-durable-events | `run_event` sequence + schema version, PG replay, gap response, heartbeat, reauth | p3-outbox-relay | FR-08 | ⬜ |
-| p3-reconciler | Stalled-work reconciler; crash-boundary fault injection in CI | p3-durable-events, p3-steps-invocations | SEC-07 | ⬜ |
+| p3-outbox-relay | Transactional outbox (unique `dedup_key`, bounded attempts), SKIP LOCKED relay in the maintenance service, consumer inbox with retention | p2-schema-expand | TM-16 | ✅ |
+| p3-leases-fencing | Lease epoch + state version CAS; Ed25519-signed execution envelope (orchestrator signs, tool workers verify only) | p3-outbox-relay | SEC-07, TM-22 | ✅ |
+| p3-steps-invocations | Step attempts, invocation `effect_key` (forwarded as `Idempotency-Key`), outcomes recorded in PostgreSQL independent of the result backend, `unknown` after timeout | p3-leases-fencing | SEC-07 | ✅ |
+| p3-approvals-v2 | Batch digest, expiry (expired → run failed), approver RBAC, idempotent immutable decisions, tenant inbox; the paused state is `input_required`, not a new `waiting_approval` name | p1-rbac, p3-steps-invocations | SEC-06 | ✅ |
+| p3-cancellation | Fenced cancel with truthful `cancelling`, suspension cancels active runs, cascade hooks | p3-leases-fencing | FR-13, SEC-12 | ✅ |
+| p3-admission-idempotency | `Idempotency-Key` with request digest (replay returns the original response; digest mismatch 409) | p3-outbox-relay | FR-01 | ✅ |
+| p3-budget-ledger | Pre-dispatch reservations, NUMERIC ledger (reserved/settled/released/uncertain), deadline/step/tool quotas; artifact/egress byte quotas move to `p4-artifact-service`/`p4-egress-proxy` | p3-steps-invocations | TM-12 | ✅ |
+| p3-durable-events | `run_events` sequence + schema version (immutable), PG replay, `stream_gap`, heartbeat, periodic SSE reauth | p3-outbox-relay | FR-08 | ✅ |
+| p3-reconciler | Stalled-lease/queued/outcome/approval reconciler; crash-boundary fault injection in the CI PostgreSQL suite | p3-durable-events, p3-steps-invocations | SEC-07 | ✅ |
 
 ## Phase 4 — Execution isolation and credentials
 
@@ -155,9 +155,9 @@ deploying these changes: follow the [operator runbook](design/operations-migrati
 | p4-sandbox-protocol | Supervisor↔sandbox RPC; `haas-plugin-sdk` with versioned ABI | p4-static-catalog | Contract tests | ⬜ |
 | p4-sandbox-runtime | Runtime ADR-13; per-run sandbox limits, no tokens/metadata/host mounts, enforced kill | p4-plugin-artifacts, p4-sandbox-protocol | SEC-05, TM-18 | ⬜ |
 | p4-credential-broker | Secret bindings, per-invocation audience-bound grants, no raw secrets in transport | p2-rls, p3-steps-invocations | SEC-09, FR-10 | ⬜ |
-| p4-egress-proxy | Destination policy, DNS pinning, private/metadata deny, TLS, byte quotas | p1-tenant-policy | SEC-08 | ⬜ |
+| p4-egress-proxy | Destination policy, DNS pinning, private/metadata deny, TLS, egress byte quotas settled in the P3 ledger (`egress_bytes`) | p1-tenant-policy | SEC-08 | ⬜ |
 | p4-redaction | Redaction/field allowlists for model, events, logs, callbacks; canaries | p3-durable-events | SEC-09 | ⬜ |
-| p4-artifact-service | Tenant/run-scoped object storage replacing scratchpad | p2-rls | SEC-02, TM-17 | ⬜ |
+| p4-artifact-service | Tenant/run-scoped object storage replacing scratchpad; artifact byte quotas in the P3 ledger (`artifact_bytes`) | p2-rls | SEC-02, TM-17 | ⬜ |
 
 ## Phase 5 — Service operation
 
@@ -185,18 +185,18 @@ deploying these changes: follow the [operator runbook](design/operations-migrati
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| d-api-contract | OpenAPI 3.1, event JSON Schemas, AsyncAPI, Spectral + oasdiff, deprecation policy (ADR-16) | p0-ci | FR-23 | ⬜ |
-| d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | ⬜ |
+| d-api-contract | OpenAPI 3.1, event JSON Schemas, AsyncAPI, Spectral + oasdiff, deprecation policy (ADR-16) | p0-ci | FR-23 | ✅ `docs/contracts/*.schema.json` (run-events.v1, run-output-delta.v1, run-terminal-webhook.v1), `docs/asyncapi.yaml`, `.spectral.yaml`, oasdiff gate + allowlist, `app/core/deprecation.py`, ADR-0016, CI `api-contract` job; autouse producer-conformance fixture validates every event the PG suite emits |
+| d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | 🚧 problem+json, Idempotency-Key admission and request IDs exist; cursors/filters on list endpoints and rate-limit headers remain (rate limits depend on p4 quotas) |
 | d-capabilities | Version-1 identity-scoped feature/actions and supported legacy event-schema metadata; never substitutes for server authorization; full contract tooling remains d-api-contract | p1-rbac, t1-identity | TUI-02; advertised-version/event compatibility tests | ✅ |
-| d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
-| d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
-| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | 🚧 |
-| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | 🚧 |
-| d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ⬜ |
-| d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | ⬜ |
-| d-openai-compat | `/v1/chat/completions` + Responses facade over agent revisions | p2-agent-revisions, p3-durable-events | SEC-24 | ⬜ |
-| d-token-streaming | Optional `run.output.delta` events | p3-durable-events | Contract tests | ⬜ |
-| d-react-widgets | Optional chat/timeline/approval components | d-sdk-typescript | — | ⬜ |
+| d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ Deferred: blocked on d-api-ergonomics (cursors) and p5-signed-webhooks; `haas_cli/client.py` is the seed. Interim: the official `openai` SDK works against the facade (tested) |
+| d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ Deferred: blocked on d-api-ergonomics; contract inputs (OpenAPI, AsyncAPI, JSON Schemas) are now ready for generation |
+| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | 🚧 chat/profile/admin/dev/plugin exist; runs/agents/approvals subcommands and `webhooks listen` wait on d-sdk-python and p5-signed-webhooks |
+| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | 🚧 `haas dev up/down/status/seed`, mock provider and expiring test keys done; remaining: non-interactive `haas dev smoke`/`doctor` and a CI quickstart job (gate not yet met) |
+| d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ⬜ Unblocked by d-api-contract; `docs/api-changelog.md` and deprecation policy started. Portal build deferred to the next wave |
+| d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | ⬜ Deferred: blocked on both SDKs |
+| d-openai-compat | `/v1/chat/completions` + Responses facade over agent revisions | p2-agent-revisions, p3-durable-events | SEC-24 | ✅ `app/core/openai_compat.py` + facade routes (chat, streaming, Responses incl. background/poll/`previous_response_id`, `/v1/models`); same RBAC/policy/approval path (SEC-24 parity tests); official `openai` SDK round trip in `tests/test_openai_compat_pg.py` |
+| d-token-streaming | Optional `run.output.delta` events | p3-durable-events | Contract tests | ✅ `app/core/output_stream.py` (`DeltaPublisher`), SSE multiplexing, capability advertisement, `run-output-delta.v1` schema + `tests/test_output_deltas.py`, migration 0010 completion tokens |
+| d-react-widgets | Optional chat/timeline/approval components | d-sdk-typescript | — | ⬜ Deferred: blocked on d-sdk-typescript |
 
 ## Track T — Terminal experience
 
@@ -214,15 +214,15 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | t1-administration | P1/P2 | Role/action-gated membership/API-key/policy workflows, scoped plugin inventory and audit paging; capability metadata integrated | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | ✅ |
 | t2-agents | P2 | Command-driven draft/validate/publish, structured JSON form, configuration/policy/registry diff and pinned run launcher | t1-administration, p2-agent-revisions | FR-14, TUI-01, TUI-02 | ✅ |
 | t2-threads | P2 | Command-driven persistent history, thread-ID search/cursor paging, explicit committed-snapshot branch and active-run/version conflict recovery | t1-identity, t0-run-control, p2-thread-fencing | SEC-15, TUI-03 | ✅ |
-| t3-inspector | P3 | Searchable durable timeline, plans/attempts/tool evidence, replay/gap/reconnect states, correlation IDs, unknown-effect and recovery explanations | t2-threads, p3-steps-invocations, p3-durable-events | TUI-01, TUI-03 | ⬜ |
-| t3-approvals | P3 | Approval inbox, exact-batch argument/destination/permission review, digest/expiry, actor history and truthful cancellation states | t1-administration, t3-inspector, p3-approvals-v2, p3-cancellation | SEC-06, SEC-12, TUI-02, TUI-03 | ⬜ |
-| t3-budgets | P3 | Reserved/observed/settled cost, deadlines and quota indicators, budget denial/recovery; no misleading estimated balances | t3-inspector, p3-budget-ledger | TUI-01, TUI-03 | ⬜ |
-| t3-output | D, when enabled | Batched token deltas, user-controlled follow/pause, streaming Markdown/code and final-output reconciliation | t3-inspector, d-token-streaming | TUI-03, TUI-06 | ⬜ |
+| t3-inspector | P3 | Searchable durable timeline, plans/attempts/tool evidence, replay/gap/reconnect states, correlation IDs, unknown-effect and recovery explanations | t2-threads, p3-steps-invocations, p3-durable-events | TUI-01, TUI-03 | ✅ |
+| t3-approvals | P3 | Approval inbox, exact-batch argument/destination/permission review, digest/expiry, actor history and truthful cancellation states | t1-administration, t3-inspector, p3-approvals-v2, p3-cancellation | SEC-06, SEC-12, TUI-02, TUI-03 | ✅ |
+| t3-budgets | P3 | Reserved/observed/settled cost, deadlines and quota indicators, budget denial/recovery; no misleading estimated balances | t3-inspector, p3-budget-ledger | TUI-01, TUI-03 | ✅ |
+| t3-output | D, when enabled | Batched token deltas, user-controlled follow/pause, streaming Markdown/code and final-output reconciliation | t3-inspector, d-token-streaming | TUI-03, TUI-06 | ✅ `/live`, `ctrl+f` follow/pause, batched rendering and final-output reconciliation; `tests/cli/test_t3_live_output.py` |
 | t4-artifacts | P4 | Scoped evidence explorer, bounded previews/diffs, provenance/version metadata, explicit upload/download/export consent | t3-inspector, p4-artifact-service | TUI-02, TUI-05 | ⬜ |
 | t4-access | P4 | Secret-binding references without readback, capability/egress explanations, sandbox status and policy-denial diagnostics | t1-administration, p4-credential-broker, p4-egress-proxy, p4-sandbox-runtime | SEC-09, TUI-02, TUI-05 | ⬜ |
 | t5-operations | P5 | Usage/quotas, authorized service health/audit, signed webhook delivery and safe replay, retention workflows; confirmation and audit for operator actions | t3-budgets, t4-access, t4-artifacts, p5-telemetry, p5-signed-webhooks, p5-retention | TUI-01, TUI-02, TUI-03 | ⬜ |
 | t5-performance | P5 | Virtualized/paged views, bounded buffers/render batching, large-session and reconnect-storm benchmarks, real-terminal usability and assistive-workflow checks | t5-operations, t2-agents, t3-approvals | TUI-04, TUI-06, TUI-07 | ⬜ |
-| t-d-onboarding | D, from P1 | Five-minute mock-run wizard, dev-stack readiness/doctor, example requests, shared CLI navigation; no provider key required | t0-qualification, d-local-dev, d-cli | TUI-01, TUI-07 | ⬜ |
+| t-d-onboarding | D, from P1 | Five-minute mock-run wizard, dev-stack readiness/doctor, example requests, shared CLI navigation; no provider key required | t0-qualification, d-local-dev, d-cli | TUI-01, TUI-07 | ⬜ Blocked on d-local-dev smoke/doctor and d-cli |
 | t-d-integrations | D, with adapters | Connector configuration/validation, redacted HTTP/MCP diagnostics, schema/version drift, SDK examples and signed webhook listener | t-d-onboarding, m-format-adapters, p4-egress-proxy, p5-signed-webhooks | TUI-01, TUI-05, TUI-07 | ⬜ |
 | t-m-catalog | M, discovery | Public/private search, publisher/trust/provenance/advisory evidence, compatibility and declared permissions; browsing never executes code | t1-administration, m-registry-service, m-trust-tiers | FR-16, TUI-02, TUI-05 | ⬜ |
 | t-m-consent | M, installs | Digest-pinned install/update/disable/revoke, permission expansion diff and re-consent, affected-agent/run impact | t-m-catalog, m-install-grants | SEC-18, SEC-19, TUI-02 | ⬜ |
@@ -240,15 +240,15 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
 | m-design | [Marketplace design](design/marketplace.md) | p0-design-scope | Docs review | ✅ |
-| m-manifest-v2 | Manifest v2: semver, api_version, permissions, risk classes, sandbox profile, SBOM | m-design | FR-15 | ⬜ |
-| m-publisher-identity | Publisher accounts, domain verification, 2FA, namespaces + per-run aliases (ADR-11) | m-design, p1-authn | TM-24 | ⬜ |
+| m-manifest-v2 | Manifest v2: semver, api_version, permissions, risk classes, sandbox profile, SBOM | m-design | FR-15 | ⬜ Deferred to the marketplace wave (needs p4 sandbox profiles for meaningful enforcement) |
+| m-publisher-identity | Publisher accounts, domain verification, 2FA, namespaces + per-run aliases (ADR-11) | m-design, p1-authn | TM-24 | ⬜ Deferred with the global marketplace tables (publisher/listing/plugin_revision/advisory/installation), intentionally excluded from migration 0011 |
 | m-signing-provenance | Sigstore/cosign, SLSA, transparency log, verify at install and launch | p4-plugin-artifacts | SEC-16 | ⬜ |
 | m-registry-service | Publish/yank/search/versions/download-by-digest; private registries; mirrors | m-manifest-v2, m-publisher-identity, m-signing-provenance | FR-15 | ⬜ |
 | m-review-pipeline | Static + dependency + secret scans, permission diff, sandboxed behavior test, injection lint | m-registry-service, p4-sandbox-runtime | SEC-17 | ⬜ |
 | m-trust-tiers | platform/verified/community/private/unreviewed in tenant policy | m-review-pipeline, p1-tenant-policy | FR-16 | ⬜ |
 | m-install-grants | Digest-pinned installs, consent, re-consent on expansion, revocation epochs | m-trust-tiers, p2-agent-revisions, p4-credential-broker, p4-egress-proxy | SEC-18, SEC-19 | ⬜ |
 | m-format-adapters | Agent Skills, ClawHub importer, OpenAPI generator, remote MCP (rug-pull pinning), stdio MCP in sandbox | m-manifest-v2, p4-sandbox-protocol | FR-18, SEC-18 | ⬜ |
-| m-dev-tooling | `haas plugin test/pack/sign/publish`, CI template, local registry | m-manifest-v2, d-cli | FR-24 | ⬜ |
+| m-dev-tooling | `haas plugin test/pack/sign/publish`, CI template, local registry | m-manifest-v2, d-cli | FR-24 | ⬜ Deferred: blocked on m-manifest-v2 |
 | m-discovery-ui | Search/browse API + web UI, badges, permissions, security reports, install flow | m-registry-service | FR-16 | ⬜ |
 | m-ecosystem-ops | Abuse reports, takedowns, advisories, publisher analytics, monetization hooks | m-install-grants | FR-17 | ⬜ |
 
@@ -257,7 +257,7 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
 | a-design | [HACP design](design/multi-agent.md) | p0-design-scope | Docs review | ✅ |
-| a-schema | Run tree, delegations, mailboxes, workspaces, agent cards (ERD §4a) | a-design, p2-schema-expand | SEC-03 | ⬜ |
+| a-schema | Run tree, delegations, mailboxes, workspaces, agent cards (ERD §4a) | a-design, p2-schema-expand | SEC-03 | ✅ Migration `0011_multi_agent_schema` (derived/frozen lineage, delegations, `hacp/1` mailbox, CAS-versioned workspace, agent cards; forced RLS, refusing downgrade); `tests/test_multi_agent_schema.py` (7 PG tests); added to the prod RLS startup check |
 | a-primitives | `write_todos`, spawn/delegate, handoff, messages, workspace CAS/watch, join, cancel; outbox wake-ups | a-schema, p3-outbox-relay, p3-cancellation, p4-artifact-service | FR-19, FR-21 | ⬜ |
 | a-topologies | Supervisor, hierarchical, swarm, graph, map-reduce, debate; publish-time validation | a-primitives, p2-agent-revisions | FR-19 | ⬜ |
 | a-attenuation-budget | Delegation tokens (ADR-15), child ⊆ parent, ledger sub-reservations, spawn caps | a-primitives, p3-budget-ledger | SEC-20, SEC-21 | ⬜ |
@@ -273,50 +273,61 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 
 ## Current qualification status
 
-Phase 1 identity and tenant authority are implemented and their RBAC, policy and scoped
-inventory gates are qualified. Approval/rejection decisions and tenant administration
-mutations have verified-actor append-only audit records. A `break_glass` membership has no
-actions or grant endpoint; separately approved, time-limited access remains unavailable.
-Production API startup requires complete HTTPS OIDC configuration and a production
-encryption key; authenticated run admission still fails closed without an active policy.
-`haas dev` provides a distinct loopback-only Compose project with deterministic mocks and
-local test-key seeding. Phase 2 database isolation, revision lifecycle, legacy migration
-tooling and atomic thread-history fencing are implemented, together with command-driven
-T2 workflows and scoped capability metadata. Production additionally requires separate
-runtime database identities and completed operator cutover. This is not a GA claim.
+Phases 1–3 are implemented. Phase 1 identity/tenant authority and Phase 2 database
+isolation, revision lifecycle and thread fencing remain qualified as previously recorded;
+production still requires separate runtime database identities and completed operator
+cutover ([runbook](design/operations-migration.md#phase-2-operator-runbook)).
+
+Phase 3 makes PostgreSQL the authority for run progress. Admission, every state
+transition and its outbox rows commit in one fenced transaction (lease epoch + state
+version). The maintenance service relays the outbox and reconciles stalled work; Celery
+and Redis only carry deliveries that are safe to repeat. Tool intents carry Ed25519-signed
+envelopes that tool workers verify without holding the signing key. Tool outcomes are
+recorded in PostgreSQL by the orchestrator, and lost ones become `unknown`, never blind
+retries. Approvals are digest-bound, expiring and immutable. Cancellation is fenced and
+reports `cancelling` truthfully. Budgets reserve before dispatch in a NUMERIC ledger, and
+`run-events.v1` provides durable, gap-aware SSE replay. T3 ships the approval inbox, run
+inspector (correlation, unknown-effect guidance, event search) and budget views. Deploy
+with the [Phase 3 runbook](design/operations-migration.md#phase-3-operator-runbook).
+This is not a GA claim.
 
 Recorded local qualification on Python 3.12 / PostgreSQL 16:
 
-* **312 tests passed**, including nine real PostgreSQL integration tests; combined
-  application/client coverage **75.70%**, exceeding the existing 75% gate.
-* Real non-owner RLS reads/writes, default denial, pool commit/rollback reuse,
-  owner/service-login refusal, real API-key authentication/admin queries, legacy
-  alias continuation, immutable revision pins, concurrent admissions and stale completion.
-* Approved/conflicting/suspended-actor mapping, bounded backfill, quarantine privilege
-  denial, active/unresolved cutover refusal and production bootstrap.
-* Empty-schema upgrade → base → head, concurrent migration runners, staged expansion,
-  active legacy-run migration refusal and non-destructive legacy adoption.
-* All nine deterministic Compose E2E scenarios passed on an isolated project, including
-  in-flight cancellation/trace propagation; the existing development stack was untouched.
-* Ruff, Pyright (zero errors), reproducible OpenAPI snapshot, production Compose config
-  and patch whitespace checks passed.
+* **353 tests passed**, combined application/client coverage **79.7%** (gate 75%).
+* 17 real-PostgreSQL Phase 3 integration tests: outbox relay/dedup, crashed-worker lease
+  fencing and stale-epoch rejection, tool redelivery, approval digest/expiry and decision/event immutability,
+  cancellation (including tenant suspension), budget reservation and uncertain settlement of crashed model attempts,
+  admission idempotency, event immutability/replay and reconciler recovery.
+* All deterministic Compose E2E scenarios passed on an isolated project, extended with
+  integer SSE ids, digest-bound resume, inbox and stale-digest 409, durable replay = live
+  stream = `/events`, durable invocation outcomes, usage and budget.
+* The CI migration steps (empty upgrade → base → head and staged legacy adoption) pass
+  with migration 0009; production Compose config validates with the maintenance service
+  and envelope keys.
+* Ruff, Pyright (zero errors) and the reproducible OpenAPI snapshot pass.
 
-CI runs PostgreSQL qualification and coverage on both supported Python versions
-(3.11/3.12); only 3.12 was exercised in this local qualification. Remaining release work
-includes automated quickstart and full hosted CI qualification.
-`p0-ci` and `p0-baseline-tests` remain 🚧
-until the GitHub workflow is green on `main`.
+Known limits: crash-boundary fault injection runs in the PostgreSQL CI suite, not as
+Compose chaos tests. Artifact/egress byte quotas wait for their Phase 4 enforcement
+points. Approval review shows exact tool arguments but not destination/credential
+metadata, which arrives with `t4-access`. Envelope verification accepts one key, so
+rotation needs a short dispatch pause. Unknown effects need operator reconciliation; there
+is no destination receipt lookup yet. The plain line REPL has no `/approve` workflow.
+CI runs on Python 3.11/3.12; only 3.12 ran locally. `p0-ci` and `p0-baseline-tests`
+remain 🚧 until the GitHub workflow is green on `main`.
 
-## Next execution wave — Phase 3 durable workflow correctness
+## Next execution wave — Phase 4 execution isolation and credentials
 
-Start with the PostgreSQL transactional outbox/relay and consumer inbox, then execution
-leases/state-version fencing and durable step/invocation outcomes. Add admission
-idempotency, exact-batch approvals, fenced cancellation, budget reservations and durable
-events/reconciliation in dependency order, shipping the T3 inspector/approval/budget
-journeys alongside them. Thread-history fencing is not a substitute for execution leases.
-Worker-time revocation, mediated egress, sandbox isolation and durable replay remain
-unimplemented later-phase controls. The local-dev CI quickstart and hosted CI/baseline
-qualification remain parallel work, not silently completed Phase 2 items.
+Remove plugin imports from the control plane (`p4-static-catalog`), then build pinned
+plugin artifacts and the supervisor↔sandbox protocol ahead of the sandbox runtime
+(ADR-13 decision first). In parallel, deliver the credential broker on top of durable
+invocations (per-invocation grants replace Redis-staged secrets), the egress proxy with
+destination policy and byte quotas, redaction and the artifact service, then worker-time
+policy revalidation. T4 (`t4-artifacts`, `t4-access`) ships alongside. Phase 3 parallel tracks delivered:
+`d-api-contract`, `d-token-streaming`/`t3-output`, `d-openai-compat` and `a-schema`.
+Carried into this wave: finish `d-local-dev` (`haas dev smoke`/`doctor` + CI quickstart),
+then `t-d-onboarding`; `d-api-ergonomics` (list cursors/filters) to unblock both SDKs;
+the Track A orchestrator primitives (`spawn_agent`, mailbox, workspace) over the 0011
+schema; and hosted CI qualification of the new `api-contract` job.
 
 ## Open decisions
 

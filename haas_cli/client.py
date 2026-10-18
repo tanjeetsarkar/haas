@@ -10,7 +10,11 @@ from urllib.parse import quote
 import httpx
 
 TERMINAL_EVENTS = ("run_completed", "run_error", "run_cancelled")
-STREAM_ID_RE = re.compile(r"\d+-\d+")
+# SSE ids are the durable per-run event sequence (`run-events.v1`).
+STREAM_ID_RE = re.compile(r"\d{1,18}")
+ACTIVE_RUN_STATUSES = ("queued", "running", "cancelling")
+OUTPUT_DELTA_EVENT = "run.output.delta"
+OUTPUT_DELTA_FEATURE = "output-deltas.v1"
 
 
 class HaasAPIError(Exception):
@@ -330,20 +334,74 @@ class HaasClient:
         approved: bool,
         rejection_reason: str | None = None,
         secrets: dict[str, str] | None = None,
+        *,
+        batch_id: str | None = None,
+        batch_digest: str | None = None,
     ) -> dict[str, Any]:
+        """Resolve the pending approval; `batch_id`/`batch_digest` bind it to what was reviewed."""
         body: dict[str, Any] = {"approved": approved, "secrets": secrets or {}}
         if rejection_reason:
             body["rejection_reason"] = rejection_reason
+        if batch_id is not None:
+            body["batch_id"] = batch_id
+        if batch_digest is not None:
+            body["batch_digest"] = batch_digest
         return await self._request("POST", f"/v1/runs/{run_id}/resume", json=body)
 
+    async def list_approvals(
+        self, *, status: str = "pending", limit: int = 50
+    ) -> dict[str, Any]:
+        params: dict[str, int | str] = {"status": status, "limit": limit}
+        return await self._request("GET", "/v1/approvals", params=params)
+
+    async def get_approval(self, batch_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/approvals/{quote(batch_id, safe='')}")
+
+    async def decide_approval(
+        self,
+        batch_id: str,
+        *,
+        approve: bool,
+        batch_digest: str,
+        reason: str | None = None,
+        secrets: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "decision": "approve" if approve else "reject",
+            "batch_digest": batch_digest,
+            "secrets": secrets or {},
+        }
+        if reason:
+            body["reason"] = reason
+        return await self._request(
+            "POST", f"/v1/approvals/{quote(batch_id, safe='')}/decision", json=body
+        )
+
+    async def run_events(
+        self, run_id: str, *, after: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/v1/runs/{run_id}/events",
+            params={"after": after, "limit": limit},
+        )
+
+    async def run_steps(self, run_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/runs/{run_id}/steps")
+
+    async def run_usage(self, run_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/runs/{run_id}/usage")
+
     async def stream_events(
-        self, run_id: str, last_event_id: str = "0-0"
+        self, run_id: str, last_event_id: str = "0", *, output_deltas: bool = False
     ) -> AsyncIterator[SSEEvent]:
         """
         Yields events until the run completes/errors or pauses at `input_required`.
-        Reconnects from the last seen event id if the connection drops mid-run.
+        Reconnects from the last seen durable sequence if the connection drops mid-run.
+        With `output_deltas`, advisory `run.output.delta` frames (no SSE id) are
+        interleaved; they never advance the durable cursor.
         """
-        cursor = last_event_id if STREAM_ID_RE.fullmatch(last_event_id) else "0-0"
+        cursor = last_event_id if STREAM_ID_RE.fullmatch(last_event_id) else "0"
         failures = 0
         while True:
             parser = SSEParser()
@@ -352,6 +410,7 @@ class HaasClient:
                     "GET",
                     f"/v1/runs/{run_id}/stream",
                     headers={**self._headers, "Last-Event-ID": cursor},
+                    params={"output_deltas": "true"} if output_deltas else None,
                 ) as resp:
                     if resp.status_code >= 400:
                         await resp.aread()
@@ -361,6 +420,17 @@ class HaasClient:
                         if ev is None:
                             continue
                         failures = 0
+                        if ev.event == "stream_closed":
+                            reason = (
+                                ev.data.get("reason")
+                                if isinstance(ev.data, dict)
+                                else None
+                            )
+                            self.auth_expired = True
+                            raise HaasAPIError(
+                                f"Event stream closed by the server: {reason or 'reauthentication failed'}",
+                                401,
+                            )
                         if ev.id:
                             cursor = ev.id
                         yield ev
@@ -377,6 +447,6 @@ class HaasClient:
 
             # Server closed the stream cleanly without a final event.
             run = await self.get_run(run_id)
-            if run["status"] != "running":
+            if run["status"] not in ACTIVE_RUN_STATUSES:
                 return
             await asyncio.sleep(self.reconnect_delay)

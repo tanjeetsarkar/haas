@@ -1,0 +1,7 @@
+# Reviewed breaking changes accepted by the oasdiff gate (CI job `api-contract`).
+# Format (oasdiff --err-ignore): METHOD PATH <oasdiff message>, one per line.
+# Every entry needs a justification comment and a docs/api-changelog.md entry.
+# Remove entries once the change is in the base branch snapshot.
+
+# Phase 3 / threat model: bound human rejection reasons that are fed back to the model.
+POST /v1/runs/{run_id}/resume the `rejection_reason/anyOf[subschema #1]/` request property's maxLength was set to `2000`

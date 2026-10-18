@@ -90,8 +90,10 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 | `Esc` | **Detach** from the running task; inside an approval dialog it leaves the run pending |
 | `Ctrl+1` / `Ctrl+2` | Switch to Chat / Runs |
 | `Ctrl+3` | Open Admin/audit when the verified role permits it |
+| `Ctrl+4` | Open the approval inbox |
 | `F6` | Move keyboard focus to the next control |
 | `Ctrl+R` | Refresh the current run list |
+| `Ctrl+F` | Follow/pause the live output preview |
 | `Ctrl+T` | Cycle the dark/light/auto theme |
 | `F1` | Show contextual help |
 | `Ctrl+L` | Clear the screen (conversation continues) |
@@ -126,6 +128,10 @@ Type `/` to open the suggestion list under the prompt (command name + descriptio
 | `/status` | API URL + health, tenant, thread, models, limits, preload list, secret **names**, total cost |
 | `/admin` | Open the role-authorized Admin/audit workspace |
 | `/approve <run-id>` | Review a known pending approval as a verified approver |
+| `/approvals [STATUS]` | Approval inbox: pending (default), approved, rejected, expired, all |
+| `/inspect [run-id]` | Run inspector: state, budget, steps, tool invocations and usage |
+| `/events [run-id] [after] [type=TEXT]` | Page or search (by event type) the durable, replayable run event log |
+| `/live [on\|off]` | Advisory live token preview when the server advertises `run.output.delta`; the final output always replaces it |
 | `/skills` | Installed skills with description, tools and the secrets each may read |
 | `/tools` | Registered tools and queue; `⚠` marks tools that need your approval |
 | `/preload <skill> […]` | Skills activated before the first step of every run. `/preload clear` empties the list; `/preload` shows it |
@@ -192,15 +198,32 @@ It cannot reconstruct arbitrary historical snapshots.
 One active/paused run owns a thread at a time. On admission conflict, wait, explicitly
 cancel through Runs, or branch; never retry by silently overwriting history. A stale
 completion cannot commit over cancellation/newer history. Identity/tenant/new-conversation
-changes reset revision/version pins and cursors. SSE remains finite Redis replay, not the
-durable timeline planned for T3.
+changes reset revision/version pins and cursors. SSE replays the durable PostgreSQL event
+log (`run-events.v1`), so reconnects resume from the last integer sequence.
 
 The local seed produces a distinct approver identity because the API forbids approving
 one's own run. An authenticated submitter cannot approve its own run in the inline dialog;
 leave it pending and share the displayed run ID with an approver. Sign in as that approver,
-then run `/approve <run-id>` to inspect the pending actions and approve, reject, or leave
-them pending. This flow is scoped to a known run ID; a tenant-wide approval inbox/stream
-for a second identity is a later T3 roadmap capability.
+then open the approval inbox with `Ctrl+4` (or `/approvals`), or run `/approve <run-id>`,
+to inspect the pending actions and approve, reject, or leave them pending.
+
+### Approval inbox, run inspector and budgets
+
+* **Approvals (`Ctrl+4`)** lists tenant-scoped batches; cycle the filter between pending,
+  approved, rejected, expired and all. Each decision sends the reviewed `batch_digest`. If
+  the batch changed or expired, the server returns 409 and the detail pane shows that the
+  decision was not accepted; press Refresh to reload. `/approvals [STATUS]` prints the same
+  list in Chat.
+* **Inspector** (Inspect in Runs, the command palette, or `/inspect [run-id]`) shows status,
+  state version, event sequence, the W3C trace context for correlating logs and traces,
+  and the budget: settled, uncertain and reserved cost against the maximum, remaining
+  cost, steps, tool-invocation count and deadline. It also lists per-step attempts, tool
+  invocations with their durable outcome and the usage ledger. Uncertain reservations
+  count as spent. An `unknown` invocation explains that the effect may have happened and
+  is never re-executed by HaaS, and prints its effect key for reconciliation.
+* **`/events [run-id] [after] [type=TEXT]`** pages the immutable event log, the same data
+  SSE replays; `type=tool` searches up to 500 events per page by event type. Cancellation
+  may show `cancelling` while dispatched tools finish.
 
 The equivalent current command-line surfaces are `haas profile`, `haas admin`, and
 `haas dev`. For example:

@@ -159,8 +159,8 @@ async def test_current_identity_returns_only_verified_authority(monkeypatch):
     assert capabilities["version"] == "1"
     assert "tenant.admin" in capabilities["actions"]
     assert "audit.read" in capabilities["actions"]
-    assert capabilities["event_schemas"] == ["redis-stream.v1"]
-    assert capabilities["durable_replay"] is False
+    assert capabilities["event_schemas"] == ["run-events.v1"]
+    assert capabilities["durable_replay"] is True
     assert body == {
         "tenant_id": "acme",
         "principal_id": _ACTOR_ID,

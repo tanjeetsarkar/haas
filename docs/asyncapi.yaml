@@ -1,0 +1,137 @@
+asyncapi: 3.1.0
+info:
+  title: HaaS asynchronous API
+  version: 1.0.0
+  description: |
+    Server-to-client streams and callbacks of Harness-as-a-Service. Payload schemas
+    are the published JSON Schemas in `docs/contracts/` (JSON Schema 2020-12); the
+    HTTP surface is described by `docs/openapi-v1.json`.
+
+    Compatibility (v1): fields and event types are only added, never removed or
+    retyped. Consumers must ignore unknown fields and unknown event types. Breaking
+    changes ship as a new major version (`run-events.v2`) with the deprecation
+    window described in `docs/api-deprecation-policy.md`.
+  license:
+    name: Proprietary
+defaultContentType: application/json
+servers:
+  api:
+    host: api.haas.example
+    protocol: https
+    description: Public HaaS API (SSE over HTTP/1.1 or HTTP/2).
+    security:
+      - $ref: '#/components/securitySchemes/bearer'
+channels:
+  runStream:
+    address: /v1/runs/{run_id}/stream
+    title: Run event stream (SSE)
+    description: |
+      `text/event-stream`. Durable events carry `id: <sequence>` and `event: <type>`;
+      the `data` line is the event's `data` object. Resume with `Last-Event-ID` or
+      `?after=<sequence>`. Pass `?output_deltas=true` to multiplex live
+      `output_delta` frames (no `id`, never replayed) when the server advertises the
+      `output-deltas.v1` capability on `GET /v1/me`. Comment lines (`: keep-alive`)
+      are heartbeats. The stream ends after a terminal event or an approval pause.
+    servers:
+      - $ref: '#/servers/api'
+    parameters:
+      run_id:
+        description: Run identifier returned by POST /v1/runs.
+    messages:
+      runEvent:
+        $ref: '#/components/messages/runEvent'
+      outputDelta:
+        $ref: '#/components/messages/outputDelta'
+      streamGap:
+        $ref: '#/components/messages/streamGap'
+      streamClosed:
+        $ref: '#/components/messages/streamClosed'
+  runEvents:
+    address: /v1/runs/{run_id}/events
+    title: Run event log (paged JSON replay)
+    description: '`GET ?after=<sequence>&limit=<n>` returns `{items, next_after, latest_sequence}`.'
+    servers:
+      - $ref: '#/servers/api'
+    parameters:
+      run_id:
+        description: Run identifier.
+    messages:
+      runEvent:
+        $ref: '#/components/messages/runEvent'
+  terminalWebhook:
+    address: '{webhook_url}'
+    title: Terminal-run webhook
+    description: |
+      One POST per terminal run to the `webhook_url` supplied at submission.
+      At-least-once delivery with retries: deduplicate on `run_id`.
+    parameters:
+      webhook_url:
+        description: Customer endpoint registered on the run.
+    messages:
+      runTerminal:
+        $ref: '#/components/messages/runTerminal'
+operations:
+  receiveRunStream:
+    action: receive
+    channel:
+      $ref: '#/channels/runStream'
+    summary: Follow a run live, with replay from any sequence.
+  receiveRunEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/runEvents'
+    summary: Page through the durable event log.
+  receiveTerminalWebhook:
+    action: send
+    channel:
+      $ref: '#/channels/terminalWebhook'
+    summary: HaaS notifies the customer endpoint when a run settles.
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: OIDC access token or HaaS API key, plus the X-Tenant-ID header.
+  messages:
+    runEvent:
+      name: runEvent
+      title: Durable run event (run-events.v1)
+      summary: Envelope from the events API; on SSE only `data` is sent.
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        schema:
+          $ref: './contracts/run-events.v1.schema.json'
+    outputDelta:
+      name: output_delta
+      title: Live output fragment (run-output-delta.v1)
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        schema:
+          $ref: './contracts/run-output-delta.v1.schema.json'
+    streamGap:
+      name: stream_gap
+      title: Requested cursor is ahead of the log
+      payload:
+        type: object
+        required: [requested, latest]
+        properties:
+          requested:
+            type: integer
+          latest:
+            type: integer
+    streamClosed:
+      name: stream_closed
+      title: Stream ended because credentials were revoked or expired
+      payload:
+        type: object
+        required: [reason]
+        properties:
+          reason:
+            type: string
+    runTerminal:
+      name: run_terminal
+      title: Terminal run notification (run-terminal-webhook.v1)
+      payload:
+        schemaFormat: application/schema+json;version=draft-07
+        schema:
+          $ref: './contracts/run-terminal-webhook.v1.schema.json'
