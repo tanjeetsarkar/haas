@@ -10,8 +10,9 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, AsyncGenerator, Literal
 from uuid import UUID
 
@@ -275,7 +276,7 @@ class BranchThreadRequest(BaseModel):
 @app.get("/v1/threads", dependencies=[_require_action(Action.RUN_READ)])
 async def list_threads(
     x_tenant_id: str = Header(default="default-tenant"),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = None,
     search: str = Query(default="", max_length=128),
 ) -> dict[str, Any]:
@@ -348,8 +349,12 @@ async def branch_thread(
 @app.get("/v1/agents/revisions", dependencies=[_require_action(Action.RUN_READ)])
 async def list_agent_revisions(
     x_tenant_id: str = Header(default="default-tenant"),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = None,
+    agent_name: str | None = Query(default=None, max_length=128),
+    state: list[str] | None = Query(
+        default=None, description="Revision state filter; repeat or comma-separate."
+    ),
 ) -> dict[str, Any]:
     before = _decode_cursor(cursor) if cursor else None
     if before:
@@ -357,15 +362,28 @@ async def list_agent_revisions(
             UUID(before[1])
         except ValueError as exc:
             raise HTTPException(422, "Invalid revision cursor.") from exc
-    rows = await store.list_agent_revisions(x_tenant_id, limit=limit + 1, before=before)
-    items = rows[:limit]
-    return {
-        "items": items,
-        "next_cursor": (
-            _encode_cursor(items[-1]["created_at"], items[-1]["revision_id"])
-            if len(rows) > limit
+    states = _csv_filter(state)
+
+    async def fetch(size: int, key: ListKey | None) -> list[dict[str, Any]]:
+        return await store.list_agent_revisions(x_tenant_id, limit=size, before=key)
+
+    items, next_key = await _keyset_page(
+        fetch,
+        before=before,
+        limit=limit,
+        key=lambda row: (float(row["created_at"]), row["revision_id"]),
+        keep=(
+            (
+                lambda row: (agent_name is None or row["agent_name"] == agent_name)
+                and (states is None or row["state"] in states)
+            )
+            if agent_name is not None or states is not None
             else None
         ),
+    )
+    return {
+        "items": items,
+        "next_cursor": _encode_cursor(*next_key) if next_key else None,
     }
 
 
@@ -537,6 +555,61 @@ def _decode_cursor(cursor: str) -> tuple[float, str]:
         raise HTTPException(status_code=422, detail="Invalid run-list cursor.") from exc
 
 
+# Rows examined per filtered list request before returning a partial page with a cursor.
+_LIST_SCAN_BUDGET = 2_000
+ListKey = tuple[float, str]
+
+
+async def _keyset_page(
+    fetch: Callable[[int, ListKey | None], Awaitable[list[dict[str, Any]]]],
+    *,
+    before: ListKey | None,
+    limit: int,
+    key: Callable[[dict[str, Any]], ListKey],
+    keep: Callable[[dict[str, Any]], bool] | None = None,
+    stop: Callable[[dict[str, Any]], bool] | None = None,
+) -> tuple[list[dict[str, Any]], ListKey | None]:
+    """
+    Keyset page over newest-first rows with optional in-API filters. Without filters this
+    is a single `limit + 1` query; filtered scans stop after `_LIST_SCAN_BUDGET` rows and
+    return a cursor at the last examined row (a short page is not the end of the list).
+    """
+    batch = limit + 1 if keep is None and stop is None else max(limit + 1, 100)
+    items: list[dict[str, Any]] = []
+    scanned = 0
+    while True:
+        rows = await fetch(batch, before)
+        for row in rows:
+            scanned += 1
+            if stop is not None and stop(row):
+                return items, None
+            if keep is None or keep(row):
+                if len(items) == limit:
+                    return items, key(items[-1])
+                items.append(row)
+            before = key(row)
+        if len(rows) < batch:
+            return items, None
+        if scanned >= _LIST_SCAN_BUDGET:
+            return items, before
+
+
+def _epoch(value: Any) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        return datetime.fromisoformat(value).timestamp()
+    return float(value)
+
+
+def _csv_filter(values: list[str] | None) -> set[str] | None:
+    if not values:
+        return None
+    selected = {part.strip() for value in values for part in value.split(",")}
+    selected.discard("")
+    return selected or None
+
+
 def _encode_audit_cursor(created_at: Any, event_id: str) -> str:
     raw = json.dumps(
         {"created_at": created_at.timestamp(), "event_id": event_id},
@@ -571,18 +644,49 @@ def _require_actor(request: Request):
 @app.get("/v1/runs", dependencies=[_require_action(Action.RUN_READ)])
 async def list_runs(
     x_tenant_id: str = Header(default="default-tenant"),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = None,
+    status: list[str] | None = Query(
+        default=None, description="Run status filter; repeat or comma-separate."
+    ),
+    thread_id: str | None = Query(default=None, max_length=255),
+    created_after: datetime | None = Query(
+        default=None, description="Exclusive lower bound (ISO 8601 or epoch seconds)."
+    ),
+    created_before: datetime | None = Query(
+        default=None, description="Exclusive upper bound (ISO 8601 or epoch seconds)."
+    ),
 ) -> dict[str, Any]:
     before = _decode_cursor(cursor) if cursor else None
-    rows = await store.list_runs(x_tenant_id, limit=limit + 1, before=before)
-    has_more = len(rows) > limit
-    items = rows[:limit]
-    next_cursor = (
-        _encode_cursor(float(items[-1]["created_at"]), items[-1]["run_id"])
-        if has_more and items
-        else None
+    if created_before is not None:
+        bound = (created_before.timestamp(), "")
+        before = min(before, bound) if before else bound
+    statuses = _csv_filter(status)
+    after = created_after.timestamp() if created_after is not None else None
+
+    async def fetch(size: int, key: ListKey | None) -> list[dict[str, Any]]:
+        return await store.list_runs(x_tenant_id, limit=size, before=key)
+
+    items, next_key = await _keyset_page(
+        fetch,
+        before=before,
+        limit=limit,
+        key=lambda row: (float(row["created_at"]), row["run_id"]),
+        keep=(
+            (
+                lambda row: (statuses is None or row["status"] in statuses)
+                and (thread_id is None or row["thread_id"] == thread_id)
+            )
+            if statuses is not None or thread_id is not None
+            else None
+        ),
+        stop=(
+            (lambda row: float(row["created_at"]) <= after)
+            if after is not None
+            else None
+        ),
     )
+    next_cursor = _encode_cursor(*next_key) if next_key else None
     return {"items": items, "next_cursor": next_cursor}
 
 
@@ -1197,12 +1301,53 @@ async def list_approvals(
         "pending", "approved", "rejected", "expired", "cancelled", "all"
     ] = Query(default="pending"),
     limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = None,
+    run_id: str | None = Query(default=None, max_length=255),
 ) -> dict[str, Any]:
     """Approval inbox: batches with digest, expiry, tool calls and any recorded decision."""
-    return {
-        "items": await store.list_approval_batches(
-            x_tenant_id, status=None if status == "all" else status, limit=limit
+    before = _decode_cursor(cursor) if cursor else None
+    if before:
+        try:
+            UUID(before[1])
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid approval cursor.") from exc
+
+    def key(row: dict[str, Any]) -> ListKey:
+        return _epoch(row["created_at"]), str(row["batch_id"])
+
+    # The inbox query has no keyset parameter: read a newest-first window, trust only rows
+    # strictly newer than the window's oldest timestamp (ties may continue past it), and
+    # widen the window until the page is full, the table is exhausted or the cap is hit.
+    window_cap = 10_000
+    window = limit + 2 if before is None and run_id is None else max(4 * limit, 200)
+    while True:
+        rows = await store.list_approval_batches(
+            x_tenant_id, status=None if status == "all" else status, limit=window
         )
+        full = len(rows) >= window
+        ordered = sorted(rows, key=key, reverse=True)
+        if full and ordered:
+            floor = key(ordered[-1])[0]
+            ordered = [row for row in ordered if key(row)[0] > floor]
+        matches = [
+            row
+            for row in ordered
+            if (before is None or key(row) < before)
+            and (run_id is None or row["run_id"] == run_id)
+        ]
+        if len(matches) > limit or not full or window >= window_cap:
+            break
+        window = min(window * 4, window_cap)
+    items = matches[:limit]
+    if len(matches) > limit:
+        next_key: ListKey | None = key(items[-1])
+    elif full and ordered and (before is None or key(ordered[-1]) < before):
+        next_key = key(ordered[-1])
+    else:
+        next_key = None
+    return {
+        "items": items,
+        "next_cursor": _encode_cursor(*next_key) if next_key else None,
     }
 
 
@@ -1616,7 +1761,7 @@ async def activate_admin_policy(
 )
 async def list_audit_events(
     x_tenant_id: str = Header(default="default-tenant"),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = None,
 ) -> dict[str, Any]:
     before = _decode_audit_cursor(cursor) if cursor else None
@@ -2059,3 +2204,24 @@ async def openai_list_models(
             }
         )
     return {"object": "list", "data": data}
+
+
+# Feature routers (one module per roadmap area); imported last so they can use app.main.store.
+from app.api import (  # noqa: E402
+    access as _access_api,
+    agent_mesh as _agent_mesh_api,
+    artifacts as _artifacts_api,
+    isolation as _isolation_api,
+    marketplace as _marketplace_api,
+    operations as _operations_api,
+)
+
+for _router_module in (
+    _isolation_api,
+    _access_api,
+    _artifacts_api,
+    _operations_api,
+    _marketplace_api,
+    _agent_mesh_api,
+):
+    app.include_router(_router_module.router)

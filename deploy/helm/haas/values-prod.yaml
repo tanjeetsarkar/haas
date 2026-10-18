@@ -1,0 +1,76 @@
+# Production overlay. Usage:
+#   helm upgrade --install haas deploy/helm/haas -n haas -f deploy/helm/haas/values-prod.yaml \
+#     --set image.repository=registry.example.com/haas --set image.digest=sha256:...
+profile: prod
+
+image:
+  repository: registry.example.com/haas/haas-distributed
+  tag: "3.0.0"
+  pullPolicy: IfNotPresent
+
+config:
+  PLUGINS_STRICT: "true"
+
+api:
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"        # SSE streams
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    hosts:
+      - host: api.haas.example.com
+        paths: ["/"]
+    tls:
+      - secretName: haas-api-tls
+        hosts: [api.haas.example.com]
+  autoscaling:
+    minReplicas: 3
+    maxReplicas: 20
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: api
+
+orchestrator:
+  autoscaling:
+    minReplicas: 3
+    maxReplicas: 40
+
+toolWorker:
+  # Stronger kernel isolation for tool execution when the cluster provides gVisor.
+  runtimeClassName: gvisor
+  autoscaling:
+    minReplicas: 3
+    maxReplicas: 60
+
+keda:
+  enabled: true
+  redis:
+    address: haas-redis.cache.internal:6379
+    databaseIndex: "1"
+    enableTLS: "true"
+    passwordSecret: haas-redis-auth
+
+networkPolicy:
+  enabled: true
+  apiIngressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  postgres:
+    to:
+      - ipBlock: {cidr: 10.20.0.0/16}
+    ports:
+      - {protocol: TCP, port: 5432}
+  redis:
+    to:
+      - ipBlock: {cidr: 10.30.0.0/16}
+    ports:
+      - {protocol: TCP, port: 6379}

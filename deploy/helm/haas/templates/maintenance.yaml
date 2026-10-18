@@ -1,0 +1,3 @@
+{{- if .Values.maintenance.enabled }}
+{{ include "haas.workerDeployment" (dict "root" $ "component" "maintenance" "c" .Values.maintenance "nodeName" "maintenance") }}
+{{- end }}

@@ -140,6 +140,78 @@ class Settings(BaseSettings):
     # (local development / integration tests only).
     ssrf_allowed_hosts: str = ""
 
+    # --- P4 isolation settings (EXEC) ---
+    # "static": the API/workers build the tool catalog from catalog JSON produced by a
+    # sandboxed `describe` (never importing plugin code); "import" is the legacy dev loader.
+    plugin_catalog_mode: Literal["static", "import"] = "static"
+    plugin_catalog_dir: Path = Path(".haas/catalog")
+    # Build a missing catalog via a sandboxed describe; off = fail the plugin with a hint.
+    plugin_catalog_autobuild: bool = True
+    plugin_artifacts_dir: Path = Path(".haas/plugin-artifacts")
+    # "sandbox" runs every plugin tool in a per-invocation subprocess (haas.sandbox/1);
+    # "inprocess" is a dev/test-only escape hatch that production rejects.
+    sandbox_mode: Literal["sandbox", "inprocess"] = "sandbox"
+    sandbox_work_root: Path = Path(".haas/sandbox")
+    # off: inherit the host network; auto: `unshare --net` when available;
+    # required: refuse to run tools when network isolation is unavailable.
+    sandbox_network: Literal["off", "auto", "required"] = "off"
+    sandbox_cpu_seconds: int = 30
+    sandbox_max_memory_mb: int = 1024
+    sandbox_max_open_files: int = 64
+    # RLIMIT_NPROC counts every task of the uid, so this is headroom above current usage.
+    sandbox_max_processes: int = 64
+    sandbox_max_output_bytes: int = 1_048_576
+    sandbox_max_file_bytes: int = 16_777_216
+    # --- end P4 isolation settings ---
+
+    # --- P4 access settings (SEC) ---
+    # Credential grants: single-use, audience-bound secret hand-offs to one tool invocation.
+    credential_grant_ttl_sec: int = Field(default=600, gt=0, le=86_400)
+    credential_grant_retention_days: int = Field(default=30, gt=0)
+    # `env` secret bindings may only reference variables with this prefix.
+    secret_provider_env_prefix: str = "HAAS_TENANT_SECRET_"
+    # Egress broker defaults (a tenant egress policy overrides the byte cap).
+    egress_default_max_bytes_per_run: int = Field(default=50 * 1024 * 1024, gt=0)
+    egress_max_redirects: int = Field(default=5, ge=0, le=20)
+    egress_request_timeout_sec: float = Field(default=20.0, gt=0)
+    # --- end P4 access settings ---
+
+    # --- P4/P5 artifact and retention settings (DATA) ---
+    # Object store backend for run artifacts: "local" (filesystem, dev/test) or "s3".
+    artifact_store_backend: Literal["local", "s3"] = "local"
+    artifact_store_dir: Path = Path("./var/artifacts")
+    artifact_s3_endpoint: str | None = None
+    artifact_s3_bucket: str | None = None
+    artifact_s3_region: str = "us-east-1"
+    artifact_s3_access_key: str | None = None
+    artifact_s3_secret_key: str | None = None
+    artifact_max_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
+    # Default per-tenant `artifact_bytes` quota; retention_policies may override it.
+    artifact_tenant_quota_bytes: int = Field(default=1024 * 1024 * 1024, ge=0)
+    retention_sweep_interval_sec: int = Field(default=3_600, gt=0)
+    retention_batch_size: int = Field(default=200, gt=0, le=5_000)
+    # HMAC-SHA256 key (any string, >= 32 chars recommended) signing erasure receipts.
+    retention_receipt_hmac_key: str | None = None
+    retention_receipt_key_id: str = "retention-receipt-v1"
+    # --- end P4/P5 artifact and retention settings ---
+
+    # --- P5/P6 operations settings (OPS) ---
+    # --- end P5/P6 operations settings ---
+
+    # --- Track M marketplace settings (MKT) ---
+    marketplace_max_artifact_bytes: int = Field(default=16_777_216, gt=0)
+    # Community-tier revisions that pass every automated check are approved without an operator.
+    marketplace_community_auto_approve: bool = True
+    # Namespaces only operators may claim (impersonation guard).
+    marketplace_reserved_namespaces: list[str] = Field(
+        default_factory=lambda: ["haas", "official", "platform", "admin", "system", "local"]
+    )
+    marketplace_web_dir: Path = Path("web/marketplace")
+    # --- end Track M marketplace settings ---
+
+    # --- Track A multi-agent settings (AGENTS) ---
+    # --- end Track A multi-agent settings ---
+
     @staticmethod
     def _csv(value: str) -> list[str]:
         return [p.strip() for p in value.split(",") if p.strip()]
@@ -287,6 +359,10 @@ def validate_profile_settings(
         errors.append(
             "Flower must be disabled or protected with a non-placeholder FLOWER_BASIC_AUTH"
         )
+    if config.sandbox_mode != "sandbox":
+        errors.append("SANDBOX_MODE must be 'sandbox' in production")
+    if config.plugin_catalog_mode != "static":
+        errors.append("PLUGIN_CATALOG_MODE must be 'static' in production")
 
     if errors:
         raise ValueError("Invalid production profile: " + "; ".join(errors))

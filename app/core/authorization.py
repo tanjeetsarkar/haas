@@ -20,6 +20,17 @@ class Action(StrEnum):
     TENANT_ADMIN = "tenant.admin"
     AUDIT_READ = "audit.read"
     PLATFORM_OPERATE = "platform.operate"
+    # Phase 4-6 and track actions (deny-by-default; granted below per role).
+    ARTIFACT_READ = "artifact.read"
+    ARTIFACT_WRITE = "artifact.write"
+    SECRET_ADMIN = "secret.admin"
+    WEBHOOK_ADMIN = "webhook.admin"
+    RETENTION_ADMIN = "retention.admin"
+    USAGE_READ = "usage.read"
+    MARKETPLACE_READ = "marketplace.read"
+    MARKETPLACE_INSTALL = "marketplace.install"
+    MARKETPLACE_PUBLISH = "marketplace.publish"
+    AGENT_COLLABORATE = "agent.collaborate"
 
 
 _ROLE_ACTIONS: dict[str, frozenset[Action]] = {
@@ -32,6 +43,15 @@ _ROLE_ACTIONS: dict[str, frozenset[Action]] = {
             Action.PLUGIN_CATALOG_READ,
             Action.TENANT_ADMIN,
             Action.AUDIT_READ,
+            Action.ARTIFACT_READ,
+            Action.ARTIFACT_WRITE,
+            Action.SECRET_ADMIN,
+            Action.WEBHOOK_ADMIN,
+            Action.RETENTION_ADMIN,
+            Action.USAGE_READ,
+            Action.MARKETPLACE_READ,
+            Action.MARKETPLACE_INSTALL,
+            Action.AGENT_COLLABORATE,
         }
     ),
     "submitter": frozenset(
@@ -41,11 +61,18 @@ _ROLE_ACTIONS: dict[str, frozenset[Action]] = {
             Action.RUN_STREAM,
             Action.RUN_CANCEL,
             Action.PLUGIN_CATALOG_READ,
+            Action.ARTIFACT_READ,
+            Action.ARTIFACT_WRITE,
+            Action.USAGE_READ,
+            Action.MARKETPLACE_READ,
+            Action.AGENT_COLLABORATE,
         }
     ),
     "approver": frozenset({Action.RUN_APPROVAL_READ, Action.RUN_APPROVE}),
-    "auditor": frozenset({Action.AUDIT_READ}),
+    "auditor": frozenset({Action.AUDIT_READ, Action.USAGE_READ}),
     "operator": frozenset({Action.PLATFORM_OPERATE}),
+    # Marketplace publishers act on their own namespace; tenant data stays out of reach.
+    "publisher": frozenset({Action.MARKETPLACE_READ, Action.MARKETPLACE_PUBLISH}),
     # Break-glass access requires a separate, time-limited grant that is not
     # implemented yet. The membership role alone deliberately grants no action.
     "break_glass": frozenset(),

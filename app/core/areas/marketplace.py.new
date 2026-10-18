@@ -1,0 +1,1332 @@
+"""Track M marketplace registry, trust and installs (owner: MKT).
+
+Catalog rows are global; private listings are filtered here by ``owner_tenant_id``.
+Installations and notifications are tenant rows protected by RLS. Cross-tenant fan-out
+(yank/takedown/suspension notices) goes through the ``haas_marketplace_fanout`` function.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
+
+from app.core.config import settings
+from app.marketplace import signing, tlog
+from app.marketplace.canonical import digest_json, is_sha256, sha256_hex
+from app.marketplace.errors import (
+    MarketplaceConflict,
+    MarketplaceForbidden,
+    MarketplaceInvalid,
+    MarketplaceNotFound,
+)
+from app.marketplace.manifest import (
+    ManifestError,
+    parse_manifest,
+    permission_diff,
+)
+from app.marketplace.packaging import ArchiveError, archive_manifest, read_archive
+from app.marketplace.review import decide, run_review
+from app.marketplace.semver import parse_version, range_matches, validate_range
+from app.marketplace.tiers import (
+    DEFAULT_ALLOWED_TIERS,
+    consent_material,
+    tier_for_publisher,
+)
+
+# Tenant-owned tables added by this area; appended to the production RLS startup check.
+RLS_TABLES: tuple[str, ...] = ("marketplace_installations", "marketplace_notifications")
+
+TLOG_TYPE = "haas.marketplace.tlog/v1"
+TLOG_VERIFY_WINDOW = 1_000
+_VISIBLE = (
+    "l.status = 'active' AND p.status = 'active' AND "
+    "(l.visibility = 'public' OR l.owner_tenant_id = resolve_haas_tenant_uuid("
+    "current_setting('haas.tenant', true)))"
+)
+_SEMVER_DESC = "r.major DESC, r.minor DESC, r.patch DESC, (r.prerelease IS NULL) DESC, r.prerelease DESC"
+
+
+@dataclass(frozen=True, slots=True)
+class Actor:
+    """Who is calling: principal (None in legacy dev) and whether they hold operator rights."""
+
+    principal_id: str | None = None
+    operator: bool = False
+    request_id: str | None = None
+
+    @property
+    def principal_uuid(self) -> UUID | None:
+        return UUID(self.principal_id) if self.principal_id else None
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _json(value: Any) -> str | None:
+    return None if value is None else json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _load(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _iso(value: Any) -> Any:
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def split_plugin_id(plugin_id: str) -> tuple[str, str]:
+    if not plugin_id.startswith("@") or "/" not in plugin_id:
+        raise MarketplaceInvalid("plugin id must be '@publisher/name'")
+    namespace, name = plugin_id[1:].split("/", 1)
+    return namespace, name
+
+
+class MarketplaceStore:
+    """Mixed into ``DistributedStore``; uses ``self.connection()`` (tenant-scoped transaction)."""
+
+    connection: Any
+    _insert_audit_event: Any
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    async def _mkt_tenant(conn: Any, *, required: bool = True) -> UUID | None:
+        tenant = await conn.fetchval(
+            "SELECT resolve_haas_tenant_uuid(current_setting('haas.tenant', true))"
+        )
+        if tenant is None and required:
+            raise MarketplaceNotFound("tenant is not registered; marketplace requires a provisioned tenant")
+        return tenant
+
+    async def _mkt_audit(
+        self,
+        conn: Any,
+        tenant: UUID | None,
+        actor: Actor,
+        action: str,
+        target_type: str,
+        target_id: str,
+        details: dict[str, Any],
+    ) -> None:
+        if tenant is None or actor.principal_uuid is None:
+            return
+        await self._insert_audit_event(
+            conn,
+            tenant_id=tenant,
+            actor_principal_id=actor.principal_uuid,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            request_id=UUID(actor.request_id) if actor.request_id else uuid4(),
+            details=details,
+        )
+
+    @staticmethod
+    async def _tlog_append(conn: Any, entry: dict[str, Any]) -> int:
+        document = {"_type": TLOG_TYPE, **entry}
+        data = tlog.entry_bytes(document)
+        return await conn.fetchval(
+            "INSERT INTO marketplace_transparency_log (seq, entry, leaf_hash, chain_hash) "
+            "VALUES (0, $1, $2, $3) RETURNING seq",
+            data.decode("utf-8"),
+            tlog.leaf_hash(data),
+            tlog.ZERO_HASH,
+        )
+
+    @staticmethod
+    async def _tlog_leaves(conn: Any) -> list[bytes]:
+        rows = await conn.fetch("SELECT leaf_hash FROM marketplace_transparency_log ORDER BY seq")
+        return [bytes(row["leaf_hash"]) for row in rows]
+
+    @staticmethod
+    def _publisher_out(row: Any, *, include_private: bool = False) -> dict[str, Any]:
+        data = {
+            "namespace": row["namespace"],
+            "display_name": row["display_name"],
+            "verification": row["verification"],
+            "domain": row["domain"],
+            "verified_at": _iso(row["verified_at"]),
+            "status": row["status"],
+            "created_at": _iso(row["created_at"]),
+        }
+        if include_private:
+            data["verification_token"] = row["verification_token"]
+            data["status_reason"] = row["status_reason"]
+        return data
+
+    async def _publisher_row(self, conn: Any, namespace: str, *, lock: bool = False) -> Any:
+        row = await conn.fetchrow(
+            "SELECT * FROM marketplace_publishers WHERE namespace = $1"
+            + (" FOR UPDATE" if lock else ""),
+            namespace,
+        )
+        if row is None:
+            raise MarketplaceNotFound(f"publisher '@{namespace}' not found")
+        return row
+
+    async def _require_publisher_owner(
+        self, conn: Any, namespace: str, actor: Actor, *, lock: bool = False
+    ) -> tuple[Any, UUID | None]:
+        row = await self._publisher_row(conn, namespace, lock=lock)
+        tenant = await self._mkt_tenant(conn, required=not actor.operator)
+        if not actor.operator and row["owner_tenant_id"] != tenant:
+            raise MarketplaceForbidden(f"tenant does not own publisher '@{namespace}'")
+        return row, tenant
+
+    # ------------------------------------------------------------- publishers
+
+    async def mkt_create_publisher(
+        self, *, namespace: str, display_name: str, domain: str | None, actor: Actor
+    ) -> dict[str, Any]:
+        reserved = {value.lower() for value in settings.marketplace_reserved_namespaces}
+        if namespace in reserved and not actor.operator:
+            raise MarketplaceForbidden(f"namespace '@{namespace}' is reserved")
+        token = "haas-verify-" + sha256_hex(uuid4().bytes)[:32]
+        async with self.connection() as conn:
+            tenant = await self._mkt_tenant(conn)
+            if await conn.fetchval(
+                "SELECT 1 FROM marketplace_publishers WHERE namespace = $1", namespace
+            ):
+                raise MarketplaceConflict(f"namespace '@{namespace}' is already claimed")
+            row = await conn.fetchrow(
+                """
+                INSERT INTO marketplace_publishers (
+                    publisher_id, namespace, display_name, owner_tenant_id, created_by,
+                    domain, verification_token
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
+                """,
+                uuid4(),
+                namespace,
+                display_name,
+                tenant,
+                actor.principal_uuid,
+                domain.lower() if domain else None,
+                token,
+            )
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.publisher.created", "publisher", namespace, {}
+            )
+        return self._publisher_out(row, include_private=True)
+
+    async def mkt_get_publisher(self, namespace: str) -> dict[str, Any]:
+        async with self.connection() as conn:
+            row = await self._publisher_row(conn, namespace)
+            tenant = await self._mkt_tenant(conn, required=False)
+            keys = await conn.fetch(
+                "SELECT key_id, label, created_at, revoked_at, revoked_reason, public_key "
+                "FROM marketplace_publisher_keys WHERE publisher_id = $1 ORDER BY created_at",
+                row["publisher_id"],
+            )
+        data = self._publisher_out(row, include_private=row["owner_tenant_id"] == tenant)
+        data["keys"] = [
+            {
+                "key_id": key["key_id"],
+                "public_key": signing.b64encode(bytes(key["public_key"])),
+                "label": key["label"],
+                "created_at": _iso(key["created_at"]),
+                "revoked_at": _iso(key["revoked_at"]),
+                "revoked_reason": key["revoked_reason"],
+            }
+            for key in keys
+        ]
+        return data
+
+    async def mkt_add_publisher_key(
+        self, *, namespace: str, public_key: str, label: str | None, actor: Actor
+    ) -> dict[str, Any]:
+        try:
+            raw = signing.public_key_bytes(public_key)
+        except signing.SignatureError as exc:
+            raise MarketplaceInvalid(str(exc)) from exc
+        key_id = signing.key_id_for(raw)
+        async with self.connection() as conn:
+            publisher, tenant = await self._require_publisher_owner(conn, namespace, actor)
+            if publisher["status"] != "active":
+                raise MarketplaceForbidden("suspended publishers cannot register keys")
+            if await conn.fetchval(
+                "SELECT 1 FROM marketplace_publisher_keys WHERE key_id = $1", key_id
+            ):
+                raise MarketplaceConflict("this public key is already registered")
+            await conn.execute(
+                "INSERT INTO marketplace_publisher_keys (key_id, publisher_id, public_key, label) "
+                "VALUES ($1, $2, $3, $4)",
+                key_id,
+                publisher["publisher_id"],
+                raw,
+                label,
+            )
+            await self._tlog_append(
+                conn,
+                {"kind": "key_added", "namespace": namespace, "key_id": key_id,
+                 "public_key": public_key, "at": _now()},
+            )
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.publisher.key_added", "publisher", namespace,
+                {"key_id": key_id},
+            )
+        return {"key_id": key_id, "public_key": public_key, "label": label}
+
+    async def mkt_revoke_publisher_key(
+        self, *, namespace: str, key_id: str, reason: str, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            publisher, tenant = await self._require_publisher_owner(conn, namespace, actor)
+            updated = await conn.fetchval(
+                "UPDATE marketplace_publisher_keys SET revoked_at = now(), revoked_reason = $3 "
+                "WHERE key_id = $1 AND publisher_id = $2 AND revoked_at IS NULL RETURNING key_id",
+                key_id,
+                publisher["publisher_id"],
+                reason,
+            )
+            if updated is None:
+                raise MarketplaceNotFound("active key not found for this publisher")
+            revisions = await conn.fetch(
+                "SELECT revision_id FROM marketplace_revisions WHERE signing_key_id = $1", key_id
+            )
+            notified = await conn.fetchval(
+                "SELECT haas_marketplace_fanout($1::uuid[], 'key_revoked', $2::jsonb, false)",
+                [row["revision_id"] for row in revisions],
+                _json({"key_id": key_id, "reason": reason}),
+            )
+            await self._tlog_append(
+                conn,
+                {"kind": "key_revoked", "namespace": namespace, "key_id": key_id,
+                 "reason": reason, "at": _now()},
+            )
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.publisher.key_revoked", "publisher", namespace,
+                {"key_id": key_id},
+            )
+        return {"key_id": key_id, "revoked": True, "tenants_notified": notified}
+
+    async def mkt_set_publisher_verification(
+        self, *, namespace: str, verification: str, domain: str | None, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE marketplace_publishers
+                   SET verification = $2, domain = COALESCE($3, domain),
+                       verified_at = CASE WHEN $2 = 'unverified' THEN NULL ELSE now() END,
+                       updated_at = now()
+                 WHERE namespace = $1 RETURNING *
+                """,
+                namespace,
+                verification,
+                domain.lower() if domain else None,
+            )
+            if row is None:
+                raise MarketplaceNotFound(f"publisher '@{namespace}' not found")
+            tenant = await self._mkt_tenant(conn, required=False)
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.publisher.verification", "publisher",
+                namespace, {"verification": verification},
+            )
+        return self._publisher_out(row)
+
+    async def mkt_set_publisher_status(
+        self, *, namespace: str, status: str, reason: str, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "UPDATE marketplace_publishers SET status = $2, status_reason = $3, "
+                "updated_at = now() WHERE namespace = $1 RETURNING *",
+                namespace,
+                status,
+                reason,
+            )
+            if row is None:
+                raise MarketplaceNotFound(f"publisher '@{namespace}' not found")
+            notified = 0
+            if status == "suspended":
+                revisions = await conn.fetch(
+                    "SELECT r.revision_id FROM marketplace_revisions r JOIN marketplace_listings l "
+                    "USING (listing_id) WHERE l.publisher_id = $1",
+                    row["publisher_id"],
+                )
+                notified = await conn.fetchval(
+                    "SELECT haas_marketplace_fanout($1::uuid[], 'publisher_suspended', $2::jsonb, false)",
+                    [item["revision_id"] for item in revisions],
+                    _json({"namespace": namespace, "reason": reason}),
+                )
+            tenant = await self._mkt_tenant(conn, required=False)
+            await self._mkt_audit(
+                conn, tenant, actor, f"marketplace.publisher.{status}", "publisher", namespace,
+                {"reason": reason},
+            )
+        return {**self._publisher_out(row), "tenants_notified": notified}
+
+    # --------------------------------------------------------------- publish
+
+    async def mkt_publish(
+        self,
+        *,
+        manifest: dict[str, Any],
+        artifact_digest: str,
+        artifact: bytes | None,
+        signature: dict[str, Any],
+        provenance: dict[str, Any] | None,
+        visibility: str,
+        tier: str | None,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        if not is_sha256(artifact_digest):
+            raise MarketplaceInvalid("artifact_digest must be a sha256 hex digest")
+        plugin_id = manifest.get("id") if isinstance(manifest, dict) else None
+        if not isinstance(plugin_id, str):
+            raise MarketplaceInvalid("manifest.id is required")
+        if manifest.get("manifest_version", 1) == 1:
+            if not plugin_id.startswith("@"):
+                raise MarketplaceInvalid(
+                    "v1 manifests must be published with a namespaced id ('@ns/name') "
+                    "or converted with `haas plugin migrate`"
+                )
+        namespace, _ = split_plugin_id(plugin_id)
+        try:
+            raw_v1 = dict(manifest)
+            if manifest.get("manifest_version", 1) == 1:
+                raw_v1["id"] = plugin_id.split("/", 1)[1]
+            parsed = parse_manifest(raw_v1, namespace=namespace)
+        except ManifestError as exc:
+            raise MarketplaceInvalid("manifest is invalid", details=exc.errors) from exc
+        model = parsed.manifest
+        files: dict[str, bytes] | None = None
+        if artifact is not None:
+            if len(artifact) > settings.marketplace_max_artifact_bytes:
+                raise MarketplaceInvalid("artifact exceeds marketplace_max_artifact_bytes")
+            if sha256_hex(artifact) != artifact_digest:
+                raise MarketplaceInvalid("artifact bytes do not match artifact_digest")
+            try:
+                files = read_archive(artifact)
+                packed_manifest = archive_manifest(files)
+            except ArchiveError as exc:
+                raise MarketplaceInvalid(str(exc)) from exc
+            if digest_json(packed_manifest) != digest_json(manifest):
+                raise MarketplaceInvalid("plugin.json inside the artifact differs from the submitted manifest")
+        version = parse_version(model.version)
+        manifest_digest = digest_json(manifest)
+        async with self.connection() as conn:
+            publisher, tenant = await self._require_publisher_owner(conn, namespace, actor, lock=True)
+            if publisher["status"] != "active":
+                raise MarketplaceForbidden(f"publisher '@{namespace}' is suspended")
+            key_id = signature.get("key_id") if isinstance(signature, dict) else None
+            key = await conn.fetchrow(
+                "SELECT public_key, revoked_at FROM marketplace_publisher_keys "
+                "WHERE key_id = $1 AND publisher_id = $2",
+                key_id,
+                publisher["publisher_id"],
+            )
+            if key is None or key["revoked_at"] is not None:
+                raise MarketplaceForbidden("signature key is not an active key of this publisher")
+            try:
+                signing.verify(
+                    bytes(key["public_key"]),
+                    signature,
+                    artifact_digest=artifact_digest,
+                    manifest=manifest,
+                    provenance=provenance,
+                )
+            except signing.SignatureError as exc:
+                raise MarketplaceInvalid(f"signature verification failed: {exc}") from exc
+            provenance_ok: bool | None = None
+            if provenance is not None:
+                try:
+                    signing.validate_provenance(
+                        provenance, plugin_id=model.id, version=model.version,
+                        artifact_digest=artifact_digest,
+                    )
+                    provenance_ok = True
+                except signing.SignatureError as exc:
+                    raise MarketplaceInvalid(f"provenance is invalid: {exc}") from exc
+            listing = await conn.fetchrow(
+                "SELECT * FROM marketplace_listings WHERE plugin_id = $1 FOR UPDATE", model.id
+            )
+            if listing is not None:
+                if listing["status"] != "active":
+                    raise MarketplaceForbidden("listing has been taken down")
+                if listing["visibility"] != visibility:
+                    raise MarketplaceConflict(
+                        f"listing visibility is '{listing['visibility']}'; it cannot change on publish"
+                    )
+                if await conn.fetchval(
+                    "SELECT 1 FROM marketplace_revisions WHERE listing_id = $1 AND version = $2",
+                    listing["listing_id"],
+                    model.version,
+                ):
+                    raise MarketplaceConflict(f"{model.id}@{model.version} already exists; versions are immutable")
+            try:
+                effective_tier = tier_for_publisher(
+                    requested=tier, verification=publisher["verification"], visibility=visibility
+                )
+            except ValueError as exc:
+                raise MarketplaceForbidden(str(exc)) from exc
+            previous = None
+            if listing is not None:
+                previous = await conn.fetchval(
+                    "SELECT permissions FROM marketplace_revisions r WHERE r.listing_id = $1 "
+                    "AND r.review_state = 'approved' AND r.yanked_at IS NULL "
+                    f"ORDER BY {_SEMVER_DESC} LIMIT 1",
+                    listing["listing_id"],
+                )
+            report = run_review(
+                parsed,
+                manifest,
+                tier=effective_tier,
+                files=files,
+                previous_permissions=_load(previous) if previous else None,
+                signature_verified=True,
+                provenance_verified=provenance_ok,
+            )
+            state, effective_tier = decide(
+                effective_tier, report,
+                community_auto_approve=settings.marketplace_community_auto_approve,
+            )
+            if listing is None:
+                listing_id = uuid4()
+                await conn.execute(
+                    """
+                    INSERT INTO marketplace_listings (
+                        listing_id, plugin_id, publisher_id, name, display_name, summary,
+                        categories, keywords, visibility, owner_tenant_id, search_document
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                              to_tsvector('simple', $11))
+                    """,
+                    listing_id,
+                    model.id,
+                    publisher["publisher_id"],
+                    model.plugin_name,
+                    model.name or model.plugin_name,
+                    model.description[:500],
+                    list(model.categories),
+                    list(model.keywords),
+                    visibility,
+                    publisher["owner_tenant_id"],
+                    self._search_text(model),
+                )
+            else:
+                listing_id = listing["listing_id"]
+            seq = await self._tlog_append(
+                conn,
+                {
+                    "kind": "publish",
+                    "plugin_id": model.id,
+                    "version": model.version,
+                    "artifact_digest": artifact_digest,
+                    "manifest_digest": manifest_digest,
+                    "provenance_digest": digest_json(provenance) if provenance else None,
+                    "key_id": key_id,
+                    "signature": signature["sig"],
+                    "at": _now(),
+                },
+            )
+            if artifact is not None:
+                await conn.execute(
+                    "INSERT INTO marketplace_artifacts (digest, size_bytes, content) "
+                    "VALUES ($1, $2, $3) ON CONFLICT (digest) DO NOTHING",
+                    artifact_digest,
+                    len(artifact),
+                    artifact,
+                )
+            revision_id = uuid4()
+            await conn.execute(
+                """
+                INSERT INTO marketplace_revisions (
+                    revision_id, listing_id, version, major, minor, patch, prerelease, digest,
+                    manifest, manifest_raw, manifest_digest, source_manifest_version,
+                    permissions, signature, signing_key_id, provenance, tier, review_state,
+                    review_report, tlog_seq, published_by
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12,
+                          $13::jsonb, $14::jsonb, $15, $16::jsonb, $17, $18, $19::jsonb, $20, $21)
+                """,
+                revision_id,
+                listing_id,
+                model.version,
+                version.major,
+                version.minor,
+                version.patch,
+                ".".join(version.prerelease) if version.prerelease else None,
+                artifact_digest,
+                _json(model.to_json()),
+                _json(manifest),
+                manifest_digest,
+                parsed.source_version,
+                _json(report["permissions"]),
+                _json(signature),
+                key_id,
+                _json(provenance),
+                effective_tier,
+                state,
+                _json(report),
+                seq,
+                actor.principal_uuid,
+            )
+            if state == "approved":
+                await self._refresh_listing(conn, listing_id, model)
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.revision.published", "plugin",
+                f"{model.id}@{model.version}",
+                {"digest": artifact_digest, "tier": effective_tier, "review_state": state},
+            )
+        return {
+            "plugin_id": model.id,
+            "version": model.version,
+            "digest": artifact_digest,
+            "tier": effective_tier,
+            "review_state": state,
+            "tlog_seq": seq,
+            "review_report": report,
+        }
+
+    @staticmethod
+    def _search_text(model: Any) -> str:
+        return " ".join(
+            [
+                model.id,
+                model.publisher,
+                model.plugin_name,
+                model.name or "",
+                model.description,
+                *model.categories,
+                *model.keywords,
+                *model.provides.tools,
+                *model.provides.skills,
+            ]
+        ).replace("-", " ") + " " + model.plugin_name
+
+    async def _refresh_listing(self, conn: Any, listing_id: UUID, model: Any) -> None:
+        await conn.execute(
+            """
+            UPDATE marketplace_listings
+               SET display_name = $2, summary = $3, categories = $4, keywords = $5,
+                   search_document = to_tsvector('simple', $6), updated_at = now()
+             WHERE listing_id = $1
+            """,
+            listing_id,
+            model.name or model.plugin_name,
+            model.description[:500],
+            list(model.categories),
+            list(model.keywords),
+            self._search_text(model),
+        )
+
+    # ------------------------------------------------------------- discovery
+
+    async def mkt_search(
+        self,
+        *,
+        query: str | None,
+        category: str | None,
+        tier: str | None,
+        publisher: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        after = ""
+        if cursor:
+            try:
+                after = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+            except (ValueError, UnicodeError) as exc:
+                raise MarketplaceInvalid("invalid cursor") from exc
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT l.plugin_id, l.display_name, l.summary, l.categories, l.keywords,
+                       l.visibility, l.install_count, l.updated_at,
+                       p.namespace, p.display_name AS publisher_name, p.verification,
+                       latest.version, latest.tier, latest.digest, latest.permissions
+                  FROM marketplace_listings l
+                  JOIN marketplace_publishers p USING (publisher_id)
+                  JOIN LATERAL (
+                        SELECT r.version, r.tier, r.digest, r.permissions
+                          FROM marketplace_revisions r
+                         WHERE r.listing_id = l.listing_id AND r.review_state = 'approved'
+                           AND r.yanked_at IS NULL
+                         ORDER BY {_SEMVER_DESC}
+                         LIMIT 1
+                  ) latest ON true
+                 WHERE {_VISIBLE}
+                   AND l.plugin_id > $1
+                   AND ($2::text IS NULL OR l.search_document @@ websearch_to_tsquery('simple', $2)
+                        OR l.plugin_id ILIKE '%' || $2 || '%')
+                   AND ($3::text IS NULL OR $3 = ANY(l.categories))
+                   AND ($4::text IS NULL OR latest.tier = $4)
+                   AND ($5::text IS NULL OR p.namespace = $5)
+                 ORDER BY l.plugin_id
+                 LIMIT $6
+                """,
+                after,
+                query or None,
+                category,
+                tier,
+                publisher,
+                limit + 1,
+            )
+        items = [self._listing_summary(row) for row in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit:
+            next_cursor = base64.urlsafe_b64encode(items[-1]["plugin_id"].encode()).decode()
+        return {"object": "list", "data": items, "next_cursor": next_cursor}
+
+    @staticmethod
+    def _listing_summary(row: Any) -> dict[str, Any]:
+        permissions = _load(row["permissions"])
+        return {
+            "plugin_id": row["plugin_id"],
+            "display_name": row["display_name"],
+            "summary": row["summary"],
+            "categories": list(row["categories"]),
+            "keywords": list(row["keywords"]),
+            "visibility": row["visibility"],
+            "install_count": row["install_count"],
+            "publisher": {
+                "namespace": row["namespace"],
+                "display_name": row["publisher_name"],
+                "verification": row["verification"],
+            },
+            "latest_version": row["version"],
+            "tier": row["tier"],
+            "digest": row["digest"],
+            "permissions": permissions,
+        }
+
+    async def _visible_listing(self, conn: Any, plugin_id: str, actor: Actor) -> Any:
+        row = await conn.fetchrow(
+            f"""
+            SELECT l.*, p.namespace, p.display_name AS publisher_name, p.verification,
+                   p.status AS publisher_status, p.owner_tenant_id AS publisher_tenant
+              FROM marketplace_listings l JOIN marketplace_publishers p USING (publisher_id)
+             WHERE l.plugin_id = $1 AND ({_VISIBLE} OR $2)
+            """,
+            plugin_id,
+            actor.operator,
+        )
+        if row is None:
+            raise MarketplaceNotFound(f"listing {plugin_id} not found")
+        return row
+
+    async def mkt_get_listing(self, plugin_id: str, actor: Actor) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, actor)
+            tenant = await self._mkt_tenant(conn, required=False)
+            owner = actor.operator or listing["publisher_tenant"] == tenant
+            revisions = await conn.fetch(
+                f"""
+                SELECT r.version, r.digest, r.tier, r.review_state, r.yanked_at, r.yank_reason,
+                       r.created_at, r.tlog_seq, r.source_manifest_version
+                  FROM marketplace_revisions r
+                 WHERE r.listing_id = $1 AND (r.review_state = 'approved' OR $2)
+                 ORDER BY {_SEMVER_DESC}
+                """,
+                listing["listing_id"],
+                owner,
+            )
+        return {
+            "plugin_id": listing["plugin_id"],
+            "display_name": listing["display_name"],
+            "summary": listing["summary"],
+            "categories": list(listing["categories"]),
+            "keywords": list(listing["keywords"]),
+            "visibility": listing["visibility"],
+            "status": listing["status"],
+            "install_count": listing["install_count"],
+            "publisher": {
+                "namespace": listing["namespace"],
+                "display_name": listing["publisher_name"],
+                "verification": listing["verification"],
+            },
+            "versions": [
+                {
+                    "version": row["version"],
+                    "digest": row["digest"],
+                    "tier": row["tier"],
+                    "review_state": row["review_state"],
+                    "yanked": row["yanked_at"] is not None,
+                    "yank_reason": row["yank_reason"],
+                    "published_at": _iso(row["created_at"]),
+                    "tlog_seq": row["tlog_seq"],
+                    "manifest_version": row["source_manifest_version"],
+                }
+                for row in revisions
+            ],
+        }
+
+    async def _resolve_revision(
+        self, conn: Any, listing: Any, spec: str | None, *, owner: bool
+    ) -> Any:
+        rows = await conn.fetch(
+            f"""
+            SELECT r.*, k.public_key, k.revoked_at AS key_revoked_at
+              FROM marketplace_revisions r
+              JOIN marketplace_publisher_keys k ON k.key_id = r.signing_key_id
+             WHERE r.listing_id = $1
+             ORDER BY {_SEMVER_DESC}
+            """,
+            listing["listing_id"],
+        )
+        wanted = spec or "latest"
+        try:
+            validate_range(wanted)
+        except ValueError as exc:
+            raise MarketplaceInvalid(str(exc)) from exc
+        for row in rows:
+            if row["version"] == wanted:
+                if row["review_state"] != "approved" and not owner:
+                    break
+                return row
+        for row in rows:
+            if row["review_state"] != "approved" or row["yanked_at"] is not None:
+                continue
+            if range_matches(wanted, row["version"]):
+                return row
+        raise MarketplaceNotFound(f"no approved version of {listing['plugin_id']} matches '{wanted}'")
+
+    def _revision_out(self, listing: Any, row: Any, *, with_report: bool) -> dict[str, Any]:
+        data = {
+            "plugin_id": listing["plugin_id"],
+            "version": row["version"],
+            "digest": row["digest"],
+            "manifest": _load(row["manifest"]),
+            "manifest_raw": _load(row["manifest_raw"]),
+            "manifest_digest": row["manifest_digest"],
+            "manifest_version": row["source_manifest_version"],
+            "permissions": _load(row["permissions"]),
+            "signature": _load(row["signature"]),
+            "public_key": signing.b64encode(bytes(row["public_key"])),
+            "key_revoked": row["key_revoked_at"] is not None,
+            "provenance": _load(row["provenance"]),
+            "tier": row["tier"],
+            "review_state": row["review_state"],
+            "review_notes": row["review_notes"],
+            "tlog_seq": row["tlog_seq"],
+            "yanked": row["yanked_at"] is not None,
+            "yank_reason": row["yank_reason"],
+            "published_at": _iso(row["created_at"]),
+        }
+        report = _load(row["review_report"])
+        data["review_summary"] = {
+            "passed": report.get("passed"),
+            "coverage": report.get("coverage"),
+            "checks": {check["name"]: check["status"] for check in report.get("checks", [])},
+        }
+        if with_report:
+            data["review_report"] = report
+        return data
+
+    async def mkt_get_revision(self, plugin_id: str, version: str, actor: Actor) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, actor)
+            tenant = await self._mkt_tenant(conn, required=False)
+            owner = actor.operator or listing["publisher_tenant"] == tenant
+            row = await self._resolve_revision(conn, listing, version, owner=owner)
+        return self._revision_out(listing, row, with_report=owner or row["review_state"] == "approved")
+
+    async def mkt_get_artifact(self, digest: str, actor: Actor) -> bytes:
+        if not is_sha256(digest):
+            raise MarketplaceInvalid("digest must be sha256 hex")
+        async with self.connection() as conn:
+            content = await conn.fetchval(
+                f"""
+                SELECT a.content FROM marketplace_artifacts a
+                 WHERE a.digest = $1 AND EXISTS (
+                    SELECT 1 FROM marketplace_revisions r
+                      JOIN marketplace_listings l USING (listing_id)
+                      JOIN marketplace_publishers p USING (publisher_id)
+                     WHERE r.digest = a.digest AND ({_VISIBLE} OR $2))
+                """,
+                digest,
+                actor.operator,
+            )
+        if content is None:
+            raise MarketplaceNotFound("artifact not found")
+        return bytes(content)
+
+    # ---------------------------------------------------------------- reviews
+
+    async def mkt_review_queue(self, *, state: str, limit: int) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT l.plugin_id, r.version, r.digest, r.tier, r.review_state, r.review_report,
+                       r.created_at
+                  FROM marketplace_revisions r JOIN marketplace_listings l USING (listing_id)
+                 WHERE r.review_state = $1 ORDER BY r.created_at LIMIT $2
+                """,
+                state,
+                limit,
+            )
+        return [
+            {
+                "plugin_id": row["plugin_id"],
+                "version": row["version"],
+                "digest": row["digest"],
+                "tier": row["tier"],
+                "review_state": row["review_state"],
+                "review_report": _load(row["review_report"]),
+                "submitted_at": _iso(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    async def mkt_review(
+        self, *, plugin_id: str, version: str, decision: str, notes: str | None, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, actor)
+            row = await conn.fetchrow(
+                "SELECT revision_id, review_state, manifest FROM marketplace_revisions "
+                "WHERE listing_id = $1 AND version = $2 FOR UPDATE",
+                listing["listing_id"],
+                version,
+            )
+            if row is None:
+                raise MarketplaceNotFound(f"{plugin_id}@{version} not found")
+            if row["review_state"] != "submitted":
+                raise MarketplaceConflict(f"revision is already {row['review_state']}")
+            await conn.execute(
+                "UPDATE marketplace_revisions SET review_state = $2, reviewed_by = $3, "
+                "reviewed_at = now(), review_notes = $4 WHERE revision_id = $1",
+                row["revision_id"],
+                decision,
+                actor.principal_uuid,
+                notes,
+            )
+            if decision == "approved":
+                parsed = parse_manifest(_load(row["manifest"]))
+                await self._refresh_listing(conn, listing["listing_id"], parsed.manifest)
+            await self._tlog_append(
+                conn,
+                {"kind": "review", "plugin_id": plugin_id, "version": version,
+                 "decision": decision, "at": _now()},
+            )
+            tenant = await self._mkt_tenant(conn, required=False)
+            await self._mkt_audit(
+                conn, tenant, actor, f"marketplace.revision.{decision}", "plugin",
+                f"{plugin_id}@{version}", {"notes": notes},
+            )
+        return {"plugin_id": plugin_id, "version": version, "review_state": decision}
+
+    # ------------------------------------------------------- yank / takedown
+
+    async def mkt_yank(
+        self, *, plugin_id: str, version: str, reason: str, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, actor)
+            tenant = await self._mkt_tenant(conn, required=not actor.operator)
+            if not actor.operator and listing["publisher_tenant"] != tenant:
+                raise MarketplaceForbidden("only the publisher or an operator can yank")
+            revision_id = await conn.fetchval(
+                "UPDATE marketplace_revisions SET yanked_at = now(), yank_reason = $3 "
+                "WHERE listing_id = $1 AND version = $2 AND yanked_at IS NULL RETURNING revision_id",
+                listing["listing_id"],
+                version,
+                reason,
+            )
+            if revision_id is None:
+                raise MarketplaceNotFound(f"{plugin_id}@{version} not found or already yanked")
+            notified = await conn.fetchval(
+                "SELECT haas_marketplace_fanout($1::uuid[], 'yanked', $2::jsonb, false)",
+                [revision_id],
+                _json({"reason": reason}),
+            )
+            await self._tlog_append(
+                conn,
+                {"kind": "yank", "plugin_id": plugin_id, "version": version,
+                 "reason": reason, "at": _now()},
+            )
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.revision.yanked", "plugin",
+                f"{plugin_id}@{version}", {"reason": reason},
+            )
+        return {"plugin_id": plugin_id, "version": version, "yanked": True, "tenants_notified": notified}
+
+    async def mkt_takedown(self, *, plugin_id: str, reason: str, actor: Actor) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await conn.fetchrow(
+                "UPDATE marketplace_listings SET status = 'taken_down', status_reason = $2, "
+                "updated_at = now() WHERE plugin_id = $1 AND status = 'active' RETURNING listing_id",
+                plugin_id,
+                reason,
+            )
+            if listing is None:
+                raise MarketplaceNotFound(f"active listing {plugin_id} not found")
+            revisions = await conn.fetch(
+                "SELECT revision_id FROM marketplace_revisions WHERE listing_id = $1",
+                listing["listing_id"],
+            )
+            revoked = await conn.fetchval(
+                "SELECT haas_marketplace_fanout($1::uuid[], 'taken_down', $2::jsonb, true)",
+                [row["revision_id"] for row in revisions],
+                _json({"reason": reason}),
+            )
+            await self._tlog_append(
+                conn, {"kind": "takedown", "plugin_id": plugin_id, "reason": reason, "at": _now()}
+            )
+            tenant = await self._mkt_tenant(conn, required=False)
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.listing.taken_down", "plugin", plugin_id,
+                {"reason": reason},
+            )
+        return {"plugin_id": plugin_id, "status": "taken_down", "installs_revoked": revoked}
+
+    # ---------------------------------------------------------------- installs
+
+    async def _verify_install_material(self, conn: Any, row: Any) -> dict[str, Any]:
+        if row["key_revoked_at"] is not None:
+            raise MarketplaceForbidden("the signing key of this revision has been revoked")
+        signature = _load(row["signature"])
+        try:
+            signing.verify(
+                bytes(row["public_key"]),
+                signature,
+                artifact_digest=row["digest"],
+                manifest=_load(row["manifest_raw"]),
+                provenance=_load(row["provenance"]),
+            )
+        except signing.SignatureError as exc:
+            raise MarketplaceConflict(f"stored signature no longer verifies: {exc}") from exc
+        entry = await conn.fetchval(
+            "SELECT entry FROM marketplace_transparency_log WHERE seq = $1", row["tlog_seq"]
+        )
+        leaves = await self._tlog_leaves(conn)
+        proof = tlog.proof_document(row["tlog_seq"], entry, leaves)
+        logged = json.loads(entry)
+        if not tlog.verify_proof_document(proof) or logged.get("artifact_digest") != row["digest"] \
+                or logged.get("signature") != signature.get("sig"):
+            raise MarketplaceConflict("transparency log inclusion check failed")
+        return {"tree_size": proof["tree_size"], "root_hash": proof["root_hash"], "seq": proof["seq"]}
+
+    async def mkt_consent(
+        self, *, plugin_id: str, version: str | None, allowed_tiers: tuple[str, ...], actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, Actor())
+            row = await self._resolve_revision(conn, listing, version, owner=False)
+            current = await conn.fetchrow(
+                "SELECT version, digest, consent FROM marketplace_installations "
+                "WHERE listing_id = $1 AND status = 'active'",
+                listing["listing_id"],
+            )
+        return self._consent_document(listing, row, current, allowed_tiers)
+
+    @staticmethod
+    def _consent_document(
+        listing: Any, row: Any, current: Any, allowed_tiers: tuple[str, ...]
+    ) -> dict[str, Any]:
+        permissions = _load(row["permissions"])
+        material = consent_material(
+            listing_id=listing["plugin_id"], version=row["version"], digest=row["digest"],
+            permissions=permissions,
+        )
+        previous = _load(current["consent"])["permissions"] if current else None
+        diff = permission_diff(previous, permissions)
+        return {
+            **material,
+            "tier": row["tier"],
+            "tier_allowed": row["tier"] in allowed_tiers,
+            "allowed_tiers": list(allowed_tiers),
+            "installed_version": current["version"] if current else None,
+            "diff": diff,
+            "requires_consent": current is None or diff["expands"],
+        }
+
+    async def mkt_install(
+        self,
+        *,
+        plugin_id: str,
+        version: str | None,
+        consent_digest: str | None,
+        allowed_tiers: tuple[str, ...] = DEFAULT_ALLOWED_TIERS,
+        actor: Actor,
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            tenant = await self._mkt_tenant(conn)
+            listing = await self._visible_listing(conn, plugin_id, Actor())
+            row = await self._resolve_revision(conn, listing, version, owner=False)
+            if row["yanked_at"] is not None:
+                raise MarketplaceConflict(f"{plugin_id}@{row['version']} is yanked")
+            if row["review_state"] != "approved":
+                raise MarketplaceConflict(f"{plugin_id}@{row['version']} is not approved")
+            current = await conn.fetchrow(
+                "SELECT * FROM marketplace_installations WHERE listing_id = $1 AND status = 'active' "
+                "FOR UPDATE",
+                listing["listing_id"],
+            )
+            document = self._consent_document(listing, row, current, allowed_tiers)
+            if not document["tier_allowed"]:
+                raise MarketplaceForbidden(
+                    f"tenant policy does not allow '{row['tier']}' tier plugins",
+                    details={"allowed_tiers": list(allowed_tiers)},
+                )
+            if current is not None and current["digest"] == row["digest"]:
+                return self._installation_out(current)
+            if consent_digest != document["consent_digest"] and (
+                document["requires_consent"] or consent_digest is not None
+            ):
+                raise MarketplaceConflict(
+                    "explicit consent required: re-submit with consent_digest from the consent document",
+                    details=document,
+                )
+            verification = await self._verify_install_material(conn, row)
+            if current is not None:
+                await conn.execute(
+                    "UPDATE marketplace_installations SET status = 'uninstalled', "
+                    "status_reason = 'replaced', updated_at = now() WHERE installation_id = $1",
+                    current["installation_id"],
+                )
+            else:
+                await conn.execute(
+                    "UPDATE marketplace_listings SET install_count = install_count + 1 "
+                    "WHERE listing_id = $1",
+                    listing["listing_id"],
+                )
+            consent = {
+                key: document[key] for key in ("listing_id", "version", "digest", "permissions")
+            }
+            consent["consented_at"] = _now()
+            consent["verification"] = verification
+            installed = await conn.fetchrow(
+                """
+                INSERT INTO marketplace_installations (
+                    installation_id, tenant_id, listing_id, revision_id, plugin_id, version,
+                    digest, consent, consent_digest, installed_by
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10) RETURNING *
+                """,
+                uuid4(),
+                tenant,
+                listing["listing_id"],
+                row["revision_id"],
+                plugin_id,
+                row["version"],
+                row["digest"],
+                _json(consent),
+                document["consent_digest"],
+                actor.principal_uuid,
+            )
+            await self._mkt_audit(
+                conn, tenant, actor,
+                "marketplace.install.upgraded" if current else "marketplace.install.created",
+                "plugin", f"{plugin_id}@{row['version']}",
+                {"digest": row["digest"], "consent_digest": document["consent_digest"]},
+            )
+        return self._installation_out(installed)
+
+    @staticmethod
+    def _installation_out(row: Any) -> dict[str, Any]:
+        consent = _load(row["consent"])
+        return {
+            "installation_id": str(row["installation_id"]),
+            "plugin_id": row["plugin_id"],
+            "version": row["version"],
+            "digest": row["digest"],
+            "status": row["status"],
+            "status_reason": row["status_reason"],
+            "consent_digest": row["consent_digest"],
+            "permissions": consent.get("permissions"),
+            "installed_at": _iso(row["installed_at"]),
+            "updated_at": _iso(row["updated_at"]),
+        }
+
+    async def mkt_list_installations(self, *, include_inactive: bool) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM marketplace_installations WHERE ($1 OR status = 'active') "
+                "ORDER BY plugin_id, installed_at DESC",
+                include_inactive,
+            )
+        return [self._installation_out(row) for row in rows]
+
+    async def mkt_uninstall(self, *, plugin_id: str, actor: Actor) -> dict[str, Any]:
+        async with self.connection() as conn:
+            tenant = await self._mkt_tenant(conn)
+            row = await conn.fetchrow(
+                "UPDATE marketplace_installations SET status = 'uninstalled', "
+                "status_reason = 'uninstalled', updated_at = now() "
+                "WHERE plugin_id = $1 AND status = 'active' RETURNING *",
+                plugin_id,
+            )
+            if row is None:
+                raise MarketplaceNotFound(f"{plugin_id} is not installed")
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.install.removed", "plugin", plugin_id,
+                {"digest": row["digest"]},
+            )
+        return self._installation_out(row)
+
+    async def mkt_installed_digests(self) -> dict[str, str]:
+        """Active installs pinned by digest (``plugin_id -> sha256``) for runtime loaders."""
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT plugin_id, digest FROM marketplace_installations WHERE status = 'active'"
+            )
+        return {row["plugin_id"]: row["digest"] for row in rows}
+
+    # ----------------------------------------------------------- notifications
+
+    async def mkt_notifications(self, *, include_acknowledged: bool) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM marketplace_notifications "
+                "WHERE ($1 OR acknowledged_at IS NULL) ORDER BY created_at DESC LIMIT 200",
+                include_acknowledged,
+            )
+        return [
+            {
+                "notification_id": str(row["notification_id"]),
+                "kind": row["kind"],
+                "plugin_id": row["plugin_id"],
+                "version": row["version"],
+                "details": _load(row["details"]),
+                "created_at": _iso(row["created_at"]),
+                "acknowledged_at": _iso(row["acknowledged_at"]),
+            }
+            for row in rows
+        ]
+
+    async def mkt_ack_notification(self, notification_id: str) -> None:
+        async with self.connection() as conn:
+            done = await conn.fetchval(
+                "UPDATE marketplace_notifications SET acknowledged_at = now() "
+                "WHERE notification_id = $1 AND acknowledged_at IS NULL RETURNING 1",
+                UUID(notification_id),
+            )
+        if done is None:
+            raise MarketplaceNotFound("notification not found or already acknowledged")
+
+    # ----------------------------------------------------------- abuse reports
+
+    async def mkt_report(
+        self, *, plugin_id: str, version: str | None, reason: str, details: str, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            listing = await self._visible_listing(conn, plugin_id, actor)
+            tenant = await self._mkt_tenant(conn, required=False)
+            report_id = uuid4()
+            await conn.execute(
+                """
+                INSERT INTO marketplace_abuse_reports (
+                    report_id, listing_id, version, reporter_tenant_id, reporter_principal_id,
+                    reason, details
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                report_id,
+                listing["listing_id"],
+                version,
+                tenant,
+                actor.principal_uuid,
+                reason,
+                details,
+            )
+            await self._mkt_audit(
+                conn, tenant, actor, "marketplace.report.created", "plugin", plugin_id,
+                {"reason": reason, "report_id": str(report_id)},
+            )
+        return {"report_id": str(report_id), "status": "open"}
+
+    async def mkt_list_reports(self, *, status: str) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT a.*, l.plugin_id FROM marketplace_abuse_reports a "
+                "JOIN marketplace_listings l USING (listing_id) WHERE a.status = $1 "
+                "ORDER BY a.created_at LIMIT 200",
+                status,
+            )
+        return [
+            {
+                "report_id": str(row["report_id"]),
+                "plugin_id": row["plugin_id"],
+                "version": row["version"],
+                "reason": row["reason"],
+                "details": row["details"],
+                "status": row["status"],
+                "resolution": row["resolution"],
+                "created_at": _iso(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    async def mkt_resolve_report(
+        self, *, report_id: str, action: str, note: str, actor: Actor
+    ) -> dict[str, Any]:
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT a.*, l.plugin_id FROM marketplace_abuse_reports a "
+                "JOIN marketplace_listings l USING (listing_id) "
+                "WHERE report_id = $1 AND a.status = 'open' FOR UPDATE",
+                UUID(report_id),
+            )
+            if row is None:
+                raise MarketplaceNotFound("open report not found")
+            await conn.execute(
+                "UPDATE marketplace_abuse_reports SET status = $2, resolution = $3, "
+                "resolved_by = $4, resolved_at = now() WHERE report_id = $1",
+                row["report_id"],
+                "dismissed" if action == "dismiss" else "actioned",
+                f"{action}: {note}",
+                actor.principal_uuid,
+            )
+        result: dict[str, Any] = {"report_id": report_id, "action": action}
+        if action == "takedown":
+            result["takedown"] = await self.mkt_takedown(
+                plugin_id=row["plugin_id"], reason=f"abuse report {report_id}: {note}", actor=actor
+            )
+        elif action == "yank":
+            if not row["version"]:
+                raise MarketplaceInvalid("report has no version to yank")
+            result["yank"] = await self.mkt_yank(
+                plugin_id=row["plugin_id"], version=row["version"],
+                reason=f"abuse report {report_id}: {note}", actor=actor,
+            )
+        return result
+
+    # ------------------------------------------------------ transparency log
+
+    async def mkt_tlog_checkpoint(self) -> dict[str, Any]:
+        async with self.connection() as conn:
+            leaves = await self._tlog_leaves(conn)
+            head = await conn.fetchval(
+                "SELECT chain_hash FROM marketplace_transparency_log ORDER BY seq DESC LIMIT 1"
+            )
+        return {
+            "tree_size": len(leaves),
+            "root_hash": tlog.merkle_root(leaves).hex(),
+            "chain_head": bytes(head).hex() if head else tlog.ZERO_HASH.hex(),
+        }
+
+    async def mkt_tlog_proof(self, seq: int) -> dict[str, Any]:
+        async with self.connection() as conn:
+            entry = await conn.fetchval(
+                "SELECT entry FROM marketplace_transparency_log WHERE seq = $1", seq
+            )
+            if entry is None:
+                raise MarketplaceNotFound("log entry not found")
+            leaves = await self._tlog_leaves(conn)
+        return tlog.proof_document(seq, entry, leaves)
+
+    async def maintenance_marketplace(self) -> dict[str, int]:
+        """Re-verifies the transparency log hash chain over the most recent entries."""
+        try:
+            async with self.connection() as conn:
+                rows = await conn.fetch(
+                    "SELECT seq, entry, leaf_hash, chain_hash FROM marketplace_transparency_log "
+                    "WHERE seq > (SELECT COALESCE(max(seq), 0) FROM marketplace_transparency_log) - $1 "
+                    "ORDER BY seq",
+                    TLOG_VERIFY_WINDOW + 1,
+                )
+        except Exception:  # noqa: BLE001 - table missing on an older schema; nothing to check
+            return {}
+        if len(rows) < 2:
+            return {"tlog_checked": len(rows), "tlog_breaks": 0}
+        breaks = sum(
+            1 for row in rows if tlog.leaf_hash(row["entry"].encode("utf-8")) != bytes(row["leaf_hash"])
+        )
+        breaks += tlog.verify_chain(
+            [(bytes(row["leaf_hash"]), bytes(row["chain_hash"])) for row in rows[1:]],
+            previous=bytes(rows[0]["chain_hash"]),
+        )
+        return {"tlog_checked": len(rows) - 1, "tlog_breaks": breaks}

@@ -16,6 +16,14 @@ import redis.asyncio as aioredis
 from app.core.config import settings
 from app.core.database_context import tenant_context
 from app.core.secret_vault import decrypt_secrets, encrypt_secrets
+from app.core.areas import (
+    access as _access,
+    agent_mesh as _agent_mesh,
+    artifacts as _artifacts,
+    isolation as _isolation,
+    marketplace as _marketplace,
+    operations as _operations,
+)
 from app.core.workflow import (
     Effects,
     IdempotencyConflictError,
@@ -96,6 +104,12 @@ RLS_TABLES = (
     "workspaces",
     "workspace_entry_versions",
     "agent_cards",
+    *_isolation.RLS_TABLES,
+    *_access.RLS_TABLES,
+    *_artifacts.RLS_TABLES,
+    *_operations.RLS_TABLES,
+    *_marketplace.RLS_TABLES,
+    *_agent_mesh.RLS_TABLES,
 )
 
 
@@ -103,7 +117,15 @@ class _AdmissionRace(Exception):
     pass
 
 
-class DistributedStore(WorkflowMixin):
+class DistributedStore(
+    WorkflowMixin,
+    _isolation.IsolationStore,
+    _access.AccessStore,
+    _artifacts.ArtifactStore,
+    _operations.OperationsStore,
+    _marketplace.MarketplaceStore,
+    _agent_mesh.AgentMeshStore,
+):
     def __init__(self) -> None:
         self.pg_pool: asyncpg.Pool | None = None
         self.redis: aioredis.Redis | None = None

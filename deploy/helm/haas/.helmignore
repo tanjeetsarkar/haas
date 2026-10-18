@@ -1,0 +1,6 @@
+.git/
+*.swp
+*.bak
+*.tmp
+*.orig
+values-*.local.yaml

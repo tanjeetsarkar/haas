@@ -8,6 +8,96 @@ Chat, Runs, identity/profile switching, and the role-aware Admin workspace are t
 increments of the [terminal experience design](design/tui-experience.md). Marketplace,
 multi-agent and production-operations controls remain future roadmap work.
 
+## TUI ↔ Harness Service Architecture
+
+The TUI is a **client application** that connects to the HaaS service over standard APIs.
+It does not run agents locally—all agent execution happens in the HaaS service.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              TUI (haas-chat)                                │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐  │
+│  │ Chat    │  │ Runs    │  │Approvals│  │ Admin   │  │ Profile/Identity│  │
+│  │ Workspace│ │Workspace│ │Workspace│ │Workspace│  │ Management      │  │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────────┬────────┘  │
+└───────┼────────────┼────────────┼────────────┼────────────────┼───────────┘
+        │            │            │            │                │
+        ▼            ▼            ▼            ▼                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           HaaS Service (REST + SSE)                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ /v1/runs     │  │ /v1/threads  │  │ /v1/agents   │  │ /v1/admin/*    │  │
+│  │ /v1/plugins  │  │ /v1/policy   │  │ /v1/approvals│  │ /v1/audit      │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───────┬────────┘  │
+└─────────┼─────────────────┼─────────────────┼──────────────────┼───────────┘
+          │                 │                 │                  │
+          ▼                 ▼                 ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        HaaS Service Internals                               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐   │
+│  │ API Gateway │  │ Orchestrator│  │ Tool Workers│  │ PostgreSQL +     │   │
+│  │ (FastAPI)   │  │ (Celery)    │  │ (Celery)    │  │ Redis (state)    │   │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Communication Channels
+
+| Channel | Protocol | Purpose |
+|---------|----------|---------|
+| **REST API** | HTTPS/HTTP | Run submission, thread management, agent revisions, plugin catalog, admin operations |
+| **SSE Stream** | `text/event-stream` | Real-time run events (`run_queued`, `step_started`, `tool_dispatched`, `tool_result`, `run_completed`, `run_error`, `hitl_pending`, `approval_expired`) |
+| **Output Deltas** | SSE (`run.output.delta`) | Advisory live tool output preview (when server advertises `output-deltas.v1`) |
+| **Webhooks** | HTTPS POST | Terminal callbacks on run completion (configured in tenant policy) |
+| **OpenAI-compatible** | HTTPS | `/v1/chat/completions`, `/v1/responses`, `/v1/models` with `model="agent/<name>"` |
+
+### Authentication Flow
+
+```
+1. TUI starts → connects to API base URL (--url / HAAS_URL)
+2. User runs /login → provides API key or OIDC bearer token
+3. TUI calls GET /v1/me → server verifies credential, returns:
+   - tenant_id, principal_id, roles (tenant_admin, submitter, approver, auditor)
+   - capabilities (actions, event_schemas, features)
+   - environment (dev/staging/prod)
+4. TUI caches identity → enables role-gated workspaces (Admin, Approvals)
+5. All subsequent requests include Authorization: Bearer <token>
+```
+
+### Run Lifecycle in TUI
+
+```
+User types prompt
+       │
+       ▼
+┌──────────────────┐
+│ POST /v1/runs    │  ← prompt, secrets, preload_skills, model overrides, budgets
+│ (async, 202)     │
+└────────┬─────────┘
+         │ run_id returned
+         ▼
+┌──────────────────┐
+│ GET /v1/runs/    │  ← SSE stream with Last-Event-ID resume
+│ {run_id}/stream  │
+└────────┬─────────┘
+         │
+         ▼
+    Events flow:
+    run_queued → step_started → tool_dispatched → tool_result → ...
+         │                              │
+         │                    (if approval needed)
+         │                              ▼
+         │                    hitl_pending → TUI shows approval dialog
+         │                              │
+         │                    User approves/rejects
+         │                              │
+         ▼                              ▼
+    run_completed ←────────────────── resume with decision
+         │
+         ▼
+    TUI shows final Markdown answer + run footer (steps, cost, cached tokens)
+```
+
 * [1. Start it](#1-start-it)
 * [2. The screen](#2-the-screen)
 * [3. Keyboard](#3-keyboard)
@@ -48,6 +138,23 @@ HAAS_SECRET_GITHUB_TOKEN=ghp_xxx haas-chat --preload github-ops
 
 If the API is down you still get the UI, with a red banner. Start the stack, then send any message to retry.
 
+### Production Connection
+
+For production HaaS deployments:
+
+```bash
+# Using a saved profile (recommended)
+haas profile add prod --url https://haas.example.com --tenant my-tenant --environment prod
+haas chat --profile prod
+# Then /login with your API key or OIDC token
+
+# Or direct connection
+haas-chat --url https://haas.example.com --tenant my-tenant
+# Then /login
+```
+
+**Important**: Production requires HTTPS, verified OIDC/API key authentication, and an active tenant policy revision. The TUI will show `PRODUCTION` in the top bar when connected to a production environment.
+
 ## 2. The screen
 
 ```
@@ -72,12 +179,13 @@ If the API is down you still get the UI, with a red banner. Start the stack, the
 
 | Area | What it tells you |
 |---|---|
-| **Status bar (6)** | `thread` id (copy it to resume later), `idle` or `step N`, **cumulative cost** of this conversation, skills the agent has active, your preloaded skills, number of secrets set (names only; never values) |
-| **Tool cards** | `⏺` dispatched/running, `✔` succeeded, `✘` failed (red). The preview is the first ~140 chars of the tool output. A failed tool is normal: the agent reads the error and usually retries |
-| **Dim `· step N` lines** | One per LLM step: which model ran and which skills were active |
-| **Run footer `✓ done`** | Steps used, USD cost of that run, cached prompt tokens |
-| **Runs** | Tenant-scoped cursor-paginated run list with status, thread, steps and cost. Select a run to attach or, for running/paused runs, request cancellation |
-| **Admin** | Appears for a verified tenant administrator or auditor. Admins can manage memberships, API keys and policy, inspect scoped plugins and audit events; auditors can read audit events only |
+| **Top bar (1)** | Connection status (green=healthy, red=down, yellow=unknown), environment badge (DEV/STAGING/**PRODUCTION**), profile name, API endpoint, tenant, authenticated principal (first 8 chars), roles |
+| **Navigation tabs** | Chat (Ctrl+1), Runs (Ctrl+2), Approvals (Ctrl+4), Admin (Ctrl+3, role-gated), Help |
+| **Chat log (2)** | User messages (bold), agent Markdown answers (green bar), tool cards, step lines, run footers, command output, notes |
+| **Activity line (3)** | Spinner + current phase (submitting, queued, step N, waiting for approval, running tools, cancelling, recovering) |
+| **Command hints (4)** | Slash command completions as you type `/` |
+| **Prompt box (5)** | Multiline input (Ctrl+J / Shift+Enter for newlines), Tab completion, history (↑/↓) |
+| **Status bar (6)** | Thread ID, run state (idle/step N), cumulative session cost, active skills, preloaded skills, secret count |
 
 ## 3. Keyboard
 
@@ -120,35 +228,32 @@ Type `/` to open the suggestion list under the prompt (command name + descriptio
   `/secret` → `set` / `list` / `unset`, and `/secret unset` → the names of secrets you have set.
 * Skill names come from the server (cached after the first connect, `/skills` or `/preload`).
 
-| Command | What it does |
-|---|---|
-| `/help` | List commands |
-| `/login` · `/logout` | Sign in with a bearer credential (memory only) / clear it |
-| `/tenant [id]` · `/profile [name]` | Verify and switch tenant / saved environment profile |
-| `/status` | API URL + health, tenant, thread, models, limits, preload list, secret **names**, total cost |
-| `/admin` | Open the role-authorized Admin/audit workspace |
-| `/approve <run-id>` | Review a known pending approval as a verified approver |
-| `/approvals [STATUS]` | Approval inbox: pending (default), approved, rejected, expired, all |
-| `/inspect [run-id]` | Run inspector: state, budget, steps, tool invocations and usage |
-| `/events [run-id] [after] [type=TEXT]` | Page or search (by event type) the durable, replayable run event log |
-| `/live [on\|off]` | Advisory live token preview when the server advertises `run.output.delta`; the final output always replaces it |
-| `/skills` | Installed skills with description, tools and the secrets each may read |
-| `/tools` | Registered tools and queue; `⚠` marks tools that need your approval |
-| `/preload <skill> […]` | Skills activated before the first step of every run. `/preload clear` empties the list; `/preload` shows it |
-| `/secret set NAME VALUE` | Set a per-run secret (memory only). `/secret list` (masked), `/secret unset NAME` |
-| `/model <name>` · `/planner <name>` | Override the primary / planner (step 1 and error recovery) model. `default` resets |
-| `/steps N` | Max LLM steps per run (1–50; server default 15) |
-| `/budget USD` | Max cost per run (above 0, up to 10; server default 0.30) |
-| `/thread [id]` | Show the current thread id, or switch to another one |
-| `/agents [next]` | Browse tenant agent revisions with cursor paging |
-| `/agent draft` | Tenant-admin structured JSON form for a new immutable draft |
-| `/agent show ID` · `/agent validate ID` · `/agent publish ID` | Inspect or advance a revision; validation/publication require tenant-admin authority |
-| `/agent diff ID ID` · `/agent use ID` · `/agent clear` | Compare configuration/policy/registry, pin a published revision, or return to request-level configuration |
-| `/threads [search]` · `/threads next` | Browse/search tenant thread IDs; subsequent pages retain the search |
-| `/history [offset]` · `/branch VERSION` | Browse version-pinned committed messages or explicitly fork the current committed version |
-| `/new` | New conversation: new thread, cost counter reset (settings and secrets are kept) |
-| `/clear` | Clear the screen only |
-| `/quit` | Exit (`/exit`, `/q` also work) |
+| Command | What it does | API Calls |
+|---|---|---|
+| `/help` | List commands | — |
+| `/login` · `/logout` | Sign in with a bearer credential (memory only) / clear it | `GET /v1/me` |
+| `/tenant [id]` · `/profile [name]` | Verify and switch tenant / saved environment profile | `GET /v1/me` (verify), profile local |
+| `/status` | API URL + health, tenant, thread, models, limits, preload list, secret **names**, total cost | `GET /v1/me`, `GET /v1/plugins` |
+| `/admin` | Open the role-authorized Admin/audit workspace | — |
+| `/approve <run-id>` | Review a known pending approval as a verified approver | `GET /v1/approvals/{run_id}`, `POST /v1/runs/{run_id}/resume` |
+| `/approvals [STATUS]` | Approval inbox: pending (default), approved, rejected, expired, all | `GET /v1/approvals` |
+| `/inspect [run-id]` | Run inspector: state, budget, steps, tool invocations and usage | `GET /v1/runs/{run_id}`, `GET /v1/runs/{run_id}/inspect` |
+| `/events [run-id] [after] [type=TEXT]` | Page or search (by event type) the durable, replayable run event log | `GET /v1/runs/{run_id}/events` |
+| `/live [on\|off]` | Advisory live token preview when the server advertises `output-deltas.v1` | SSE `run.output.delta` |
+| `/skills` | List installed skills with descriptions and declared secrets | `GET /v1/plugins` |
+| `/preload [skill...]` | Set/clear skills active from the first message | Sent with `POST /v1/runs` |
+| `/secret set NAME VALUE` · `/secret list` · `/secret unset NAME` | Per-run secrets in memory only | Sent with `POST /v1/runs` |
+| `/model <model-id>` · `/planner <model-id>` | Override primary/planner model for this run | Sent with `POST /v1/runs` |
+| `/steps <N>` · `/budget <USD>` | Override step/cost limits for this run | Sent with `POST /v1/runs` |
+| `/agent draft` | Create immutable agent draft (JSON form, tenant_admin) | `POST /v1/agents/draft` |
+| `/agent show <id>` · `/agent validate <id>` · `/agent publish <id>` | Inspect, validate, publish agent revision | `GET/POST /v1/agents/{id}/validate`, `POST /v1/agents/{id}/publish` |
+| `/agent use <id>` · `/agent clear` | Pin/clear agent revision for subsequent runs | Local state |
+| `/agent diff <id1> <id2>` | Compare configuration, policy permissions, registry fingerprint | `GET /v1/agents/{id1}/diff/{id2}` |
+| `/agents` | List agent revisions with status | `GET /v1/agents` |
+| `/threads [search]` · `/threads next` | Search/select thread (cursor-paginated) | `GET /v1/threads` |
+| `/history [offset]` | Refresh/browse committed thread history at captured version | `GET /v1/threads/{id}/history` |
+| `/branch <version>` | Branch from committed snapshot at exact version | `POST /v1/threads/{id}/branch` |
+| `/new` · `/clear` · `/quit` | New thread, clear screen, exit | Local |
 
 ## Identity and tenant administration
 
@@ -164,6 +269,21 @@ through audit events. Auditors receive audit-read access but do not see mutation
 Every operation is still authorized by the API; a hidden button is only a usability aid.
 Human membership grants need a configured OIDC issuer. An API key created in the TUI is
 shown once in the result panel and is not saved; copy it securely before leaving the view.
+
+### Admin Workspace Operations
+
+| Button | Action | Required Role | API Endpoint |
+|---|---|---|---|
+| List members | List all tenant memberships | tenant_admin, auditor | `GET /v1/admin/memberships` |
+| Grant member | Add principal with role | tenant_admin | `POST /v1/admin/memberships` |
+| Revoke member | Remove principal role | tenant_admin | `DELETE /v1/admin/memberships/{principal_id}/{role}` |
+| List API keys | List tenant API keys (hashed) | tenant_admin | `GET /v1/admin/api-keys` |
+| Create API key | Generate new API key (shown once) | tenant_admin | `POST /v1/admin/api-keys` |
+| Revoke API key | Revoke key by prefix | tenant_admin | `DELETE /v1/admin/api-keys/{key_prefix}` |
+| View policy | Show active policy revision | tenant_admin, auditor | `GET /v1/admin/policy` |
+| Activate policy | Activate a policy revision (JSON form) | tenant_admin | `POST /v1/admin/policy/activate` |
+| Scoped plugins | List tenant-scoped plugin catalog | tenant_admin | `GET /v1/admin/plugins` |
+| Audit events | Page audit events (cursor-paginated) | tenant_admin, auditor | `GET /v1/admin/audit` |
 
 ## Agent revisions and thread history
 
@@ -262,6 +382,14 @@ their own. The run pauses and a dialog opens:
 * Read the JSON arguments: they are exactly what will be executed. Several tools in one batch are approved or
   rejected together.
 
+### Approval Security Model
+
+- **Exact batch digest**: Decisions are bound to the SHA-256 digest of the exact pending tool calls, run state version, and expiry
+- **No self-approval**: The API rejects approval from the same principal that submitted the run
+- **Attributed decisions**: Every decision records the actor principal, reason, and request ID
+- **Single winner**: CAS on approval batch prevents race conditions
+- **Expiry**: Batches expire; expired batches cannot be decided
+
 ## 6. Secrets
 
 Skills declare which secrets their tools may read (`/skills` shows them). Supply values in either way:
@@ -278,25 +406,50 @@ Secrets are kept in the TUI process memory, sent with each run request, never wr
 list`, never shown in the chat, and omitted from the input history. The server only releases a secret to tools of an
 **active** skill that lists it. Remember: the value travels in the request body, so use HTTPS/a trusted network if the API is remote.
 
+### Secret Flow
+
+```
+TUI: /secret set GITHUB_TOKEN ghp_xxx
+       │
+       ▼
+TUI stores in memory (never disk)
+       │
+       ▼
+User sends prompt
+       │
+       ▼
+POST /v1/runs { ..., "secrets": {"GITHUB_TOKEN": "ghp_xxx"} }
+       │
+       ▼
+API validates: secret declared by active skill?
+       │
+       ▼
+Orchestrator includes secret in tool task envelope (signed)
+       │
+       ▼
+Tool worker verifies envelope, unlocks secret for tool handler only
+       │
+       ▼
+Tool executes with secret → result returned (secret never in output)
+```
+
 ## 7. Skills: preload vs automatic
 
 Normally the agent sees a catalogue of skill descriptions and decides to activate one. Smaller/cheaper models sometimes
-just chat instead. **`/preload <skill>` (or `--preload`) guarantees the skill is active from step 1** and is the most
-reliable way to use a specific skill. Name the tool or the task explicitly in your prompt for best results.
+just need a nudge. `/preload skill1,skill2` (or `--preload` at launch) activates those skills for every step of the run,
+bypassing the model's skill-selection logic. Preloaded skills still respect the tenant policy allowlist and secret
+declarations. Use `/preload clear` to return to automatic selection.
 
 ## 8. Recipes for the sample skills
 
-Run `/skills` first to see what the server has installed. Replace the examples with your own data.
-
-| Skill | Setup | Try |
-|---|---|---|
-| `weather` | `/preload weather` | `Weather in Pune for the next 3 days, in °C` |
-| `web-research` | `/preload web-research` (+ `HAAS_SECRET_BRAVE_API_KEY` for search) | `Read https://example.com and summarise it with a link` · `Compare the latest Postgres and MySQL release notes` |
-| `github-ops` | `HAAS_SECRET_GITHUB_TOKEN=…`, `/preload github-ops` | `List open bugs in owner/repo` · `Is PR 42 in owner/repo ready to merge? check CI` · `File an issue about X in owner/repo` (→ approval) |
-| `incident-triage` | `/preload incident-triage` | Paste logs (`Ctrl+J` for newlines or paste) + `40% of users can't check out, no workaround. Triage.` |
-| `data-analyst` | `/preload data-analyst` | Paste a CSV, then `Profile it and show revenue by region` or give a URL: `Load https://…/data.csv as sales` |
-| `plugin-creator` | `/preload plugin-creator` | `Draft a skill + tool that looks up customers in our CRM REST API` |
-| `revenue-ops` (demo) | `HAAS_SECRET_ANALYTICS_DB_PATH=/tmp/demo.db HAAS_SECRET_BILLING_WEBHOOK_SECRET=x`, `/preload revenue-ops` | `Investigate Q3 revenue anomalies and prepare a refund` (→ two approvals) |
+| Skill | Tools | Secrets | Example prompt |
+|---|---|---|---|
+| `weather` | `get_weather_forecast` | — | "Weather in Tokyo today?" |
+| `github-ops` | `github_create_issue`, `github_add_comment`, `github_list_issues` | `GITHUB_TOKEN` | "File a bug for the login crash in my/app" |
+| `web-research` | `web_search`, `fetch_url` | `BRAVE_API_KEY` | "Find recent papers on RAG evaluation" |
+| `data-analyst` | `sql_query`, `python_exec`, `load_csv` | `ANALYTICS_DB_PATH` | "Load sales.csv and show Q3 trends" |
+| `incident-triage` | `create_incident`, `add_timeline_entry`, `generate_postmortem` | — | "Start incident for API 5xx spike" |
+| `revenue-ops` | `prepare_refund_batch`, `verify_refund_batch` | `BILLING_WEBHOOK_SECRET` | "Prepare refund batch for order #12345" |
 
 Follow-ups work in the same thread: after loading a CSV just ask the next question.
 
@@ -343,6 +496,9 @@ Without `--auto-approve` it asks `approve? [y/N]` on the terminal at each gate.
 | `Run failed: … 401` from OpenRouter | `OPENROUTER_API_KEY` in `.env` is invalid; fix and restart the development Compose stack |
 | `409 Resume already in progress` | Another operator answered the same approval; nothing to do |
 | Broken characters/boxes | Use a UTF-8 terminal with a modern font; `export TERM=xterm-256color` |
+| `403 Forbidden` on admin commands | Identity lacks `tenant_admin` or `auditor` role; check `/status` for roles |
+| `409 approval_required` on OpenAI-compatible API | Run has pending approval; use TUI or `POST /v1/runs/{id}/resume` to decide |
+| SSE reconnects frequently | Check network latency; server may be under load; check `haas dev status` |
 
 ## 12. Behaviour to know about
 
@@ -360,3 +516,7 @@ Without `--auto-approve` it asks `approve? [y/N]` on the terminal at each gate.
 * **Reconnects:** if the event stream drops, the client resumes from the last event id (up to 5 attempts).
 * **Unauthenticated dev tenancy uses the header only as a local selector.** Authenticated
   profiles verify tenant membership with the server; production does not trust header-only identity.
+* **Output deltas are advisory.** The final `run_completed` event from the durable log is authoritative.
+  Live previews may be truncated; the final answer replaces them.
+* **Thread version conflicts:** If `/history` or `/branch` reports a version mismatch, another run
+  committed first. Refresh with `/history` and retry.

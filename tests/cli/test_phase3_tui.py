@@ -333,3 +333,4 @@ async def test_tui_attached_approval_shows_digest_binding(monkeypatch):
             ApprovalBinding(BATCH_ID, BATCH_DIGEST, "2030-01-01T00:00:00+00:00")
         ]
         assert fake.resumes[0]["batch_id"] == BATCH_ID
+        await app.workers.wait_for_complete()

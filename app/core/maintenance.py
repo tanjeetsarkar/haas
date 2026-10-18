@@ -38,6 +38,17 @@ async def maintenance_cycle(
 ) -> dict[str, int]:
     counts = await store.reconcile()
     counts["outbox_relayed"] = await store.relay_outbox(limit=500)
+    for area in (
+        "isolation",
+        "access",
+        "artifacts",
+        "operations",
+        "marketplace",
+        "agent_mesh",
+    ):
+        job = getattr(store, f"maintenance_{area}", None)
+        if job is not None:
+            counts.update(await job())
     if collect_garbage:
         counts["removed_scratchpad_files"] = await asyncio.to_thread(
             garbage_collect_scratchpad,

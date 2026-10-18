@@ -76,6 +76,25 @@ extension. It does not add runtime functionality.
 | FR-24 | Provide Python and TypeScript SDKs and a unified CLI with safe defaults | Internal Python client, TUI, `haas-plugin` | SDK conformance suite against mock server; credential hygiene (SEC-26) |
 | FR-25 | Deliver user-facing platform capabilities through a keyboard-first, authorized, recoverable terminal workbench alongside backend milestones | T0/T1 workbench plus command-driven T2 agent/history/branch journeys and capability metadata; durable inspection and later-phase journeys remain targets | Track T journey parity, auth/recovery, safe rendering, terminal/accessibility, performance and compatibility gates (TUI-01..07) |
 
+### TUI-Specific Functional Requirements
+
+| ID | Requirement | Current evidence / gap | Target verification |
+|---|---|---|---|
+| FR-TUI-01 | Keyboard-first chat workspace with multiline composition, Markdown rendering, tool previews | Textual `PromptInput`, `Markdown`, tool cards with status icons | Textual pilot tests; accessibility audit |
+| FR-TUI-02 | Tenant-scoped run browser with cursor pagination, attach/reattach, cooperative cancel | `GET /v1/runs` cursor, SSE stream with `Last-Event-ID`, `POST /v1/runs/{id}/cancel` | E2E run list/attach/cancel; reconnect with cursor |
+| FR-TUI-03 | Approval inbox with batch digest binding, approve/reject/leave-pending, filter by status | `GET /v1/approvals`, `POST /v1/runs/{id}/resume` with `batch_digest` | Decision binding test; expiry/409 handling; filter pagination |
+| FR-TUI-04 | Role-gated Admin workspace (tenant_admin, auditor) for memberships, API keys, policy, audit | `/v1/me` capabilities drive visibility; `/v1/admin/*` endpoints with RBAC | Role matrix test; hidden buttons ≠ authorization bypass |
+| FR-TUI-05 | Verified identity flow: `/login` (API key/OIDC), `/logout`, `/tenant` switch, `/profile` switch | `GET /v1/me` returns principal, roles, capabilities, environment | Auth state machine test; credential never persisted |
+| FR-TUI-06 | Agent revision management: draft (JSON form), validate, publish, diff, use/clear | `POST /v1/agents/draft`, `POST /v1/agents/{id}/validate`, `POST /v1/agents/{id}/publish`, `GET /v1/agents/{id}/diff/{id2}` | Immutable revision test; policy/registry recheck on validate/publish |
+| FR-TUI-07 | Thread history browser with search, pagination, version capture, explicit branch | `GET /v1/threads`, `GET /v1/threads/{id}/history`, `POST /v1/threads/{id}/branch` | Version conflict test; ancestry recording; no arbitrary snapshot reconstruction |
+| FR-TUI-08 | Run inspector: budget (settled/uncertain/reserved), steps, invocations, usage ledger, trace context | `GET /v1/runs/{id}/inspect` | Budget reconciliation test; unknown invocation handling |
+| FR-TUI-09 | Durable event log browser with type filtering and pagination | `GET /v1/runs/{id}/events` with `after`, `type` params | Gap detection test; schema version compatibility |
+| FR-TUI-10 | Output deltas (advisory live preview) with final durable log settlement | SSE `run.output.delta` when server advertises `output-deltas.v1` | Preview truncation test; final output supersedes preview |
+| FR-TUI-11 | Secret management: in-memory only, never persisted, masked in list, omitted from history | `PromptInput` skips `/secret` lines; secrets sent only in run request | No secret in client persistence; secure input mode |
+| FR-TUI-12 | One-shot scripting mode with optional auto-approve | `--once`, `--auto-approve` flags | Non-interactive exit codes; auto-approve server-side enforcement |
+| FR-TUI-13 | Accessibility: ASCII mode, theme cycling, focus navigation, screen reader compatible | `--ascii`, `Ctrl+T`, `F6`, semantic Textual widgets | Accessibility audit; keyboard-only navigation test |
+| FR-TUI-14 | OpenAI-compatible facade access via TUI (model=`agent/<name>`) | `/v1/chat/completions` with HaaS policy enforcement | Facade parity test; approval/budget enforcement |
+
 Proposed availability, latency, recovery and retention objectives are specified in
 [operations](operations-migration.md). They are acceptance targets, not measured results.
 

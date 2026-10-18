@@ -1,0 +1,90 @@
+{{- if .Values.migrations.enabled }}
+{{- $c := .Values.migrations }}
+{{- $name := include "haas.componentName" (dict "root" $ "component" "migrations") }}
+# Runs `alembic upgrade head` as the schema-owner login before install/upgrade.
+# The hook ServiceAccount is created first (lower weight) because pre-install hooks
+# run before regular chart resources exist.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "migrations") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "migrations") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  {{- range $k, $v := .Values.config }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "migrations") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ $c.backoffLimit }}
+  activeDeadlineSeconds: {{ $c.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "haas.labels" (dict "root" $ "component" "migrations") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "haas.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migrations
+          image: {{ include "haas.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml $c.command | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}-config
+          env:
+            - name: HAAS_PROFILE
+              value: {{ .Values.profile | quote }}
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            {{- include "haas.secretEnv" $c.secretEnv | nindent 12 }}
+          securityContext:
+            {{- include "haas.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+{{- end }}

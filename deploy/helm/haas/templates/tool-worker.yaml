@@ -1,0 +1,3 @@
+{{- if .Values.toolWorker.enabled }}
+{{ include "haas.workerDeployment" (dict "root" $ "component" "tool-worker" "c" .Values.toolWorker "nodeName" "tools") }}
+{{- end }}

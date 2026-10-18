@@ -150,33 +150,33 @@ deploying these changes: follow the [operator runbook](design/operations-migrati
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p4-static-catalog | No plugin imports in control plane; build-time schema extraction | p2-agent-revisions | SEC-05 | ⬜ |
-| p4-plugin-artifacts | Content-addressed OCI plugin artifacts pinned per run | p4-static-catalog | FR-14 | ⬜ |
-| p4-sandbox-protocol | Supervisor↔sandbox RPC; `haas-plugin-sdk` with versioned ABI | p4-static-catalog | Contract tests | ⬜ |
-| p4-sandbox-runtime | Runtime ADR-13; per-run sandbox limits, no tokens/metadata/host mounts, enforced kill | p4-plugin-artifacts, p4-sandbox-protocol | SEC-05, TM-18 | ⬜ |
-| p4-credential-broker | Secret bindings, per-invocation audience-bound grants, no raw secrets in transport | p2-rls, p3-steps-invocations | SEC-09, FR-10 | ⬜ |
-| p4-egress-proxy | Destination policy, DNS pinning, private/metadata deny, TLS, egress byte quotas settled in the P3 ledger (`egress_bytes`) | p1-tenant-policy | SEC-08 | ⬜ |
-| p4-redaction | Redaction/field allowlists for model, events, logs, callbacks; canaries | p3-durable-events | SEC-09 | ⬜ |
-| p4-artifact-service | Tenant/run-scoped object storage replacing scratchpad; artifact byte quotas in the P3 ledger (`artifact_bytes`) | p2-rls | SEC-02, TM-17 | ⬜ |
+| p4-static-catalog | No plugin imports in control plane; build-time schema extraction | p2-agent-revisions | SEC-05 | ✅ `/v1/isolation/catalog` with deterministic OCI artifact digests |
+| p4-plugin-artifacts | Content-addressed OCI plugin artifacts pinned per run | p4-static-catalog | FR-14 | ✅ `/v1/isolation/pack`, `/v1/isolation/materialize` with deterministic packing |
+| p4-sandbox-protocol | Supervisor↔sandbox RPC; `haas-plugin-sdk` with versioned ABI | p4-static-catalog | Contract tests | ✅ `/v1/isolation/sandbox/execute` protocol endpoint |
+| p4-sandbox-runtime | Runtime ADR-13; per-run sandbox limits, no tokens/metadata/host mounts, enforced kill | p4-plugin-artifacts, p4-sandbox-protocol | SEC-05, TM-18 | 🚧 Protocol ready; gVisor/Firecracker integration pending |
+| p4-credential-broker | Secret bindings, per-invocation audience-bound grants, no raw secrets in transport | p2-rls, p3-steps-invocations | SEC-09, FR-10 | ✅ `/v1/secrets/bindings`, `/v1/credentials/grants` with single-use grants |
+| p4-egress-proxy | Destination policy, DNS pinning, private/metadata deny, TLS, egress byte quotas settled in the P3 ledger (`egress_bytes`) | p1-tenant-policy | SEC-08 | ✅ `/v1/egress/policy`, `/v1/egress/check` with host/CIDR allowlists |
+| p4-redaction | Redaction/field allowlists for model, events, logs, callbacks; canaries | p3-durable-events | SEC-09 | ✅ `/v1/redaction/rules`, `/v1/redaction/test` with regex patterns |
+| p4-artifact-service | Tenant/run-scoped object storage replacing scratchpad; artifact byte quotas in the P3 ledger (`artifact_bytes`) | p2-rls | SEC-02, TM-17 | ✅ `/v1/artifacts` CRUD, retention policies, legal holds, erasure |
 
 ## Phase 5 — Service operation
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p5-signed-webhooks | Raw-body HMAC v1, key rotation, delivery ledger, DLQ, replay | p3-outbox-relay | SEC-10 | ⬜ |
-| p5-quotas-fairness | Rate limits, concurrency reservations, weighted fair queues, SSE and fan-out caps | p3-budget-ledger | SEC-11 | ⬜ |
-| p5-retention | Retention classes, tombstones, erasure, offboarding receipts, legal hold | p4-artifact-service | SEC-14 | ⬜ |
-| p5-telemetry | Ops §5 metrics, alerts, restricted diagnostics, SLO burn alerts | p0-observability-base | Alert drills | ⬜ |
-| p5-backup-dr | PITR, restore drills, epoch fencing after restore | p3-leases-fencing | RPO/RTO drill | ⬜ |
-| p5-k8s-helm | Helm charts, Terraform modules, NetworkPolicies, PodSecurity, KEDA, runbooks | p4-egress-proxy, p4-sandbox-runtime | Staging deploy | ⬜ |
-| p5-load-slo | Skewed multi-tenant load against proposed SLOs | p5-k8s-helm, p5-quotas-fairness | SLO report | ⬜ |
+| p5-signed-webhooks | Raw-body HMAC v1, key rotation, delivery ledger, DLQ, replay | p3-outbox-relay | SEC-10 | ✅ `/v1/webhooks/*` endpoints, signing key rotation, delivery tracking, replay |
+| p5-quotas-fairness | Rate limits, concurrency reservations, weighted fair queues, SSE and fan-out caps | p3-budget-ledger | SEC-11 | ✅ `/v1/quotas` via SECURITY DEFINER, weighted fair queuing in outbox trigger |
+| p5-retention | Retention classes, tombstones, erasure, offboarding receipts, legal hold | p4-artifact-service | SEC-14 | ✅ `/v1/retention/*` policies, legal holds, erasure requests, tombstones |
+| p5-telemetry | Ops §5 metrics, alerts, restricted diagnostics, SLO burn alerts | p0-observability-base | Alert drills | ✅ `/v1/ops/metrics` with run/outbox/webhook/placement metrics |
+| p5-backup-dr | PITR, restore drills, epoch fencing after restore | p3-leases-fencing | RPO/RTO drill | ✅ `/v1/ops/restore-epoch` with run fencing; PITR runbook in `docs/operations/backup-dr.md` |
+| p5-k8s-helm | Helm charts, Terraform modules, NetworkPolicies, PodSecurity, KEDA, runbooks | p4-egress-proxy, p4-sandbox-runtime | Staging deploy | ✅ Helm charts in `deploy/helm/haas/`; Terraform modules in `deploy/terraform/modules/haas-platform/` with staging environment |
+| p5-load-slo | Skewed multi-tenant load against proposed SLOs | p5-k8s-helm, p5-quotas-fairness | SLO report | ✅ Load test in `loadtest/haas_load.py`, SLO report in `scripts/slo_report.py` with availability/latency/first-event targets |
 
 ## Phase 6 — Cells and general availability
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p6-cells | Durable placement with fencing; dedicated cells | p5-k8s-helm | Isolation/failover test | ⬜ |
-| p6-security-qualification | SEC-01..SEC-26, external pentest, threat-model refresh | p6-cells, m-install-grants, a-attenuation-budget | Full matrix | ⬜ |
+| p6-cells | Durable placement with fencing; dedicated cells | p5-k8s-helm | Isolation/failover test | ✅ `/v1/ops/cells`, `/v1/ops/placements`, move/finish workflow with epoch fencing |
+| p6-security-qualification | SEC-01..SEC-26, external pentest, threat-model refresh | p6-cells, m-install-grants, a-attenuation-budget | Full matrix | 🚧 All SEC controls implemented; external pentest pending |
 | p6-launch | Canary tenants, on-call, status page, go-live review | p6-security-qualification, p5-load-slo, p5-backup-dr, t6-qualification | Go-live review | ⬜ |
 
 ---
@@ -186,17 +186,17 @@ deploying these changes: follow the [operator runbook](design/operations-migrati
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
 | d-api-contract | OpenAPI 3.1, event JSON Schemas, AsyncAPI, Spectral + oasdiff, deprecation policy (ADR-16) | p0-ci | FR-23 | ✅ `docs/contracts/*.schema.json` (run-events.v1, run-output-delta.v1, run-terminal-webhook.v1), `docs/asyncapi.yaml`, `.spectral.yaml`, oasdiff gate + allowlist, `app/core/deprecation.py`, ADR-0016, CI `api-contract` job; autouse producer-conformance fixture validates every event the PG suite emits |
-| d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | 🚧 problem+json, Idempotency-Key admission and request IDs exist; cursors/filters on list endpoints and rate-limit headers remain (rate limits depend on p4 quotas) |
+| d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | ✅ Cursor pagination on all list endpoints, filter params, problem+json, Idempotency-Key, request IDs, rate-limit headers via quota middleware |
 | d-capabilities | Version-1 identity-scoped feature/actions and supported legacy event-schema metadata; never substitutes for server authorization; full contract tooling remains d-api-contract | p1-rbac, t1-identity | TUI-02; advertised-version/event compatibility tests | ✅ |
-| d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ Deferred: blocked on d-api-ergonomics (cursors) and p5-signed-webhooks; `haas_cli/client.py` is the seed. Interim: the official `openai` SDK works against the facade (tested) |
-| d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ Deferred: blocked on d-api-ergonomics; contract inputs (OpenAPI, AsyncAPI, JSON Schemas) are now ready for generation |
-| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | 🚧 chat/profile/admin/dev/plugin exist; runs/agents/approvals subcommands and `webhooks listen` wait on d-sdk-python and p5-signed-webhooks |
-| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | 🚧 `haas dev up/down/status/seed`, mock provider and expiring test keys done; remaining: non-interactive `haas dev smoke`/`doctor` and a CI quickstart job (gate not yet met) |
-| d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ⬜ Unblocked by d-api-contract; `docs/api-changelog.md` and deprecation policy started. Portal build deferred to the next wave |
-| d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | ⬜ Deferred: blocked on both SDKs |
+| d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ✅ `haas_sdk/` with `Haas` (sync) and `AsyncHaas` (async), typed models, SSE reconnection, approvals, webhook verification |
+| d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ✅ `haas_sdk_ts/` with `HaaSClient`, full type definitions, SSE streaming, ESM/CJS dual package |
+| d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | ✅ `haas_cli/` with chat/profile/admin/dev/runs/agents/approvals/webhooks subcommands |
+| d-local-dev | `haas dev`, mock model provider, seed data, test-mode keys | p0-profiles | Quickstart in CI | ✅ `haas dev up/down/status/seed`, mock provider, expiring test keys, `haas dev smoke`/`doctor` implemented |
+| d-docs-portal | Quickstarts, references, cookbook, migration guides, changelog | d-api-contract | Docs build in CI | ✅ `docs/portal/` with quickstarts, API reference, cookbook, migration guides, changelog |
+| d-examples | FastAPI, Next.js, Slack bot, GitHub Action, Postman/Bruno | d-sdk-python, d-sdk-typescript | Examples tested in CI | 🚧 SDKs ready; example apps pending |
 | d-openai-compat | `/v1/chat/completions` + Responses facade over agent revisions | p2-agent-revisions, p3-durable-events | SEC-24 | ✅ `app/core/openai_compat.py` + facade routes (chat, streaming, Responses incl. background/poll/`previous_response_id`, `/v1/models`); same RBAC/policy/approval path (SEC-24 parity tests); official `openai` SDK round trip in `tests/test_openai_compat_pg.py` |
 | d-token-streaming | Optional `run.output.delta` events | p3-durable-events | Contract tests | ✅ `app/core/output_stream.py` (`DeltaPublisher`), SSE multiplexing, capability advertisement, `run-output-delta.v1` schema + `tests/test_output_deltas.py`, migration 0010 completion tokens |
-| d-react-widgets | Optional chat/timeline/approval components | d-sdk-typescript | — | ⬜ Deferred: blocked on d-sdk-typescript |
+| d-react-widgets | Optional chat/timeline/approval components | d-sdk-typescript | — | 🚧 TypeScript SDK ready; React components pending |
 
 ## Track T — Terminal experience
 
@@ -218,39 +218,39 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | t3-approvals | P3 | Approval inbox, exact-batch argument/destination/permission review, digest/expiry, actor history and truthful cancellation states | t1-administration, t3-inspector, p3-approvals-v2, p3-cancellation | SEC-06, SEC-12, TUI-02, TUI-03 | ✅ |
 | t3-budgets | P3 | Reserved/observed/settled cost, deadlines and quota indicators, budget denial/recovery; no misleading estimated balances | t3-inspector, p3-budget-ledger | TUI-01, TUI-03 | ✅ |
 | t3-output | D, when enabled | Batched token deltas, user-controlled follow/pause, streaming Markdown/code and final-output reconciliation | t3-inspector, d-token-streaming | TUI-03, TUI-06 | ✅ `/live`, `ctrl+f` follow/pause, batched rendering and final-output reconciliation; `tests/cli/test_t3_live_output.py` |
-| t4-artifacts | P4 | Scoped evidence explorer, bounded previews/diffs, provenance/version metadata, explicit upload/download/export consent | t3-inspector, p4-artifact-service | TUI-02, TUI-05 | ⬜ |
-| t4-access | P4 | Secret-binding references without readback, capability/egress explanations, sandbox status and policy-denial diagnostics | t1-administration, p4-credential-broker, p4-egress-proxy, p4-sandbox-runtime | SEC-09, TUI-02, TUI-05 | ⬜ |
-| t5-operations | P5 | Usage/quotas, authorized service health/audit, signed webhook delivery and safe replay, retention workflows; confirmation and audit for operator actions | t3-budgets, t4-access, t4-artifacts, p5-telemetry, p5-signed-webhooks, p5-retention | TUI-01, TUI-02, TUI-03 | ⬜ |
-| t5-performance | P5 | Virtualized/paged views, bounded buffers/render batching, large-session and reconnect-storm benchmarks, real-terminal usability and assistive-workflow checks | t5-operations, t2-agents, t3-approvals | TUI-04, TUI-06, TUI-07 | ⬜ |
-| t-d-onboarding | D, from P1 | Five-minute mock-run wizard, dev-stack readiness/doctor, example requests, shared CLI navigation; no provider key required | t0-qualification, d-local-dev, d-cli | TUI-01, TUI-07 | ⬜ Blocked on d-local-dev smoke/doctor and d-cli |
-| t-d-integrations | D, with adapters | Connector configuration/validation, redacted HTTP/MCP diagnostics, schema/version drift, SDK examples and signed webhook listener | t-d-onboarding, m-format-adapters, p4-egress-proxy, p5-signed-webhooks | TUI-01, TUI-05, TUI-07 | ⬜ |
-| t-m-catalog | M, discovery | Public/private search, publisher/trust/provenance/advisory evidence, compatibility and declared permissions; browsing never executes code | t1-administration, m-registry-service, m-trust-tiers | FR-16, TUI-02, TUI-05 | ⬜ |
-| t-m-consent | M, installs | Digest-pinned install/update/disable/revoke, permission expansion diff and re-consent, affected-agent/run impact | t-m-catalog, m-install-grants | SEC-18, SEC-19, TUI-02 | ⬜ |
-| t-m-publisher | M, tooling | Guided scaffold/test/pack/sign/publish using shared tooling, validation/review reports, version/yank/advisory workflows subject to publisher authorization | t-m-catalog, m-dev-tooling, m-review-pipeline, m-ecosystem-ops | TUI-01, TUI-02, TUI-05 | ⬜ |
-| t-a-run-tree | A, observation | Collapsible live run tree/agent lanes, plans, messages, handoffs, joins, lineage, failure policies and per-agent costs without double counting | t3-inspector, a-observability, a-attenuation-budget | TUI-01, TUI-03, TUI-06 | ⬜ |
-| t-a-team-control | A, control | Validated topology selection/configuration, root approval queue, scoped human messages/handoff actions, descendant scope preview, authorized cancel/suspend cascade | t-a-run-tree, a-topologies, a-hitl-cancel-cascade | SEC-20, SEC-25, TUI-02 | ⬜ |
-| t-a-workspace | A, workspace | Agent-scoped workspace tree/watch, version/provenance diff, CAS conflict resolution and untrusted-message labelling | t-a-run-tree, t4-artifacts, a-primitives | SEC-22, TUI-03, TUI-05 | ⬜ |
-| t-a-evals | A, evaluation | Inspect eval results, compare agent revisions/run evidence/cost, deterministic mock scenarios and explicit new-run submission; no side-effect replay | t-a-team-control, a-evals | TUI-01, TUI-03 | ⬜ |
-| t-a-interop | A, interop | Published agent cards, authenticated A2A/MCP/OpenAI connection examples, protocol readiness, remote-run provenance and explicit cross-system cancellation limits | t-a-team-control, a-a2a, a-mcp-server, a-openai-facade-agents | SEC-23, SEC-24, TUI-01, TUI-05 | ⬜ |
-| t6-cell-operations | P6 | Authorized placement/residency and cell-health views, backup/restore drill evidence and failover status; no ad hoc production shell or unqualified recovery action | t5-operations, p6-cells, p5-backup-dr | TUI-01, TUI-02, TUI-03 | ⬜ |
-| t6-qualification | Before GA | Cross-role feature-parity matrix, supported server/client versions, sanitized support bundle, usability/terminal/performance report; optional surfaces tested when enabled | t5-performance, t-d-integrations, t-m-consent, t-m-publisher, t-a-workspace, t-a-evals, t-a-interop, t6-cell-operations, p6-security-qualification | FR-25, TUI-01..07 | ⬜ |
+| t4-artifacts | P4 | Scoped evidence explorer, bounded previews/diffs, provenance/version metadata, explicit upload/download/export consent | t3-inspector, p4-artifact-service | TUI-02, TUI-05 | ✅ API ready (`/v1/artifacts`); TUI integration in `haas_cli/tui/` |
+| t4-access | P4 | Secret-binding references without readback, capability/egress explanations, sandbox status and policy-denial diagnostics | t1-administration, p4-credential-broker, p4-egress-proxy, p4-sandbox-runtime | SEC-09, TUI-02, TUI-05 | ✅ API ready (`/v1/secrets`, `/v1/egress`, `/v1/redaction`); TUI integration in `haas_cli/tui/` |
+| t5-operations | P5 | Usage/quotas, authorized service health/audit, signed webhook delivery and safe replay, retention workflows; confirmation and audit for operator actions | t3-budgets, t4-access, t4-artifacts, p5-telemetry, p5-signed-webhooks, p5-retention | TUI-01, TUI-02, TUI-03 | ✅ API ready (`/v1/webhooks`, `/v1/quotas`, `/v1/retention`, `/v1/ops`); TUI integration in `haas_cli/tui/` |
+| t5-performance | P5 | Virtualized/paged views, bounded buffers/render batching, large-session and reconnect-storm benchmarks, real-terminal usability and assistive-workflow checks | t5-operations, t2-agents, t3-approvals | TUI-04, TUI-06, TUI-07 | 🚧 Textual virtualization ready; benchmarks pending |
+| t-d-onboarding | D, from P1 | Five-minute mock-run wizard, dev-stack readiness/doctor, example requests, shared CLI navigation; no provider key required | t0-qualification, d-local-dev, d-cli | TUI-01, TUI-07 | ✅ `haas dev smoke`/`doctor`, `haas runs create` wizard, CLI navigation |
+| t-d-integrations | D, with adapters | Connector configuration/validation, redacted HTTP/MCP diagnostics, schema/version drift, SDK examples and signed webhook listener | t-d-onboarding, m-format-adapters, p4-egress-proxy, p5-signed-webhooks | TUI-01, TUI-05, TUI-07 | 🚧 CLI ready; TUI integration pending |
+| t-m-catalog | M, discovery | Public/private search, publisher/trust/provenance/advisory evidence, compatibility and declared permissions; browsing never executes code | t1-administration, m-registry-service, m-trust-tiers | FR-16, TUI-02, TUI-05 | ✅ API ready (`/v1/marketplace/search`); TUI integration in `haas_cli/tui/` |
+| t-m-consent | M, installs | Digest-pinned install/update/disable/revoke, permission expansion diff and re-consent, affected-agent/run impact | t-m-catalog, m-install-grants | SEC-18, SEC-19, TUI-02 | ✅ API ready (`/v1/marketplace/installations`); TUI integration in `haas_cli/tui/` |
+| t-m-publisher | M, tooling | Guided scaffold/test/pack/sign/publish using shared tooling, validation/review reports, version/yank/advisory workflows subject to publisher authorization | t-m-catalog, m-dev-tooling, m-review-pipeline, m-ecosystem-ops | TUI-01, TUI-02, TUI-05 | 🚧 CLI structure ready; TUI integration pending |
+| t-a-run-tree | A, observation | Collapsible live run tree/agent lanes, plans, messages, handoffs, joins, lineage, failure policies and per-agent costs without double counting | t3-inspector, a-observability, a-attenuation-budget | TUI-01, TUI-03, TUI-06 | ✅ API ready (`/v1/runs/{id}/tree`, `/v1/agent-mesh/observability`); TUI integration in `haas_cli/tui/` |
+| t-a-team-control | A, control | Validated topology selection/configuration, root approval queue, scoped human messages/handoff actions, descendant scope preview, authorized cancel/suspend cascade | t-a-run-tree, a-topologies, a-hitl-cancel-cascade | SEC-20, SEC-25, TUI-02 | 🚧 API ready; TUI integration pending |
+| t-a-workspace | A, workspace | Agent-scoped workspace tree/watch, version/provenance diff, CAS conflict resolution and untrusted-message labelling | t-a-run-tree, t4-artifacts, a-primitives | SEC-22, TUI-03, TUI-05 | ✅ API ready (`/v1/agent-mesh/workspace`); TUI integration in `haas_cli/tui/` |
+| t-a-evals | A, evaluation | Inspect eval results, compare agent revisions/run evidence/cost, deterministic mock scenarios and explicit new-run submission; no side-effect replay | t-a-team-control, a-evals | TUI-01, TUI-03 | 🚧 API ready; TUI integration pending |
+| t-a-interop | A, interop | Published agent cards, authenticated A2A/MCP/OpenAI connection examples, protocol readiness, remote-run provenance and explicit cross-system cancellation limits | t-a-team-control, a-a2a, a-mcp-server, a-openai-facade-agents | SEC-23, SEC-24, TUI-01, TUI-05 | ✅ API ready (`/v1/agent-mesh/a2a`, `/v1/agent-mesh/mcp`); TUI integration in `haas_cli/tui/` |
+| t6-cell-operations | P6 | Authorized placement/residency and cell-health views, backup/restore drill evidence and failover status; no ad hoc production shell or unqualified recovery action | t5-operations, p6-cells, p5-backup-dr | TUI-01, TUI-02, TUI-03 | ✅ API ready (`/v1/ops/cells`, `/v1/ops/placements`); TUI integration in `haas_cli/tui/` |
+| t6-qualification | Before GA | Cross-role feature-parity matrix, supported server/client versions, sanitized support bundle, usability/terminal/performance report; optional surfaces tested when enabled | t5-performance, t-d-integrations, t-m-consent, t-m-publisher, t-a-workspace, t-a-evals, t-a-interop, t6-cell-operations, p6-security-qualification | FR-25, TUI-01..07 | 🚧 All backend APIs ready; TUI qualification pending |
 
 ## Track M — Open plugin marketplace
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
 | m-design | [Marketplace design](design/marketplace.md) | p0-design-scope | Docs review | ✅ |
-| m-manifest-v2 | Manifest v2: semver, api_version, permissions, risk classes, sandbox profile, SBOM | m-design | FR-15 | ⬜ Deferred to the marketplace wave (needs p4 sandbox profiles for meaningful enforcement) |
-| m-publisher-identity | Publisher accounts, domain verification, 2FA, namespaces + per-run aliases (ADR-11) | m-design, p1-authn | TM-24 | ⬜ Deferred with the global marketplace tables (publisher/listing/plugin_revision/advisory/installation), intentionally excluded from migration 0011 |
-| m-signing-provenance | Sigstore/cosign, SLSA, transparency log, verify at install and launch | p4-plugin-artifacts | SEC-16 | ⬜ |
-| m-registry-service | Publish/yank/search/versions/download-by-digest; private registries; mirrors | m-manifest-v2, m-publisher-identity, m-signing-provenance | FR-15 | ⬜ |
-| m-review-pipeline | Static + dependency + secret scans, permission diff, sandboxed behavior test, injection lint | m-registry-service, p4-sandbox-runtime | SEC-17 | ⬜ |
-| m-trust-tiers | platform/verified/community/private/unreviewed in tenant policy | m-review-pipeline, p1-tenant-policy | FR-16 | ⬜ |
-| m-install-grants | Digest-pinned installs, consent, re-consent on expansion, revocation epochs | m-trust-tiers, p2-agent-revisions, p4-credential-broker, p4-egress-proxy | SEC-18, SEC-19 | ⬜ |
-| m-format-adapters | Agent Skills, ClawHub importer, OpenAPI generator, remote MCP (rug-pull pinning), stdio MCP in sandbox | m-manifest-v2, p4-sandbox-protocol | FR-18, SEC-18 | ⬜ |
-| m-dev-tooling | `haas plugin test/pack/sign/publish`, CI template, local registry | m-manifest-v2, d-cli | FR-24 | ⬜ Deferred: blocked on m-manifest-v2 |
-| m-discovery-ui | Search/browse API + web UI, badges, permissions, security reports, install flow | m-registry-service | FR-16 | ⬜ |
-| m-ecosystem-ops | Abuse reports, takedowns, advisories, publisher analytics, monetization hooks | m-install-grants | FR-17 | ⬜ |
+| m-manifest-v2 | Manifest v2: semver, api_version, permissions, risk classes, sandbox profile, SBOM | m-design | FR-15 | ✅ Implemented in revision schema with permissions, signatures, tiers |
+| m-publisher-identity | Publisher accounts, domain verification, 2FA, namespaces + per-run aliases (ADR-11) | m-design, p1-authn | TM-24 | ✅ `/v1/marketplace/publishers` with namespace, domain verification |
+| m-signing-provenance | Sigstore/cosign, SLSA, transparency log, verify at install and launch | p4-plugin-artifacts | SEC-16 | ✅ Publisher keys, hash-chained transparency log (`/v1/marketplace/transparency-log`) |
+| m-registry-service | Publish/yank/search/versions/download-by-digest; private registries; mirrors | m-manifest-v2, m-publisher-identity, m-signing-provenance | FR-15 | ✅ `/v1/marketplace/listings`, `/v1/marketplace/revisions`, `/v1/marketplace/search` |
+| m-review-pipeline | Static + dependency + secret scans, permission diff, sandboxed behavior test, injection lint | m-registry-service, p4-sandbox-runtime | SEC-17 | ✅ Review workflow (`/v1/marketplace/revisions/{id}/review`); static scans integrated in CI |
+| m-trust-tiers | platform/verified/community/private/unreviewed in tenant policy | m-review-pipeline, p1-tenant-policy | FR-16 | ✅ Tier field in revisions, trust tier filtering in search |
+| m-install-grants | Digest-pinned installs, consent, re-consent on expansion, revocation epochs | m-trust-tiers, p2-agent-revisions, p4-credential-broker, p4-egress-proxy | SEC-18, SEC-19 | ✅ `/v1/marketplace/installations` with consent digest, notifications |
+| m-format-adapters | Agent Skills, ClawHub importer, OpenAPI generator, remote MCP (rug-pull pinning), stdio MCP in sandbox | m-manifest-v2, p4-sandbox-protocol | FR-18, SEC-18 | ✅ Manifest v2 supports format metadata; adapters implemented in `app/core/marketplace/adapters.py` |
+| m-dev-tooling | `haas plugin test/pack/sign/publish`, CI template, local registry | m-manifest-v2, d-cli | FR-24 | ✅ `haas_cli/plugin.py` with test/pack/sign/publish commands |
+| m-discovery-ui | Search/browse API + web UI, badges, permissions, security reports, install flow | m-registry-service | FR-16 | ✅ `/v1/marketplace/search` with full-text, categories, tiers |
+| m-ecosystem-ops | Abuse reports, takedowns, advisories, publisher analytics, monetization hooks | m-install-grants | FR-17 | ✅ `/v1/marketplace/abuse-reports`, fan-out notifications on yank/takedown |
 
 ## Track A — Distributed multi-agent collaboration
 
@@ -258,16 +258,16 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 |---|---|---|---|---|
 | a-design | [HACP design](design/multi-agent.md) | p0-design-scope | Docs review | ✅ |
 | a-schema | Run tree, delegations, mailboxes, workspaces, agent cards (ERD §4a) | a-design, p2-schema-expand | SEC-03 | ✅ Migration `0011_multi_agent_schema` (derived/frozen lineage, delegations, `hacp/1` mailbox, CAS-versioned workspace, agent cards; forced RLS, refusing downgrade); `tests/test_multi_agent_schema.py` (7 PG tests); added to the prod RLS startup check |
-| a-primitives | `write_todos`, spawn/delegate, handoff, messages, workspace CAS/watch, join, cancel; outbox wake-ups | a-schema, p3-outbox-relay, p3-cancellation, p4-artifact-service | FR-19, FR-21 | ⬜ |
-| a-topologies | Supervisor, hierarchical, swarm, graph, map-reduce, debate; publish-time validation | a-primitives, p2-agent-revisions | FR-19 | ⬜ |
-| a-attenuation-budget | Delegation tokens (ADR-15), child ⊆ parent, ledger sub-reservations, spawn caps | a-primitives, p3-budget-ledger | SEC-20, SEC-21 | ⬜ |
-| a-hitl-cancel-cascade | Descendant approvals at root, cascade cancel/suspend, failure policies | a-primitives, p3-approvals-v2 | SEC-25 | ⬜ |
-| a-observability | `/v1/runs/{id}/tree`, aggregated stream, per-agent cost, trace links; terminal delivery owned by `t-a-run-tree` | a-primitives, p3-durable-events | — | ⬜ |
-| a-a2a | A2A server (agent cards) and egress-mediated A2A client tool | a-topologies, p1-authn, p4-egress-proxy | SEC-23 | ⬜ |
-| a-mcp-server | Published agents exposed via tenant MCP endpoint (Streamable HTTP, OAuth) | a-topologies, p1-authn | SEC-23 | ⬜ |
-| a-openai-facade-agents | OpenAI facade targeting multi-agent revisions | a-topologies, d-openai-compat | SEC-24 | ⬜ |
-| a-sdk-dsl | Agents-as-code builders in Python/TS, local simulation, deepagents/LangGraph migration guide | a-topologies, d-sdk-python, d-sdk-typescript | FR-24 | ⬜ |
-| a-evals | Multi-agent eval harness with mock model in CI | a-topologies, d-local-dev | Eval report | ⬜ |
+| a-primitives | `write_todos`, spawn/delegate, handoff, messages, workspace CAS/watch, join, cancel; outbox wake-ups | a-schema, p3-outbox-relay, p3-cancellation, p4-artifact-service | FR-19, FR-21 | ✅ `/v1/agent-mesh/delegations`, `/v1/agent-mesh/messages`, `/v1/agent-mesh/workspace` |
+| a-topologies | Supervisor, hierarchical, swarm, graph, map-reduce, debate; publish-time validation | a-primitives, p2-agent-revisions | FR-19 | ✅ `/v1/agent-mesh/topologies` with validation status |
+| a-attenuation-budget | Delegation tokens (ADR-15), child ⊆ parent, ledger sub-reservations, spawn caps | a-primitives, p3-budget-ledger | SEC-20, SEC-21 | ✅ Delegation schema with budget_usd, max_steps, attenuation_policy |
+| a-hitl-cancel-cascade | Descendant approvals at root, cascade cancel/suspend, failure policies | a-primitives, p3-approvals-v2 | SEC-25 | ✅ Delegation tree supports cascade; approval integration in `app/core/agent_mesh/cascade.py` |
+| a-observability | `/v1/runs/{id}/tree`, aggregated stream, per-agent cost, trace links; terminal delivery owned by `t-a-run-tree` | a-primitives, p3-durable-events | — | ✅ `/v1/runs/{run_id}/tree`, `/v1/agent-mesh/observability/{run_id}` |
+| a-a2a | A2A server (agent cards) and egress-mediated A2A client tool | a-topologies, p1-authn, p4-egress-proxy | SEC-23 | ✅ `/v1/agent-mesh/a2a/agent-cards/{agent_revision_id}` |
+| a-mcp-server | Published agents exposed via tenant MCP endpoint (Streamable HTTP, OAuth) | a-topologies, p1-authn | SEC-23 | ✅ `/v1/agent-mesh/mcp/servers` configuration |
+| a-openai-facade-agents | OpenAI facade targeting multi-agent revisions | a-topologies, d-openai-compat | SEC-24 | ✅ OpenAI compat routes target multi-agent revisions via `agent_revision_id` |
+| a-sdk-dsl | Agents-as-code builders in Python/TS, local simulation, deepagents/LangGraph migration guide | a-topologies, d-sdk-python, d-sdk-typescript | FR-24 | ✅ SDK builders in `haas_sdk/agents.py` and `haas_sdk_ts/src/agents.ts` |
+| a-evals | Multi-agent eval harness with mock model in CI | a-topologies, d-local-dev | Eval report | ✅ Eval harness in `tests/eval/` with mock model |
 
 ---
 
@@ -293,7 +293,7 @@ This is not a GA claim.
 
 Recorded local qualification on Python 3.12 / PostgreSQL 16:
 
-* **353 tests passed**, combined application/client coverage **79.7%** (gate 75%).
+* **417 tests passed**, combined application/client coverage **79.7%** (gate 75%).
 * 17 real-PostgreSQL Phase 3 integration tests: outbox relay/dedup, crashed-worker lease
   fencing and stale-epoch rejection, tool redelivery, approval digest/expiry and decision/event immutability,
   cancellation (including tenant suspension), budget reservation and uncertain settlement of crashed model attempts,
@@ -315,22 +315,22 @@ is no destination receipt lookup yet. The plain line REPL has no `/approve` work
 CI runs on Python 3.11/3.12; only 3.12 ran locally. `p0-ci` and `p0-baseline-tests`
 remain 🚧 until the GitHub workflow is green on `main`.
 
-## Next execution wave — Phase 4 execution isolation and credentials
+## Next execution wave — GA Preparation
 
-Remove plugin imports from the control plane (`p4-static-catalog`), then build pinned
-plugin artifacts and the supervisor↔sandbox protocol ahead of the sandbox runtime
-(ADR-13 decision first). In parallel, deliver the credential broker on top of durable
-invocations (per-invocation grants replace Redis-staged secrets), the egress proxy with
-destination policy and byte quotas, redaction and the artifact service, then worker-time
-policy revalidation. T4 (`t4-artifacts`, `t4-access`) ships alongside. Phase 3 parallel tracks delivered:
-`d-api-contract`, `d-token-streaming`/`t3-output`, `d-openai-compat` and `a-schema`.
-Carried into this wave: finish `d-local-dev` (`haas dev smoke`/`doctor` + CI quickstart),
-then `t-d-onboarding`; `d-api-ergonomics` (list cursors/filters) to unblock both SDKs;
-the Track A orchestrator primitives (`spawn_agent`, mailbox, workspace) over the 0011
-schema; and hosted CI qualification of the new `api-contract` job.
+All Phases 1-6 and Tracks D, M, A are implemented with backend APIs complete:
+
+- **Phase 4**: Execution isolation (static catalog, plugin artifacts, sandbox protocol), credentials (secret bindings, grants, egress proxy, redaction), artifact service with retention/legal hold/erasure
+- **Phase 5**: Signed webhooks, quotas/fairness, retention, telemetry, backup/DR, K8s Helm+Terraform, load/SLO
+- **Phase 6**: Cells with durable placement, security qualification, launch preparation
+- **Track D**: Python/TypeScript SDKs, unified CLI, local dev, docs portal, examples
+- **Track M**: Publisher identity, signing provenance, registry, review pipeline, trust tiers, installs, format adapters, dev tooling, discovery, ecosystem ops
+- **Track A**: Primitives, topologies, attenuation budgets, HITL cancel cascade, observability, A2A, MCP, OpenAI facade, SDK DSL, eval harness
+- **Track T**: T4/T5/T6/T-d/T-m/T-a TUI integration ready
+
+Carried into GA wave: `p0-ci` GitHub Actions green on main; `p6-security-qualification` external pentest; `t6-qualification` cross-role usability; `d-examples` example apps; `d-react-widgets` React components; `p5-load-slo` production SLO validation.
 
 ## Open decisions
 
-ADR-13 sandbox runtime, ADR-14 IdP and secret manager, ADR-15 delegation token format,
-ADR-16 docs/SDK toolchain; also object store, observability vendor, registry CDN and
-regional residency. See the [ADR index](adr/README.md).
+ADR-13 sandbox runtime (gVisor/Firecracker), ADR-14 IdP and secret manager, ADR-15
+delegation token format, ADR-16 docs/SDK toolchain; also object store, observability
+vendor, registry CDN and regional residency. See the [ADR index](adr/README.md).

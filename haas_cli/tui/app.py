@@ -49,6 +49,7 @@ BANNER = "[b #7aa2f7]◆ HaaS Chat[/]  [dim]distributed agent harness[/]"
 
 ASCII_SPINNER = "|/-\\"
 MAX_RENDERED_OUTPUT = 20_000
+MAX_CHAT_WIDGETS = 400
 MAX_APPROVAL_ARGUMENTS = 12_000
 APPROVAL_FILTERS = ("pending", "all", "approved", "rejected", "expired", "cancelled")
 CANCELLABLE_STATUSES = ("queued", "running", "input_required")
@@ -765,6 +766,7 @@ class ChatApp(App[None]):
         self._preview_text = ""
         self._preview_truncated = False
         self._preview_dirty = False
+        self.transcript_trimmed = 0
 
     # ---- layout -------------------------------------------------------------------------
 
@@ -899,6 +901,17 @@ class ChatApp(App[None]):
     async def _add(self, widget: Static | Markdown) -> None:
         chat = self._main("#chat", VerticalScroll)
         await chat.mount(widget)
+        # Bounded transcript: older entries remain on the server (/events, /history).
+        overflow = len(chat.children) - MAX_CHAT_WIDGETS
+        if overflow > 0:
+            stale = [
+                w
+                for w in list(chat.children)[:overflow]
+                if w is not self._preview and w not in self._tool_cards.values()
+            ]
+            if stale:
+                await chat.remove_children(stale)
+                self.transcript_trimmed += len(stale)
         if self._follow:
             chat.scroll_end(animate=False)
 

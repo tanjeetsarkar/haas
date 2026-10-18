@@ -29,6 +29,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.50b0",
     "opentelemetry-instrumentation-httpx>=0.50b0",
     "opentelemetry-instrumentation-celery>=0.50b0",
+    "python-multipart>=0.0.32",
 ]
 
 [project.optional-dependencies]
@@ -54,7 +55,7 @@ haas-bootstrap-tenant = "app.bootstrap_tenant:main"
 # The repo root also holds plugins/ and tests/, which setuptools' flat-layout
 # auto-discovery would reject as "multiple top-level packages".
 [tool.setuptools.packages.find]
-include = ["app*", "haas_cli*"]
+include = ["app*", "haas_cli*", "haas_plugin_sdk*", "haas_sdk*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -67,9 +68,9 @@ extend-exclude = ["plugins/_templates"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 typeCheckingMode = "standard"
-include = ["app", "haas_cli", "migrations", "scripts"]
+include = ["app", "haas_cli", "haas_plugin_sdk", "haas_sdk", "migrations", "scripts"]
 exclude = ["plugins/_templates", "tests"]
 
 [tool.ruff.lint]

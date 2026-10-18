@@ -94,7 +94,74 @@ flowchart TB
 * All services use the same image. The plugin mount is read-only, but shared scratch
   content and Redis task/result content remain sensitive.
 
-## 3. Production logical architecture (TARGET)
+## 3. TUI ↔ Service Interaction Architecture (CURRENT)
+
+```mermaid
+flowchart TB
+    subgraph tui["haas-chat TUI (Textual)"]
+        chat_ws["Chat Workspace<br/>multiline, markdown, tool cards"]
+        runs_ws["Runs Workspace<br/>cursor-paginated, attach/cancel"]
+        approvals_ws["Approvals Workspace<br/>batch digest, approve/reject/leave"]
+        admin_ws["Admin Workspace<br/>memberships, keys, policy, audit"]
+        profile_mgr["Profile Manager<br/>endpoint/tenant/env (no secrets)"]
+    end
+    
+    subgraph api["HaaS Service API (FastAPI)"]
+        runs_api["/v1/runs<br/>POST submit, GET status, POST resume"]
+        threads_api["/v1/threads<br/>history, branch, version"]
+        agents_api["/v1/agents<br/>draft, validate, publish, diff, use"]
+        plugins_api["/v1/plugins<br/>catalog, skills, tools"]
+        admin_api["/v1/admin/*<br/>memberships, keys, policy, audit"]
+        approvals_api["/v1/approvals<br/>pending, decide"]
+        events_api["/v1/runs/{id}/events<br/>durable replay"]
+        openai_api["/v1/chat/completions<br/>/v1/responses, /v1/models"]
+    end
+    
+    subgraph sse["SSE Event Stream"]
+        stream["/v1/runs/{id}/stream<br/>Last-Event-ID resume"]
+        events["run_queued, step_started,<br/>tool_dispatched, tool_result,<br/>run_completed, run_error,<br/>hitl_pending, approval_expired,<br/>run_recovering, stream_gap"]
+        deltas["run.output.delta<br/>(advisory live preview)"]
+    end
+    
+    subgraph core["HaaS Core Services"]
+        orchestrator["Celery Orchestrator<br/>leases, fencing, model calls"]
+        tool_workers["Celery Tool Workers<br/>q_tools_fast, q_tools_sandbox"]
+        pg[("PostgreSQL 16<br/>RLS + composite keys")]
+        redis[("Redis 7.4<br/>broker, secrets, SSE wakeups")]
+    end
+    
+    chat_ws -->|"POST /v1/runs<br/>prompt, secrets, skills"| runs_api
+    runs_ws -->|"GET /v1/runs, SSE stream"| runs_api
+    approvals_ws -->|"GET/POST /v1/approvals"| approvals_api
+    admin_ws -->|"GET/POST /v1/admin/*"| admin_api
+    profile_mgr -->|"local only"| runs_api
+    
+    runs_api -->|"202 run_id"| chat_ws
+    runs_api -->|"SSE stream"| stream
+    stream -->|"events + deltas"| chat_ws
+    runs_api -->|"admission txn"| pg
+    approvals_api -->|"decision + digest"| pg
+    admin_api -->|"RBAC checks"| pg
+    
+    orchestrator -->|"model calls"| provider["OpenRouter"]
+    orchestrator -->|"signed envelopes"| tool_workers
+    tool_workers -->|"HTTP/MCP/native"| endpoints["External Systems"]
+    orchestrator -->|"events + outbox"| pg
+    orchestrator -->|"SSE wakeups"| redis
+    tool_workers -->|"outcomes"| orchestrator
+```
+
+### TUI Communication Patterns
+
+| TUI Workspace | Primary API Calls | SSE Events Consumed |
+|---|---|---|
+| **Chat** | `POST /v1/runs`, `GET /v1/plugins` | `run_queued`, `step_started`, `tool_dispatched`, `tool_result`, `run_completed`, `run_error`, `hitl_pending`, `run.output.delta` |
+| **Runs** | `GET /v1/runs` (cursor), `POST /v1/runs/{id}/cancel` | `run_cancelling`, `run_cancelled` (on attach) |
+| **Approvals** | `GET /v1/approvals`, `POST /v1/runs/{id}/resume` | `hitl_approved`, `hitl_rejected`, `approval_expired` |
+| **Admin** | `GET/POST /v1/admin/*` (RBAC-gated) | — |
+| **Identity** | `GET /v1/me` (verify), `/login`, `/tenant`, `/profile` | — |
+
+## 4. Production logical architecture (TARGET)
 
 ```mermaid
 flowchart TB
@@ -148,6 +215,7 @@ flowchart TB
     registry -->|"digest-verified artifact"| supervisor
     sandbox -->|"short-lived invocation capability"| creds
     creds --> secrets
+    creds --> secrets
     sandbox --> egress
     egress --> external
     sandbox -->|"scoped artifact access"| artifacts
@@ -181,7 +249,7 @@ boundaries are preserved. This is not a requirement to create a microservice per
   terminate stale/cancelled work and report uncertain effects.
 * Preserve tenant/cell identity through every queue, callback and artifact operation.
 
-## 4. Deployment and network boundaries (TARGET)
+## 5. Deployment and network boundaries (TARGET)
 
 ```mermaid
 flowchart LR
@@ -239,7 +307,7 @@ Managed services use TLS, independent identities, encryption and documented back
 and failover policies. Kubernetes scheduling alone does not establish tenant isolation;
 enforcement must exist in runtime, network, identity and storage.
 
-## 5. Placement, scaling and alternatives
+## 6. Placement, scaling and alternatives
 
 * Start with one regional control plane and multiple execution cells. A tenant's
   cell/region assignment is durable and versioned; do not reroute in-flight work
@@ -254,7 +322,7 @@ enforcement must exist in runtime, network, identity and storage.
   outgrow the lease/outbox design. It would not remove application-level authorization,
   effect idempotency, approval binding or sandbox requirements.
 
-## 6. Product extensions (TARGET)
+## 7. Product extensions (TARGET)
 
 The following reuse the control/execution split above rather than adding new trust boundaries:
 

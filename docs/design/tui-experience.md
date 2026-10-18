@@ -8,6 +8,96 @@ Chat, Runs, authenticated profiles/tenant switching, and role-aware tenant admin
 under both `haas chat` and the `haas-chat` alias. Remaining journeys ship with their backend
 milestones; do not rewrite the UI framework or wait for a web UI.
 
+## TUI ↔ Harness Service Architecture
+
+The `haas-chat` TUI is a **client application** that connects to the HaaS service over
+standard APIs. It does not run agents locally—all agent execution happens in the HaaS service.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              TUI (haas-chat)                                │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐  │
+│  │ Chat    │  │ Runs    │  │Approvals│  │ Admin   │  │ Profile/Identity│  │
+│  │ Workspace│ │Workspace│ │Workspace│ │Workspace│  │ Management      │  │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────────┬────────┘  │
+└───────┼────────────┼────────────┼────────────┼────────────────┼───────────┘
+        │            │            │            │                │
+        ▼            ▼            ▼            ▼                ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           HaaS Service (REST + SSE)                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │ /v1/runs     │  │ /v1/threads  │  │ /v1/agents   │  │ /v1/admin/*    │  │
+│  │ /v1/plugins  │  │ /v1/policy   │  │ /v1/approvals│  │ /v1/audit      │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └───────┬────────┘  │
+└─────────┼─────────────────┼─────────────────┼──────────────────┼───────────┘
+          │                 │                 │                  │
+          ▼                 ▼                 ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        HaaS Service Internals                               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐   │
+│  │ API Gateway │  │ Orchestrator│  │ Tool Workers│  │ PostgreSQL +     │   │
+│  │ (FastAPI)   │  │ (Celery)    │  │ (Celery)    │  │ Redis (state)    │   │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Communication Channels
+
+| Channel | Protocol | Purpose |
+|---------|----------|---------|
+| **REST API** | HTTPS/HTTP | Run submission, thread management, agent revisions, plugin catalog, admin operations |
+| **SSE Stream** | `text/event-stream` | Real-time run events (`run_queued`, `step_started`, `tool_dispatched`, `tool_result`, `run_completed`, `run_error`, `hitl_pending`, `approval_expired`) |
+| **Output Deltas** | SSE (`run.output.delta`) | Advisory live tool output preview (when server advertises `output-deltas.v1`) |
+| **Webhooks** | HTTPS POST | Terminal callbacks on run completion (configured in tenant policy) |
+| **OpenAI-compatible** | HTTPS | `/v1/chat/completions`, `/v1/responses`, `/v1/models` with `model="agent/<name>"` |
+
+### Authentication Flow
+
+```
+1. TUI starts → connects to API base URL (--url / HAAS_URL)
+2. User runs /login → provides API key or OIDC bearer token
+3. TUI calls GET /v1/me → server verifies credential, returns:
+   - tenant_id, principal_id, roles (tenant_admin, submitter, approver, auditor)
+   - capabilities (actions, event_schemas, features)
+   - environment (dev/staging/prod)
+4. TUI caches identity → enables role-gated workspaces (Admin, Approvals)
+5. All subsequent requests include Authorization: Bearer <token>
+```
+
+### Run Lifecycle in TUI
+
+```
+User types prompt
+       │
+       ▼
+┌──────────────────┐
+│ POST /v1/runs    │  ← prompt, secrets, preload_skills, model overrides, budgets
+│ (async, 202)     │
+└────────┬─────────┘
+         │ run_id returned
+         ▼
+┌──────────────────┐
+│ GET /v1/runs/    │  ← SSE stream with Last-Event-ID resume
+│ {run_id}/stream  │
+└────────┬─────────┘
+         │
+         ▼
+    Events flow:
+    run_queued → step_started → tool_dispatched → tool_result → ...
+         │                              │
+         │                    (if approval needed)
+         │                              ▼
+         │                    hitl_pending → TUI shows approval dialog
+         │                              │
+         │                    User approves/rejects
+         │                              │
+         ▼                              ▼
+    run_completed ←────────────────── resume with decision
+         │
+         ▼
+    TUI shows final Markdown answer + run footer (steps, cost, cached tokens)
+```
+
 ## 1. Baseline and ambition
 
 The shipped TUI has multiline composition, command completion, prompt history, Markdown
@@ -40,19 +130,19 @@ Users should always be able to answer:
 
 ## 2. Product surfaces
 
-| Surface | Target experience |
-|---|---|
-| Home / activity | Recent and pinned threads, active runs, approval inbox, actionable failures, onboarding; role-scoped counts |
-| Chat / composer | Multiline drafts, paste preview, skill/agent picker, revision and budget summary, expandable tool results, explicit attachment upload consent |
-| Runs / threads | Search, filters, cursors, attach/detach, compare runs, explicit cancel, historical transcript; branch only through versioned server APIs |
-| Run inspector | Ordered timeline, plan checklist, attempts, tool inputs/results, artifact references, cost breakdown, trace/request IDs and failure explanations |
-| Approvals | Review queue with lineage, exact actions/destinations, permission and argument diffs, expiry, decision history, deliberate approve/reject |
-| Agents | Draft editor, schema validation, revision comparison, publish review, allowed models/plugins and topology selection |
-| Team view | Collapsible live run tree, agent lanes, bounded graph inspection, messages, handoffs, joins, child budgets and root-visible approvals |
-| Workspace / artifacts | Scoped file tree, bounded text/JSON/diff previews, provenance, version history, download/export consent, CAS conflict resolution |
-| Plugins / marketplace | Search public/private catalogs, provenance and trust evidence, permission comparison, digest-pinned install, upgrade consent, advisory/revocation state |
-| Connections / developer tools | Guided local mock run, connector readiness, secret-binding names, redacted HTTP/MCP diagnostics, example requests and signed webhook listener |
-| Tenant / operations | Authorized membership and policy workflows, usage/quotas, webhook delivery/replay, audit, retention and operational diagnostics |
+| Surface | Target experience | Current Status |
+|---|---|---|
+| Home / activity | Recent and pinned threads, active runs, approval inbox, actionable failures, onboarding; role-scoped counts | **Planned** (T3+) |
+| Chat / composer | Multiline drafts, paste preview, skill/agent picker, revision and budget summary, expandable tool results, explicit attachment upload consent | **Implemented** (T0/T1) |
+| Runs / threads | Search, filters, cursors, attach/detach, compare runs, explicit cancel, historical transcript; branch only through versioned server APIs | **Implemented** (T1/T2) |
+| Run inspector | Ordered timeline, plan checklist, attempts, tool inputs/results, artifact references, cost breakdown, trace/request IDs and failure explanations | **Implemented** (T3) |
+| Approvals | Review queue with lineage, exact actions/destinations, permission and argument diffs, expiry, decision history, deliberate approve/reject | **Implemented** (T3) |
+| Agents | Draft editor, schema validation, revision comparison, publish review, allowed models/plugins and topology selection | **Implemented** (T2) |
+| Team view | Collapsible live run tree, agent lanes, bounded graph inspection, messages, handoffs, joins, child budgets and root-visible approvals | **Planned** (Multi-agent Track) |
+| Workspace / artifacts | Scoped file tree, bounded text/JSON/diff previews, provenance, version history, download/export consent, CAS conflict resolution | **Planned** (Phase 4+) |
+| Plugins / marketplace | Search public/private catalogs, provenance and trust evidence, permission comparison, digest-pinned install, upgrade consent, advisory/revocation state | **Planned** (Marketplace Track) |
+| Connections / developer tools | Guided local mock run, connector readiness, secret-binding names, redacted HTTP/MCP diagnostics, example requests and signed webhook listener | **Planned** (Developer Platform Track) |
+| Tenant / operations | Authorized membership and policy workflows, usage/quotas, webhook delivery/replay, audit, retention and operational diagnostics | **Implemented** (T2 Admin) |
 
 The run inspector is a record of user-visible actions, plans, outcomes, and evidence;
 it must not present hidden model reasoning as an inspectable execution guarantee.
@@ -97,6 +187,152 @@ These are future migrations, not claims about current keybindings:
   fencing. The UI must never advertise its early guard as a concurrency/security boundary.
 * Final answers remain readable without inspecting every tool. Detailed output is expandable,
   bounded, searchable, and labelled as untrusted content.
+
+## 4. Current Implementation Status (T0–T3)
+
+### T0 — Foundation (IMPLEMENTED)
+- Textual application shell with navigation rail (Chat, Runs, Admin, Help)
+- Multiline prompt with history, Tab completion, Ctrl+J newlines
+- Markdown rendering for agent answers
+- Tool cards with running/succeeded/failed status and preview
+- Step lines showing model and active skills
+- Run footer with steps, cost, cached tokens
+- SSE reconnect with Last-Event-ID resume (up to 5 attempts)
+- Connection health indicator (green/red/yellow dot)
+- Environment badge (DEV/STAGING/PRODUCTION)
+- ASCII mode (`--ascii`) for limited terminals
+- Theme cycling (dark/light/auto) with `Ctrl+T`
+
+### T1 — Authenticated Identity & Tenant Context (IMPLEMENTED)
+- `/login` with API key or OIDC bearer token (memory only, never persisted)
+- `/logout` clears credential
+- `/tenant` switch verified by server via `GET /v1/me`
+- `/profile` switch with saved endpoint profiles (URL, tenant, environment)
+- Profile store: `haas profile add/list/activate/remove`
+- Top bar shows: environment, profile name, endpoint, tenant, principal (8 chars), roles
+- Role-gated Admin workspace visibility (`tenant_admin`, `auditor`)
+
+### T2 — Agent Revisions & Thread History (IMPLEMENTED)
+- `/agent draft` — structured JSON form for immutable agent draft
+- `/agent validate <id>` — validates against active tenant policy
+- `/agent publish <id>` — publishes immutable revision
+- `/agent use <id>` — pins revision for subsequent runs
+- `/agent clear` — restores request-level settings
+- `/agent diff <id1> <id2>` — compares config, policy permissions, registry fingerprint
+- `/agents` — lists revisions with status
+- `/threads [search]` — cursor-paginated thread search
+- `/threads next` — advances cursor
+- `/history [offset]` — refreshes/browses committed history at captured version
+- `/branch <version>` — branches from committed snapshot at exact version
+- Version conflict detection and recovery guidance
+
+### T3 — Approvals, Inspector & Events (IMPLEMENTED)
+- **Approvals workspace** (`Ctrl+4`): tenant-scoped batch list with filter (pending/approved/rejected/expired/all)
+- Batch digest binding: decisions sent with reviewed `batch_digest`; 409 on mismatch/expiry
+- Approve/Reject/Leave-pending actions with explicit keys (`y`/`n`/`Esc`)
+- `/approvals [STATUS]` — Chat command for approval list
+- `/approve <run-id>` — review specific pending approval as verified approver
+- **Run inspector** (`/inspect [run-id]` or Inspect button): status, state version, event sequence, W3C trace context, budget (settled/uncertain/reserved vs max), remaining cost, steps, tool invocations, deadline, per-step attempts, tool invocations with durable outcome, usage ledger
+- **Durable event log** (`/events [run-id] [after] [type=TEXT]`): pages immutable `run_events` with type filtering (e.g., `type=tool`)
+- Output deltas: advisory live preview via SSE `run.output.delta` when server advertises `output-deltas.v1`; final `run_completed` output supersedes
+
+## 5. Keyboard Reference (Current)
+
+| Key | Action |
+|---|---|
+| `Enter` | Send message / run command (completes partial command first) |
+| `Ctrl+J` / `Shift+Enter` | New line in prompt |
+| `Tab` | Complete command/argument (never leaves prompt) |
+| `↑` / `↓` | Choose completion / browse history |
+| `Esc` | Detach from running task; leave approval pending |
+| `Ctrl+1` / `Ctrl+2` | Chat / Runs workspace |
+| `Ctrl+3` | Admin workspace (role-gated) |
+| `Ctrl+4` | Approvals workspace |
+| `F6` | Next focus |
+| `Ctrl+R` | Refresh run list |
+| `Ctrl+F` | Follow/pause live output |
+| `Ctrl+T` | Cycle theme |
+| `F1` | Contextual help |
+| `Ctrl+L` | Clear screen |
+| `Ctrl+N` | New conversation (`/new`) |
+| `Ctrl+Q` | Quit |
+| `Ctrl+P` | Command palette |
+
+## 6. Slash Commands Reference (Current)
+
+| Command | Description | API Calls |
+|---|---|---|
+| `/help` | List commands | — |
+| `/login` · `/logout` | Sign in/out (memory only) | `GET /v1/me` |
+| `/tenant [id]` · `/profile [name]` | Switch tenant/profile | `GET /v1/me` (verify) |
+| `/status` | Connection, thread, models, budgets, secrets, cost | `GET /v1/me`, `GET /v1/plugins` |
+| `/admin` | Open Admin workspace | — |
+| `/approve <run-id>` | Review pending approval | `GET /v1/approvals/{run_id}`, `POST /v1/runs/{run_id}/resume` |
+| `/approvals [STATUS]` | Approval inbox | `GET /v1/approvals` |
+| `/inspect [run-id]` | Run inspector | `GET /v1/runs/{run_id}/inspect` |
+| `/events [run-id] [after] [type]` | Durable event log | `GET /v1/runs/{run_id}/events` |
+| `/live [on\|off]` | Toggle output deltas | SSE `run.output.delta` |
+| `/skills` | List skills with secrets | `GET /v1/plugins` |
+| `/preload [skill...]` | Set/clear preloaded skills | Sent with `POST /v1/runs` |
+| `/secret set/list/unset` | In-memory secrets | Sent with `POST /v1/runs` |
+| `/model <id>` · `/planner <id>` | Override models | Sent with `POST /v1/runs` |
+| `/steps <N>` · `/budget <USD>` | Override limits | Sent with `POST /v1/runs` |
+| `/agent draft/show/validate/publish/use/clear/diff` | Agent revision mgmt | `POST/GET /v1/agents/*` |
+| `/agents` | List agent revisions | `GET /v1/agents` |
+| `/threads [search]` · `/threads next` | Thread browser | `GET /v1/threads` |
+| `/history [offset]` | Thread history | `GET /v1/threads/{id}/history` |
+| `/branch <version>` | Branch thread | `POST /v1/threads/{id}/branch` |
+| `/new` · `/clear` · `/quit` | New thread, clear, exit | Local |
+
+## 7. Admin Workspace Operations (Current)
+
+| Button | Action | Required Role | API Endpoint |
+|---|---|---|---|
+| List members | List all tenant memberships | tenant_admin, auditor | `GET /v1/admin/memberships` |
+| Grant member | Add principal with role | tenant_admin | `POST /v1/admin/memberships` |
+| Revoke member | Remove principal role | tenant_admin | `DELETE /v1/admin/memberships/{principal_id}/{role}` |
+| List API keys | List tenant API keys (hashed) | tenant_admin | `GET /v1/admin/api-keys` |
+| Create API key | Generate new API key (shown once) | tenant_admin | `POST /v1/admin/api-keys` |
+| Revoke API key | Revoke key by prefix | tenant_admin | `DELETE /v1/admin/api-keys/{key_prefix}` |
+| View policy | Show active policy revision | tenant_admin, auditor | `GET /v1/admin/policy` |
+| Activate policy | Activate policy revision (JSON form) | tenant_admin | `POST /v1/admin/policy/activate` |
+| Scoped plugins | List tenant-scoped plugin catalog | tenant_admin | `GET /v1/admin/plugins` |
+| Audit events | Page audit events (cursor-paginated) | tenant_admin, auditor | `GET /v1/admin/audit` |
+
+## 8. Security Model (TUI-Specific)
+
+| Threat | Mitigation |
+|---|---|
+| Stolen API key | Stored in memory only; `/logout` clears; no persistence; short-lived keys recommended |
+| Secret disclosure | Never in chat/logs/history; masked in `/secret list`; omitted from `PromptInput.remember()` |
+| Approval tampering | Decision bound to `batch_digest` (SHA-256); server rejects digest mismatch; immutable |
+| Role escalation | Admin workspace visibility from `/v1/me` capabilities; API enforces RBAC regardless of UI |
+| Cross-tenant SSE | SSE requires run ownership; `Last-Event-ID` checked against tenant; RLS on `run_events` |
+| MITM to malicious endpoint | TLS verification; profile stores endpoint only; `/login` verifies with server |
+| Auto-approve bypass | `--auto-approve` only in `--once` mode; interactive TUI always prompts; server enforces |
+
+## 9. Roadmap (T4+)
+
+| Track | Target | Dependency |
+|---|---|---|
+| T4 | Home/activity dashboard with role-scoped counts | Backend: recent threads, active runs, approval counts APIs |
+| T4 | Team view: live run tree, agent lanes, handoffs | Multi-agent: `runs.root_run_id`, `delegations`, `agent_messages` |
+| T4 | Workspace/artifacts: scoped file tree, CAS, provenance | Phase 4: artifact service, workspace entries |
+| T4 | Plugins/marketplace: search, consent, digest-pin, advisories | Marketplace: `INSTALLATION`, `CAPABILITY_GRANT`, `ADVISORY` |
+| T4 | Connections: mock run, connector readiness, webhook listener | Developer platform: local mock, signed webhook |
+| T4 | Operator workflows: fleet ops, cell management, break-glass | Operations: dedicated cells, revocation epochs |
+
+## 10. Acceptance Gates (Track T)
+
+| Gate | Criteria |
+|---|---|
+| TUI-01 | Journey parity: Chat → Runs → Approvals → Admin flows complete without mouse |
+| TUI-02 | Auth/recovery: `/login` → `/tenant` → `/profile` → reconnect preserves state |
+| TUI-03 | Safe rendering: untrusted tool output never executes terminal commands; Markdown sanitized |
+| TUI-04 | Terminal/accessibility: ASCII mode, theme, focus nav, screen reader, 80x24 usable |
+| TUI-05 | Performance: <100ms keystroke-to-render; SSE reconnect <2s; large transcript scroll |
+| TUI-06 | Compatibility: works on Linux/macOS/Windows Terminal; SSH; tmux/screen; no raw mode issues |
+| TUI-07 | Version skew: TUI gracefully degrades on older servers (capability version check) |
 
 ## 4. Delivery waves and backend ownership
 

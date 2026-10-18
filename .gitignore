@@ -41,3 +41,6 @@ test-results/
 # Operating system files
 .DS_Store
 Thumbs.db
+# Local development artifacts
+.infra-render/
+scripts_mkt_pg.sh

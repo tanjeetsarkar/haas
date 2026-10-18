@@ -1,0 +1,3 @@
+{{- if .Values.orchestrator.enabled }}
+{{ include "haas.workerDeployment" (dict "root" $ "component" "orchestrator" "c" .Values.orchestrator "nodeName" "orchestrator") }}
+{{- end }}

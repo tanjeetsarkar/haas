@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars (git-ignored) or export TF_VAR_* variables.
+image_repository = "registry.example.com/haas/haas-distributed"
+image_digest     = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+api_hostname     = "api.staging.haas.example.com"
+
+postgres = {
+  api_dsn       = "postgresql://haas_api:CHANGE_ME@db.internal:5432/haas_db?sslmode=verify-full"
+  executor_dsn  = "postgresql://haas_executor:CHANGE_ME@db.internal:5432/haas_db?sslmode=verify-full"
+  migration_dsn = "postgresql://haas_owner:CHANGE_ME@db.internal:5432/haas_db?sslmode=verify-full"
+  cidrs         = ["10.20.0.0/16"]
+}
+
+redis = {
+  url                = "rediss://:CHANGE_ME@redis.internal:6379/0"
+  broker_url         = "rediss://:CHANGE_ME@redis.internal:6379/1"
+  result_backend_url = "rediss://:CHANGE_ME@redis.internal:6379/2"
+  address            = "redis.internal:6379"
+  password           = "CHANGE_ME"
+  cidrs              = ["10.30.0.0/16"]
+}

@@ -10,6 +10,40 @@ agent revisions, thread fencing and RLS. Expanded fields remain nullable until t
 explicit operator cutover; production runtime startup refuses that intermediate state.
 JSON arrays do not imply separate normalized entities.
 
+### TUI Data Access Patterns
+
+The `haas-chat` TUI accesses data through the following API endpoints, which map to
+the underlying data model:
+
+| TUI Workspace | API Endpoint | Primary Tables Queried |
+|---|---|---|
+| **Chat** | `POST /v1/runs` | `runs`, `threads`, `tenant_policy_revisions`, `agent_revisions` |
+| **Chat** | `GET /v1/plugins` | `agent_revisions` (via plugin catalog) |
+| **Chat** | `GET /v1/me` | `principals`, `memberships`, `tenants` |
+| **Runs** | `GET /v1/runs` (cursor) | `runs` (tenant-scoped, ordered by `created_at_ts`) |
+| **Runs** | `GET /v1/runs/{id}` | `runs`, `run_steps`, `tool_invocations` |
+| **Runs** | `POST /v1/runs/{id}/cancel` | `runs` (state transition) |
+| **Approvals** | `GET /v1/approvals` | `approval_batches`, `tool_invocations`, `runs` |
+| **Approvals** | `POST /v1/runs/{id}/resume` | `approval_batches`, `approval_decisions`, `runs` |
+| **Admin** | `GET /v1/admin/memberships` | `memberships`, `principals` |
+| **Admin** | `POST /v1/admin/memberships` | `memberships`, `principals`, `audit_events` |
+| **Admin** | `GET /v1/admin/api-keys` | `tenant_api_keys` |
+| **Admin** | `POST /v1/admin/api-keys` | `tenant_api_keys`, `principals`, `audit_events` |
+| **Admin** | `GET /v1/admin/policy` | `tenant_policy_revisions`, `tenants` |
+| **Admin** | `POST /v1/admin/policy/activate` | `tenant_policy_revisions`, `tenants`, `audit_events` |
+| **Admin** | `GET /v1/admin/plugins` | `agent_revisions` (tenant-scoped) |
+| **Admin** | `GET /v1/admin/audit` | `audit_events` |
+| **Thread History** | `GET /v1/threads` | `threads` (tenant-scoped) |
+| **Thread History** | `GET /v1/threads/{id}/history` | `threads` (`messages_json`, `history_version`) |
+| **Thread History** | `POST /v1/threads/{id}/branch` | `threads` (version check, new thread insert) |
+| **Agent Revisions** | `GET /v1/agents` | `agent_revisions` |
+| **Agent Revisions** | `POST /v1/agents/draft` | `agent_revisions` (insert draft) |
+| **Agent Revisions** | `POST /v1/agents/{id}/validate` | `agent_revisions`, `tenant_policy_revisions` |
+| **Agent Revisions** | `POST /v1/agents/{id}/publish` | `agent_revisions` (state transition) |
+| **Agent Revisions** | `GET /v1/agents/{id}/diff/{id2}` | `agent_revisions` (compare) |
+| **Events** | `GET /v1/runs/{id}/events` | `run_events` (gapless sequence) |
+| **OpenAI-compatible** | `POST /v1/chat/completions` | `runs`, `threads`, `tenant_policy_revisions` (admission path) |
+
 ```mermaid
 erDiagram
     threads ||--o{ runs : "tenant-composite ownership"

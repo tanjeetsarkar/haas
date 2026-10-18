@@ -57,6 +57,26 @@ class TenantPolicyRules(BaseModel):
     max_steps: int = Field(default=15, ge=1, le=50)
     max_cost_usd: float = Field(default=0.30, gt=0, le=10)
     retention_class: str = Field(default="standard", min_length=1, max_length=64)
+    # Track M: marketplace trust tiers this tenant may install; None = platform/verified/private.
+    marketplace_tiers: list[str] | None = None
+
+    @field_validator("marketplace_tiers")
+    @classmethod
+    def validate_marketplace_tiers(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        from app.marketplace.tiers import normalize_tier
+
+        normalized = [normalize_tier(value) for value in values]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("marketplace tiers must be unique")
+        return normalized
+
+    def marketplace_tier_allowed(self, tier: str) -> bool:
+        from app.marketplace.tiers import DEFAULT_ALLOWED_TIERS
+
+        allowed = self.marketplace_tiers
+        return tier in (DEFAULT_ALLOWED_TIERS if allowed is None else allowed)
 
     @field_validator("model_providers")
     @classmethod

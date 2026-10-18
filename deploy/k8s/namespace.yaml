@@ -1,0 +1,12 @@
+# Namespace for clusters not managed by deploy/terraform. Enforces the Pod Security
+# "restricted" standard that every HaaS workload is built to satisfy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: haas
+  labels:
+    app.kubernetes.io/part-of: haas
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

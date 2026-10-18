@@ -1,0 +1,27 @@
+{{- range $key, $component := dict "api" "api" "orchestrator" "orchestrator" "toolWorker" "tool-worker" }}
+{{- $c := index $.Values $key }}
+{{- $kedaManaged := and $.Values.keda.enabled (ne $key "api") }}
+{{- if and $c.enabled $c.autoscaling.enabled (not $kedaManaged) }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" $component) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  minReplicas: {{ $c.autoscaling.minReplicas }}
+  maxReplicas: {{ $c.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $c.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

@@ -125,7 +125,57 @@ class HaasClient:
         if response.status_code == 401:
             self.credential = None
             self.auth_expired = True
-        raise HaasAPIError(_detail(response), response.status_code)
+        detail = _detail(response)
+        if response.status_code == 429:
+            retry = response.headers.get("Retry-After")
+            detail = f"Rate limited: {detail}" + (
+                f" Retry after {retry}s." if retry else ""
+            )
+        raise HaasAPIError(detail, response.status_code)
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+    ) -> Any:
+        """Generic scoped API call returning decoded JSON (or None for empty bodies)."""
+        resp = await self.request_raw(method, path, params=params, json_body=json_body)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise HaasAPIError(f"Unexpected non-JSON response from {path}.") from exc
+
+    async def request_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        kw: dict[str, Any] = {"params": params}
+        if json_body is not None:
+            kw["json"] = json_body
+        if content is not None:
+            kw["content"] = content
+        try:
+            resp = await self._http.request(
+                method, path, headers={**self._headers, **(headers or {})}, **kw
+            )
+        except httpx.HTTPError as exc:
+            raise HaasAPIError(
+                f"Cannot reach {self.base_url}: {exc or type(exc).__name__}"
+            ) from exc
+        if resp.status_code >= 400:
+            self._raise_api_error(resp)
+        return resp
 
     async def _request(self, method: str, path: str, **kw: Any) -> Any:
         try:
@@ -450,3 +500,70 @@ class HaasClient:
             if run["status"] not in ACTIVE_RUN_STATUSES:
                 return
             await asyncio.sleep(self.reconnect_delay)
+
+    # Webhook endpoints
+    async def list_webhook_endpoints(self, enabled_only: bool = True) -> list[dict[str, Any]]:
+        return await self._request("GET", "/v1/webhooks/endpoints", params={"enabled_only": enabled_only})
+
+    async def create_webhook_endpoint(self, url: str, events: list[str] | None = None, enabled: bool = True, description: str = "") -> dict[str, Any]:
+        return await self._request("POST", "/v1/webhooks/endpoints", json={
+            "url": url,
+            "events": events or ["run.terminal"],
+            "enabled": enabled,
+            "description": description,
+        })
+
+    async def get_webhook_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/webhooks/endpoints/{endpoint_id}")
+
+    async def update_webhook_endpoint(self, endpoint_id: str, url: str | None = None, events: list[str] | None = None, enabled: bool | None = None, description: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if url is not None:
+            body["url"] = url
+        if events is not None:
+            body["events"] = events
+        if enabled is not None:
+            body["enabled"] = enabled
+        if description is not None:
+            body["description"] = description
+        return await self._request("PATCH", f"/v1/webhooks/endpoints/{endpoint_id}", json=body)
+
+    async def delete_webhook_endpoint(self, endpoint_id: str) -> None:
+        await self._request("DELETE", f"/v1/webhooks/endpoints/{endpoint_id}")
+
+    # Webhook signing keys
+    async def list_webhook_signing_keys(self, active_only: bool = True) -> list[dict[str, Any]]:
+        return await self._request("GET", "/v1/webhooks/signing-keys", params={"active_only": active_only})
+
+    async def create_webhook_signing_key(self, key_id: str, secret_envelope: str) -> dict[str, Any]:
+        return await self._request("POST", "/v1/webhooks/signing-keys", json={
+            "key_id": key_id,
+            "secret_envelope": secret_envelope,
+        })
+
+    async def rotate_webhook_signing_key(self, key_id: str, new_key_id: str, new_secret_envelope: str, retire_at: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "new_key_id": new_key_id,
+            "new_secret_envelope": new_secret_envelope,
+        }
+        if retire_at:
+            body["retire_at"] = retire_at
+        return await self._request("POST", f"/v1/webhooks/signing-keys/{key_id}/rotate", json=body)
+
+    async def revoke_webhook_signing_key(self, key_id: str) -> None:
+        await self._request("POST", f"/v1/webhooks/signing-keys/{key_id}/revoke")
+
+    # Webhook deliveries
+    async def list_webhook_deliveries(self, status: str | None = None, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "/v1/webhooks/deliveries", params=params)
+
+    async def get_webhook_delivery(self, delivery_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/v1/webhooks/deliveries/{delivery_id}")
+
+    async def replay_webhook_deliveries(self, delivery_ids: list[str]) -> dict[str, Any]:
+        return await self._request("POST", "/v1/webhooks/deliveries/replay", json={"delivery_ids": delivery_ids})

@@ -1,0 +1,305 @@
+# Default values for the HaaS chart.
+#
+# The chart never creates Secrets: every credential is a reference to a Secret that
+# you provision out-of-band (External Secrets Operator, Vault agent, sealed-secrets,
+# Terraform kubernetes_secret, ...). Each component only receives the secrets it needs
+# (least privilege mirrors docker-compose.yml): tool workers get no database DSN, no
+# model-provider key and no envelope signing key.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: haas-distributed
+  # Defaults to .Chart.AppVersion. Prefer `digest` in production.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# `prod` activates fail-closed settings (OIDC, encryption key, qualified DB login...).
+profile: prod
+
+# Non-secret settings shared by every app container (rendered into a ConfigMap).
+config:
+  PLUGINS_DIR: /app/plugins
+  PLUGINS_STRICT: "true"
+  PLUGINS_ALLOW: ""
+  PLUGINS_DENY: ""
+  HAAS_MAX_REQUEST_BODY_BYTES: "1048576"
+  HAAS_MAX_PROMPT_CHARS: "32000"
+  SKILLS_PROMPT_MAX_CHARS: "6000"
+
+# Redis connection strings (may embed passwords, so they come from a Secret).
+# Injected into api, orchestrator, toolWorker and maintenance.
+redis:
+  secretEnv:
+    REDIS_URL: {name: haas-redis, key: redis-url}
+    CELERY_BROKER_URL: {name: haas-redis, key: broker-url}
+    CELERY_RESULT_BACKEND: {name: haas-redis, key: result-backend-url}
+
+# Pod/container hardening shared by every workload (Pod Security "restricted").
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# Writable scratch space. The root filesystem is read-only; /tmp is an emptyDir.
+# Set `persistentVolumeClaim` to a ReadWriteMany claim to share tool-output spill
+# files between orchestrator and tool workers across nodes.
+scratchpad:
+  sizeLimit: 1Gi
+  persistentVolumeClaim: ""
+
+serviceAccount:
+  # Workloads never talk to the Kubernetes API.
+  automountToken: false
+  annotations: {}
+
+api:
+  enabled: true
+  replicas: 2
+  command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers"]
+  containerPort: 8000
+  env:
+    DEFAULT_PRIMARY_MODEL: deepseek/deepseek-chat-v3-0324
+    DEFAULT_PLANNER_MODEL: deepseek/deepseek-r1
+    FLOWER_ENABLED: "false"
+  secretEnv:
+    POSTGRES_DSN: {name: haas-api-db, key: postgres-dsn}
+    HAAS_SECRET_ENCRYPTION_KEY: {name: haas-crypto, key: secret-encryption-key}
+    HAAS_OIDC_ISSUER: {name: haas-oidc, key: issuer}
+    HAAS_OIDC_AUDIENCE: {name: haas-oidc, key: audience}
+    HAAS_OIDC_JWKS_URL: {name: haas-oidc, key: jwks-url}
+  service:
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    #  - host: api.haas.example.com
+    #    paths: ["/"]
+    tls: []
+  resources:
+    requests: {cpu: 250m, memory: 384Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  startupProbe:
+    httpGet: {path: /livez, port: http}
+    periodSeconds: 5
+    failureThreshold: 30
+  livenessProbe:
+    httpGet: {path: /livez, port: http}
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    httpGet: {path: /readyz, port: http}
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  terminationGracePeriodSeconds: 30
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+orchestrator:
+  enabled: true
+  replicas: 2
+  concurrency: 8
+  queues: [q_orchestrator]
+  env:
+    HAAS_WORKER_ROLE: orchestrator
+    OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
+    DEFAULT_PRIMARY_MODEL: deepseek/deepseek-chat-v3-0324
+    DEFAULT_PLANNER_MODEL: deepseek/deepseek-r1
+  secretEnv:
+    POSTGRES_DSN: {name: haas-executor-db, key: postgres-dsn}
+    HAAS_SECRET_ENCRYPTION_KEY: {name: haas-crypto, key: secret-encryption-key}
+    HAAS_ENVELOPE_SIGNING_KEY: {name: haas-envelope-signing, key: signing-key}
+    OPENROUTER_API_KEY: {name: haas-model-provider, key: openrouter-api-key}
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1536Mi}
+  livenessProbe:
+    exec:
+      command: ["sh", "-c", "celery -A app.worker.celery_app inspect ping -d orchestrator@$HOSTNAME --timeout 10"]
+    initialDelaySeconds: 30
+    periodSeconds: 60
+    timeoutSeconds: 20
+    failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 75
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  # Long enough for in-flight model steps to checkpoint (Celery warm shutdown).
+  terminationGracePeriodSeconds: 120
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+toolWorker:
+  enabled: true
+  replicas: 2
+  concurrency: 8
+  queues: [q_tools_fast, q_tools_sandbox]
+  env:
+    HAAS_WORKER_ROLE: tools
+  # Verify-only public key; no DSN, no model key, no signing key.
+  secretEnv:
+    HAAS_ENVELOPE_VERIFY_KEY: {name: haas-envelope-verify, key: verify-key}
+  resources:
+    requests: {cpu: 250m, memory: 384Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  livenessProbe:
+    exec:
+      command: ["sh", "-c", "celery -A app.worker.celery_app inspect ping -d tools@$HOSTNAME --timeout 10"]
+    initialDelaySeconds: 30
+    periodSeconds: 60
+    timeoutSeconds: 20
+    failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 30
+    targetCPUUtilizationPercentage: 75
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  terminationGracePeriodSeconds: 120
+  # Optional RuntimeClass for stronger isolation (e.g. gVisor `runsc`, Kata).
+  runtimeClassName: ""
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+maintenance:
+  enabled: true
+  # Reconciler + transactional-outbox relay. One replica; restarts on exit.
+  replicas: 1
+  command: ["python", "-m", "app.maintenance_service"]
+  env: {}
+  secretEnv:
+    POSTGRES_DSN: {name: haas-executor-db, key: postgres-dsn}
+    HAAS_SECRET_ENCRYPTION_KEY: {name: haas-crypto, key: secret-encryption-key}
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  terminationGracePeriodSeconds: 30
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+migrations:
+  enabled: true
+  command: ["python", "-m", "app.migrate"]
+  # Schema-owner login. Never give this credential to runtime workloads.
+  secretEnv:
+    POSTGRES_DSN: {name: haas-migration-db, key: postgres-dsn}
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+# Queue-length autoscaling for workers with KEDA (https://keda.sh). When enabled,
+# KEDA ScaledObjects replace the CPU HPAs of orchestrator and toolWorker.
+keda:
+  enabled: false
+  pollingInterval: 15
+  cooldownPeriod: 300
+  redis:
+    # host:port of the Celery broker Redis; databaseIndex must match CELERY_BROKER_URL.
+    address: redis:6379
+    databaseIndex: "1"
+    enableTLS: "false"
+    # Optional Secret holding the Redis password (key `password`).
+    passwordSecret: ""
+  orchestrator:
+    # Target queued messages per replica.
+    listLength: "10"
+  toolWorker:
+    listLength: "20"
+
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to reach the API (ingress controller, monitoring).
+  apiIngressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  # DNS resolution for every pod.
+  dns:
+    to:
+      - namespaceSelector: {}
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+    ports:
+      - {protocol: UDP, port: 53}
+      - {protocol: TCP, port: 53}
+  # Managed PostgreSQL / Redis endpoints. Replace the CIDRs with your VPC subnets or
+  # use pod/namespace selectors for in-cluster services.
+  postgres:
+    to:
+      - ipBlock: {cidr: 10.0.0.0/8}
+    ports:
+      - {protocol: TCP, port: 5432}
+  redis:
+    to:
+      - ipBlock: {cidr: 10.0.0.0/8}
+    ports:
+      - {protocol: TCP, port: 6379}
+  # Public HTTPS (OIDC JWKS, model provider, tool destinations). Private ranges and
+  # the cloud metadata endpoint are always excluded.
+  publicHttps:
+    cidr: 0.0.0.0/0
+    except:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 100.64.0.0/10
+      - 169.254.0.0/16
+    ports:
+      - {protocol: TCP, port: 443}
+  # Whether tool workers may reach public HTTPS directly. Set false when tool egress
+  # goes through an egress proxy and allow only that proxy in `toolWorkerExtraEgress`.
+  toolWorkerPublicHttps: true
+  toolWorkerExtraEgress: []

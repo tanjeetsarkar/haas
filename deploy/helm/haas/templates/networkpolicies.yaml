@@ -1,0 +1,73 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $publicHttps := dict "to" (list (dict "ipBlock" (dict "cidr" $np.publicHttps.cidr "except" $np.publicHttps.except))) "ports" $np.publicHttps.ports }}
+# Default deny: every pod of this release starts with no ingress and no egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "haas.fullname" . }}-default-deny
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "network") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "haas.releaseSelector" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "haas.fullname" . }}-allow-dns
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "network") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "haas.releaseSelector" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        {{- toYaml $np.dns.to | nindent 8 }}
+      ports:
+        {{- toYaml $np.dns.ports | nindent 8 }}
+{{- $rules := dict
+  "api" (list $np.postgres $np.redis $publicHttps)
+  "orchestrator" (list $np.postgres $np.redis $publicHttps)
+  "maintenance" (list $np.postgres $np.redis)
+  "migrations" (list $np.postgres)
+  "tool-worker" (concat (list $np.redis) (ternary (list $publicHttps) (list) $np.toolWorkerPublicHttps) $np.toolWorkerExtraEgress)
+}}
+{{- range $component, $egress := $rules }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "network") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "haas.selectorLabels" (dict "root" $ "component" $component) | nindent 6 }}
+  {{- if eq $component "api" }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        {{- toYaml $np.apiIngressFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.api.containerPort }}
+  {{- else }}
+  policyTypes: [Egress]
+  {{- end }}
+  egress:
+    {{- range $egress }}
+    - to:
+        {{- toYaml .to | nindent 8 }}
+      {{- with .ports }}
+      ports:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

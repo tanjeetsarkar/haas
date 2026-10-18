@@ -1,0 +1,50 @@
+{{- if .Values.keda.enabled }}
+{{- $k := .Values.keda }}
+{{- if $k.redis.passwordSecret }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "haas.fullname" . }}-redis
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" "keda") | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: {{ $k.redis.passwordSecret }}
+      key: password
+{{- end }}
+{{- range $key, $component := dict "orchestrator" "orchestrator" "toolWorker" "tool-worker" }}
+{{- $c := index $.Values $key }}
+{{- if $c.enabled }}
+---
+# Scales on Celery queue depth (Redis list length per queue) instead of CPU.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" $component) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  pollingInterval: {{ $k.pollingInterval }}
+  cooldownPeriod: {{ $k.cooldownPeriod }}
+  minReplicaCount: {{ $c.autoscaling.minReplicas }}
+  maxReplicaCount: {{ $c.autoscaling.maxReplicas }}
+  triggers:
+    {{- range $c.queues }}
+    - type: redis
+      metadata:
+        address: {{ $k.redis.address | quote }}
+        databaseIndex: {{ $k.redis.databaseIndex | quote }}
+        enableTLS: {{ $k.redis.enableTLS | quote }}
+        listName: {{ . | quote }}
+        listLength: {{ (index $k $key).listLength | quote }}
+      {{- if $k.redis.passwordSecret }}
+      authenticationRef:
+        name: {{ include "haas.fullname" $ }}-redis
+      {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

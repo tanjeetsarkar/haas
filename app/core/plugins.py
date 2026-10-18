@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import importlib.metadata
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Collection, Iterable
 
 import yaml
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from app.core.context import (
     RunContext,
@@ -60,9 +61,18 @@ class RegisteredTool:
     plugin_id: str = ""
     source: str = ""  # file that registered the tool (python module or endpoint json)
     secret_key: str = ""  # endpoint tools only: secret used to sign/authenticate calls
+    # JSON schema from the static catalog; preferred over `args_schema` when set.
+    parameters_schema: dict[str, Any] | None = None
+    # inprocess: app code (core/endpoint tools); plugin: imported plugin code;
+    # static: catalog-only entry whose code exists only inside the sandbox.
+    execution: str = "inprocess"
+    secret_keys: list[str] = field(default_factory=list)
 
     def to_openai_schema(self) -> dict[str, Any]:
-        schema = self.args_schema.model_json_schema()
+        if self.parameters_schema is not None:
+            schema = copy.deepcopy(self.parameters_schema)
+        else:
+            schema = self.args_schema.model_json_schema()
         schema.pop("title", None)
         return {
             "type": "function",
@@ -103,6 +113,20 @@ class PluginRecord:
     skills: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     digest: str = ""
+    artifact_digest: str = ""  # sha256 of the OCI manifest of the packed plugin
+    catalog_digest: str = ""  # static catalog mode only
+
+
+class StaticToolArgs(BaseModel):
+    """Placeholder schema for catalog-only tools; the sandbox validates the real model."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+def _static_tool_handler(*_args: Any, **_kwargs: Any) -> Any:
+    raise ToolRemediationError(
+        "This tool's code is only loaded inside the sandbox (static catalog mode)."
+    )
 
 
 @dataclass

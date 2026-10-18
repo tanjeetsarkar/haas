@@ -1,0 +1,18 @@
+HaaS {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" (profile: {{ .Values.profile }}).
+
+Required pre-provisioned Secrets (the chart never creates credentials):
+{{- $seen := dict }}
+{{- range $c := list .Values.redis .Values.api .Values.orchestrator .Values.toolWorker .Values.maintenance .Values.migrations }}
+{{- range $env, $ref := $c.secretEnv }}
+{{- $_ := set $seen (printf "%s/%s" $ref.name $ref.key) true }}
+{{- end }}
+{{- end }}
+{{- range $k, $_ := $seen }}
+  - {{ $k }}
+{{- end }}
+
+API service: {{ include "haas.componentName" (dict "root" $ "component" "api") }}:{{ .Values.api.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "haas.componentName" (dict "root" $ "component" "api") }} 8000:{{ .Values.api.service.port }}
+  curl -fsS http://127.0.0.1:8000/readyz
+
+Runbooks: docs/launch/ and docs/runbooks/ in the source repository.

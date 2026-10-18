@@ -111,6 +111,21 @@ delivery order, not an exploit severity score.
 | TM-33 Disclosure | SDK/CLI leaks tokens via logs, URLs, crash reports or shell history | Client holds secrets in memory; no bearer support | Redacting loggers, header-only credentials, OS keychain storage, device flow | P2 |
 | TM-34 Tampering | Registry, signing key or CDN compromise distributes malicious artifacts | Not applicable | Sigstore transparency log, provenance verification at install and launch, key ceremony and rotation, mirror digest checks | P0 |
 
+### TUI-Specific Threat Scenarios (CURRENT)
+
+| ID / STRIDE | Scenario and affected flow | Current control / limitation | Required target treatment | Priority |
+|---|---|---|---|---|
+| TM-TUI-01 Spoofing | TUI user impersonates another principal via stolen API key | API key is SHA-256 hashed; `/login` stores credential in memory only; `/logout` clears it; no persistence | Short-lived API keys, device flow, hardware-bound credentials | P1 |
+| TM-TUI-02 Disclosure | Secret values displayed in TUI chat/logs | Secrets never written to chat, masked in `/secret list`, omitted from history; only sent in run request body | Structured redaction in all outputs; secret never in TUI memory after run submission | P1 |
+| TM-TUI-03 Tampering | Malicious TUI modification approves without user consent | Approval dialog requires explicit `y`/`n`/`Esc`; `Esc` leaves pending; no auto-approve | Signed approval decisions with user attestation; hardware confirmation for high-risk | P1 |
+| TM-TUI-04 Elevation | TUI user with submitter role accesses Admin workspace | Admin workspace visibility gated by `tenant_admin`/`auditor` roles from `/v1/me` capabilities; buttons hidden but API still enforces RBAC | Capability-driven UI with server-authoritative checks; no client-side role caching | P1 |
+| TM-TUI-05 Disclosure | SSE stream exposes other tenant's run events | SSE requires run ownership; `Last-Event-ID` resume checked against tenant; RLS on `run_events` | Per-connection tenant context; periodic re-authorization on long-lived streams | P1 |
+| TM-TUI-06 Tampering | TUI sends modified tool arguments in approval decision | Approval decision bound to `batch_digest` (SHA-256 of exact pending calls); server rejects digest mismatch | Immutable decision binding; client cannot modify arguments | P0 |
+| TM-TUI-07 DoS | TUI holds SSE connection open indefinitely | SSE reconnects up to 5 attempts; server enforces stream retention limits | Connection timeouts, fair queue per tenant, stream heartbeat | P1 |
+| TM-TUI-08 Disclosure | TUI command history leaks secrets | `/secret` commands never stored in history; `PromptInput.remember()` skips secret lines | No secret in any client-side persistence; secure input mode for secrets | P1 |
+| TM-TUI-09 Spoofing | TUI connects to malicious HaaS endpoint (MITM) | TLS verification; profile stores endpoint only; `/login` verifies identity with server | Certificate pinning, TOFU for profiles, signed server identity | P1 |
+| TM-TUI-10 Tampering | TUI user bypasses approval via `--auto-approve` flag | `--auto-approve` only in one-shot mode; interactive TUI always prompts; server still enforces approval | Server-side approval requirement cannot be bypassed by client flags | P0 |
+
 ### Important limits of existing controls
 
 * Phase 2 RLS isolates tenant content for the non-owner API login, including tenant

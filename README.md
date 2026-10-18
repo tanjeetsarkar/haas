@@ -27,6 +27,43 @@ tenancy, RBAC and transaction-scoped PostgreSQL RLS are implemented foundations.
 Durable dispatch recovery, worker-time revocation, mediated egress and per-run
 sandboxing remain production requirements, not guarantees of the current Compose stack.
 
+## Core Features
+
+### Multi-Tenant Architecture
+- **Tenant isolation**: Complete data and execution isolation via PostgreSQL RLS and tenant-composite foreign keys
+- **Identity & RBAC**: Provider-neutral OIDC JWTs and tenant-scoped API keys with roles (tenant_admin, submitter, approver, auditor)
+- **Policy-driven**: Versioned tenant policies control models, plugins, skills, webhooks, budgets, and retention
+- **Audit trail**: Append-only audit events with actor, action, target, and request correlation
+
+### Agent Orchestration
+- **Runs**: Bounded agent executions with step limits, cost budgets, and tool invocation quotas
+- **Threads**: Persistent conversation history with versioned branching and atomic claim/release
+- **Skills**: Declarative capabilities bundling instructions, references, tool requirements, and secret declarations
+- **Planner/Primary model routing**: Separate models for planning and execution with automatic fallback
+
+### Human-in-the-Loop (HITL)
+- **Approval gates**: Exact batch digest binding, expiry, attributed decisions, no self-approval
+- **Cooperative cancellation**: Request cancellation with in-flight tool settlement
+- **Durable events**: Gapless per-run event sequences for SSE replay and `/events` API
+
+### Plugin System
+- **Plugin packs**: Versioned `plugins/<id>/plugin.json` bundles with skills, native tools, HTTP/MCP manifests
+- **Static manifests**: Policy, readiness, isolation declarations without runtime code execution in control plane
+- **Tool unlocking**: Only core tools + tools of active skills enforced on tool workers
+- **Marketplace ready**: Signed artifacts, provenance, consent, tier policy (TARGET)
+
+### Multi-Agent Collaboration (HACP)
+- **Child runs**: Spawn, join, message, and hand off between agents as durable child runs
+- **Delegation**: Attenuated capabilities and budget slices to child agents
+- **Shared workspace**: Versioned, scoped workspace with CAS conflict resolution
+- **Interoperability**: A2A, MCP server, and OpenAI-compatible facade with policy parity
+
+### Developer Platform
+- **OpenAI-compatible API**: `/v1/chat/completions`, `/v1/responses`, `/v1/models` with `model="agent/<name>"`
+- **SDKs**: Python (`haas_sdk`) and TypeScript with safe defaults and credential hygiene
+- **CLI**: Unified `haas` CLI with `chat`, `profile`, `admin`, `dev`, `plugin` commands
+- **Contracts**: Machine-readable OpenAPI, AsyncAPI, and JSON Schema with breaking-change detection
+
 ## Deterministic local development
 
 The `haas dev` stack is isolated from the regular Compose project, uses a deterministic mock
@@ -109,20 +146,62 @@ deliberately refuse active or paused legacy runs.
 The base Compose file does not publish Redis/PostgreSQL ports or start Flower; the dev
 overlay adds loopback-only ports and Flower. Do not combine the dev overlay with production.
 
-## Chat TUI
+## Chat TUI — Terminal Workbench
+
+The `haas-chat` TUI (also available as `haas chat`) is a keyboard-first terminal workbench
+that connects to HaaS as a service. It provides:
+
+### Workspaces (Ctrl+1/2/3/4)
+- **Chat**: Multiline composition, command completion, Markdown answers, tool previews, model/step/cost indicators
+- **Runs**: Tenant-scoped cursor-paginated run list with status, thread, steps, cost; attach/reattach/cancel
+- **Approvals**: Review queue with lineage, exact actions/destinations, permission/argument diffs, expiry
+- **Admin**: Role-gated membership, API keys, policy, scoped plugins, audit workflows (tenant_admin/auditor)
+
+### Key Features
+- **Verified identity**: `/login` with API key or OIDC bearer; `/tenant` switches verified by server
+- **Profiles**: Named non-secret environment profiles (`haas profile add`) with URL, tenant, environment
+- **Slash commands**: `/skills`, `/secret`, `/agent draft/validate/publish/use/diff`, `/threads`, `/history`, `/branch`, `/approve`, `/status`
+- **Live output deltas**: Streaming tool output previews with final durable log settlement
+- **SSE reconnect**: Automatic reconnection with cursor preservation
+- **Accessibility**: ASCII mode, theme cycling, focus navigation, screen reader compatible
 
 ```bash
 uv pip install -e ".[tui]"      # once
 haas-chat                       # talks to http://localhost:8000 (HAAS_URL / --url to change)
 haas-chat --preload weather     # activate a skill from the first message
+haas-chat --thread thd_ab12cd34ef56  # continue an earlier conversation
 ```
 
 Full navigation guide (screen layout, keys, slash commands, approvals, secrets, recipes, troubleshooting):
 [docs/tui_usage.md](docs/tui_usage.md).
-Verified identities with tenant-admin or auditor roles also get an Admin workspace for
-authorized membership, API-key, policy, scoped-plugin and audit workflows. The unified
-`haas` CLI currently includes `chat`, `profile`, `admin`, and `dev` commands; other CLI
-surfaces remain roadmap work.
+
+### TUI ↔ Harness Service Interaction
+
+The TUI interacts with the HaaS service through:
+
+1. **REST API** (`/v1/runs`, `/v1/threads`, `/v1/agents`, `/v1/plugins`, `/v1/admin/*`)
+   - Run submission with prompt, secrets, skill preloads, model overrides, budgets
+   - Thread history, branching, agent revision management
+   - Plugin catalog discovery, tenant policy, scoped plugin inventory
+   - Admin operations (memberships, API keys, policy, audit) with RBAC enforcement
+
+2. **Server-Sent Events (SSE)** (`/v1/runs/{run_id}/stream`)
+   - Real-time run events: `run_queued`, `step_started`, `tool_dispatched`, `tool_result`, `run_completed`, `run_error`, `run_cancelled`
+   - Approval events: `hitl_pending`, `hitl_approved`, `hitl_rejected`, `approval_expired`
+   - Recovery events: `run_recovering`, `stream_gap`
+   - Last-Event-ID resume for durable replay
+
+3. **Output Deltas** (when server advertises `output-deltas.v1`)
+   - Advisory live streaming of tool output chunks (`run.output.delta`)
+   - Final output from durable `run_completed` event supersedes preview
+
+4. **Webhooks** (configured in tenant policy)
+   - Terminal callbacks on run completion/failure/cancellation
+   - Signed delivery with replay protection (TARGET)
+
+5. **OpenAI-compatible facade** (`/v1/chat/completions`, `/v1/responses`)
+   - Drop-in replacement for OpenAI SDKs with HaaS policy enforcement
+   - Model format: `agent/<published-agent-name>` or policy-allowed model
 
 Phase 2 workflows are keyboard-first commands in Chat:
 `/agent draft` opens a structured JSON form, `/agents` browses revisions,
@@ -131,7 +210,12 @@ Phase 2 workflows are keyboard-first commands in Chat:
 policy permissions and registry fingerprints. `/threads [search]`, `/threads next`,
 `/history [offset]` and `/branch VERSION` browse or explicitly branch committed history.
 See the [terminal guide](docs/tui_usage.md#agent-revisions-and-thread-history) for roles
-and conflict recovery. These use scoped `/v1/agents` and `/v1/threads` APIs through the
+and conflict recovery.
+
+Verified identities with tenant-admin or auditor roles also get an Admin workspace for
+authorized membership, API-key, policy, scoped-plugin and audit workflows. The unified
+`haas` CLI currently includes `chat`, `profile`, `admin`, `dev`, and `plugin` commands; other CLI
+surfaces remain roadmap work.ry. These use scoped `/v1/agents` and `/v1/threads` APIs through the
 shared Python client, not database access. `/v1/capabilities` and `/v1/me` advertise
 identity-scoped actions and supported event schemas (`run-events.v1`, durable replay).
 

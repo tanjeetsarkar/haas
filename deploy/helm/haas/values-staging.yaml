@@ -1,0 +1,21 @@
+# Staging overlay: production profile and controls with smaller footprints.
+profile: prod
+
+api:
+  autoscaling:
+    minReplicas: 2
+    maxReplicas: 4
+
+orchestrator:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 6
+  pdb:
+    enabled: false
+
+toolWorker:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 8
+  pdb:
+    enabled: false

@@ -1,0 +1,17 @@
+{{- range $key, $component := dict "api" "api" "orchestrator" "orchestrator" "toolWorker" "tool-worker" }}
+{{- $c := index $.Values $key }}
+{{- if and $c.enabled $c.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "haas.componentName" (dict "root" $ "component" $component) }}
+  labels:
+    {{- include "haas.labels" (dict "root" $ "component" $component) | nindent 4 }}
+spec:
+  maxUnavailable: {{ $c.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "haas.selectorLabels" (dict "root" $ "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}
