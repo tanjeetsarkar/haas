@@ -7,6 +7,15 @@
 isolated `haas dev` mock stack. The broader SDK, contract tooling and integration surfaces
 remain targets ([integrations](integrations-usage.md), [roadmap](../roadmap.md)).
 
+Phase 2 supplies scoped, cursor-paginated `/v1/agents` and `/v1/threads`,
+version-pinned history/branch operations, immutable published revision admission and
+shared Python client/TUI methods. `/v1/capabilities`, also embedded in `/v1/me`,
+advertises metadata version `1`, authorized actions, feature versions and supported
+`redis-stream.v1` observations. `durable_replay: false` describes the existing finite
+Redis transport honestly; Phase 3 still owns durable events. This metadata is a UI
+compatibility hint, never an authorization grant. Full event schemas, AsyncAPI,
+Spectral/oasdiff and distributable Python/TypeScript SDKs remain Track D work.
+
 ## 1. Principles
 
 * **Contract first.** OpenAPI 3.1 for REST, JSON Schema for every event and webhook payload,

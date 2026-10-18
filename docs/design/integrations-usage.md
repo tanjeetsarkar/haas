@@ -345,11 +345,16 @@ original run receipt; a different digest returns 409.
 
 Tenant identity, membership, API-key, policy and audit APIs are implemented with
 authenticated `haas admin` and TUI workflows. Tenant provisioning starts with the
-bootstrap command; immutable agent revisions remain a Phase 2 capability, so the
-current `/v1` examples do not provision agents. Production API startup accepts only a
+bootstrap command. Phase 2 adds immutable agent draft/validate/publish APIs,
+revision-pinned admission and scoped thread/history/branch APIs. Production API startup accepts only a
 complete HTTPS OIDC configuration and the production encryption-key requirements;
-authenticated run admission still fails closed when no valid active tenant policy exists.
+it also requires non-owner RLS runtime logins and completed legacy cutover. Authenticated
+run admission fails closed when no valid active tenant policy exists.
 Development examples continue to use the local-only `X-Tenant-ID` compatibility path.
+The terminal [agent/history guide](../tui_usage.md#agent-revisions-and-thread-history)
+and generated [OpenAPI contract](../openapi-v1.json) describe the additive current API.
+Idempotency keys, durable events, secret-binding references and signed terminal callbacks
+in the target journey above remain later-phase work.
 
 ### Execution envelope
 

@@ -215,16 +215,18 @@ class ApprovalScreen(ModalScreen[Decision | None]):
         if not self.decisions_enabled:
             self.query_one("#approve", Button).disabled = True
             self.query_one("#reject", Button).disabled = True
-        if any(
-            len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls
-        ):
+        if any(len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls):
             self.query_one("#approve", Button).disabled = True
         self.query_one("#leave-pending", Button).focus()
 
     def action_approve(self) -> None:
-        if self.decisions_enabled and not any(
-            len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls
-        ) and not isinstance(self.focused, Input):
+        if (
+            self.decisions_enabled
+            and not any(
+                len(call.pretty_args) > MAX_APPROVAL_ARGUMENTS for call in self.calls
+            )
+            and not isinstance(self.focused, Input)
+        ):
             self.dismiss(Decision(True))
 
     def action_reject(self) -> None:
@@ -449,11 +451,13 @@ class AdminFormScreen(ModalScreen[dict[str, str] | None]):
         fields: list[tuple[str, str, str]],
         *,
         json_value: str | None = None,
+        json_label: str = "Policy rules JSON",
     ) -> None:
         super().__init__()
         self.form_title = title
         self.fields = fields
         self.json_value = json_value
+        self.json_label = json_label
 
     def compose(self) -> ComposeResult:
         with Vertical(id="admin-form-box"):
@@ -462,7 +466,7 @@ class AdminFormScreen(ModalScreen[dict[str, str] | None]):
                 yield Static(label, classes="admin-field-label")
                 yield Input(placeholder=placeholder, id=f"admin-field-{field_id}")
             if self.json_value is not None:
-                yield Static("Policy rules JSON", classes="admin-field-label")
+                yield Static(self.json_label, classes="admin-field-label")
                 yield TextArea(self.json_value, id="admin-form-json", language="json")
             yield Static("", id="identity-error")
             with Horizontal(id="identity-buttons"):
@@ -876,6 +880,19 @@ class ChatApp(App[None]):
             or identity.get("environment") not in ("dev", "staging", "prod")
         ):
             raise HaasAPIError("Identity response is malformed.", 502)
+        capabilities = identity.get("capabilities")
+        if capabilities is not None and (
+            not isinstance(capabilities, dict)
+            or capabilities.get("version") != "1"
+            or not isinstance(capabilities.get("actions"), list)
+            or not all(isinstance(action, str) for action in capabilities["actions"])
+            or not isinstance(capabilities.get("event_schemas"), list)
+            or "redis-stream.v1" not in capabilities.get("event_schemas", [])
+        ):
+            raise HaasAPIError(
+                "Server capability/event schema is incompatible; update the client.",
+                502,
+            )
         return identity
 
     def _accept_identity(self, identity: Any) -> dict[str, Any]:
@@ -955,6 +972,8 @@ class ChatApp(App[None]):
         self._main("#status", Static).update(Text(separator.join(parts)))
 
     def _tick(self) -> None:
+        if not self.screen_stack:
+            return
         try:
             act = self._main("#activity", Static)
         except NoMatches:  # timer can fire before the screen finishes composing
@@ -1077,6 +1096,42 @@ class ChatApp(App[None]):
         if command == "/approve":
             await self.action_review_approval(argument)
             return
+        if command == "/agent" and argument == "draft":
+            if not self._has_admin_role():
+                await self._note(
+                    "Agent authoring requires a signed-in tenant administrator.",
+                    style="yellow",
+                )
+                return
+            values = await self.push_screen_wait(
+                AdminFormScreen(
+                    "Create immutable agent draft",
+                    [("name", "Agent name", "my-agent")],
+                    json_label="Agent configuration JSON (no credentials)",
+                    json_value=json.dumps(
+                        {
+                            "primary_model": "",
+                            "planner_model": "",
+                            "skills": [],
+                            "preload_skills": [],
+                            "max_steps": 15,
+                            "max_cost_usd": 0.30,
+                        },
+                        indent=2,
+                    ),
+                )
+            )
+            if values is None:
+                return
+            try:
+                config = json.loads(values["json"])
+                if not isinstance(config, dict):
+                    raise ValueError("Configuration must be a JSON object.")
+                result = await self.session.client.draft_agent(values["name"], config)
+                await self._note(json.dumps(result), style="green")
+            except (ValueError, HaasAPIError) as exc:
+                await self._note(sanitize_terminal_text(exc, limit=1000), style="red")
+            return
         result = await handle_command(self.session, line)
         if result.quit:
             self.exit()
@@ -1157,9 +1212,7 @@ class ChatApp(App[None]):
         self._phase = "waiting for approval"
         roles = self.identity.get("roles", []) if self.identity else []
         decisions_enabled = self.identity is None or (
-            isinstance(roles, list)
-            and "approver" in roles
-            and not self._submitting_run
+            isinstance(roles, list) and "approver" in roles and not self._submitting_run
         )
         decision = await self.push_screen_wait(
             ApprovalScreen(
@@ -1471,13 +1524,18 @@ class ChatApp(App[None]):
         self._refresh_bars()
 
     def _has_admin_role(self) -> bool:
-        return bool(self.identity and "tenant_admin" in self.identity["roles"])
+        return self._has_action("tenant.admin", {"tenant_admin"})
 
     def _has_audit_role(self) -> bool:
-        return bool(
-            self.identity
-            and {"tenant_admin", "auditor"}.intersection(self.identity["roles"])
-        )
+        return self._has_action("audit.read", {"tenant_admin", "auditor"})
+
+    def _has_action(self, action: str, legacy_roles: set[str]) -> bool:
+        if self.identity is None:
+            return False
+        metadata = self.identity.get("capabilities")
+        if metadata is not None:
+            return action in metadata["actions"]
+        return bool(legacy_roles.intersection(self.identity["roles"]))
 
     def _refresh_admin_visibility(self) -> None:
         try:
@@ -1546,8 +1604,7 @@ class ChatApp(App[None]):
             if label == "Create API key":
                 content = (
                     "The API credential is shown once. Copy it now; the TUI will not "
-                    "save it.\n\n"
-                    + content
+                    "save it.\n\n" + content
                 )
             self._main("#admin-result", Static).update(
                 Text(sanitize_terminal_text(content, limit=MAX_RENDERED_OUTPUT))
@@ -1813,7 +1870,9 @@ class ChatApp(App[None]):
         calls: list[PendingCall] = []
         for item in raw_calls:
             if not isinstance(item, dict):
-                await self._note("The approval data from the API is malformed.", style="red")
+                await self._note(
+                    "The approval data from the API is malformed.", style="red"
+                )
                 return
             function = item.get("function")
             function_data = function if isinstance(function, dict) else {}
@@ -1821,7 +1880,9 @@ class ChatApp(App[None]):
             name = item.get("name", function_data.get("name"))
             arguments = item.get("arguments", function_data.get("arguments", {}))
             if not isinstance(call_id, str) or not isinstance(name, str):
-                await self._note("The approval data from the API is malformed.", style="red")
+                await self._note(
+                    "The approval data from the API is malformed.", style="red"
+                )
                 return
             calls.append(PendingCall(call_id, name, arguments))
         if not calls:
@@ -1831,9 +1892,7 @@ class ChatApp(App[None]):
             )
             return
 
-        decision = await self.push_screen_wait(
-            ApprovalScreen(calls, ascii=self._ascii)
-        )
+        decision = await self.push_screen_wait(ApprovalScreen(calls, ascii=self._ascii))
         if decision is None:
             await self._note(
                 f"Approval for {sanitize_terminal_text(run_id, limit=64)} remains pending.",

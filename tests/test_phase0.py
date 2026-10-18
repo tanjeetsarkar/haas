@@ -219,9 +219,18 @@ def test_scratchpad_gc_removes_only_expired_regular_text_files(tmp_path):
 
 
 def test_orphan_reaper_updates_only_rows_returned_by_atomic_update():
+    from contextlib import asynccontextmanager
+
     class Connection:
         query = ""
         params: tuple = ()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        async def execute(self, *_args):
+            return "SELECT 1"
 
         async def fetch(self, query, *params):
             self.query = query

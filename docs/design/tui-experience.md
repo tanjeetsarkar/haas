@@ -15,9 +15,14 @@ answers, tool previews, model/step/cost indicators, approval dialogs, SSE reconn
 run browsing/reattach/cooperative cancellation, verified bearer identity, named non-secret
 profiles, tenant switching, and role-gated membership/API-key/policy/scoped-inventory/audit
 workflows. The client verifies the tenant with `/v1/me`; unauthenticated development mode
-still uses the header only as a local selector. Agent revisions, persistent thread/history
-browsing, capability metadata, marketplace consent, distributed-agent inspection and
-operator workflows remain roadmap work.
+still uses the header only as a local selector. Phase 2 adds command-driven agent
+draft/validate/publish/diff/pinning and paginated thread/history/branch journeys,
+with a structured JSON draft form and explicit active-run/version conflict recovery.
+Versioned identity-scoped capability metadata drives administration visibility; older
+servers without metadata retain the role-based compatibility path, and unsupported
+advertised versions/event schemas are rejected. These are Chat commands, not new
+dedicated visual workspaces. Marketplace consent, distributed-agent inspection,
+durable timelines and operator workflows remain roadmap work.
 
 The target is an **agent mission control terminal**: a welcoming chat for first-time users,
 a precise execution workbench for developers, and an authorized control surface for

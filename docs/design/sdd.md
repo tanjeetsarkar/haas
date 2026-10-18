@@ -51,8 +51,8 @@ extension. It does not add runtime functionality.
 | ID | Requirement | Current evidence / gap | Target verification |
 |---|---|---|---|
 | FR-01 | Accept bounded asynchronous work and return a run handle | `POST /v1/runs`, 202 | Idempotent admission test |
-| FR-02 | Authorize every resource operation within an authenticated tenant | Header + run/thread ownership only | Membership, role and cross-tenant negative tests |
-| FR-03 | Preserve thread history without concurrent overwrite | Completed runs update whole thread history; no serialization | Thread version/active-run conflict tests |
+| FR-02 | Authorize every resource operation within an authenticated tenant | Verified OIDC/API keys, RBAC, composite ownership constraints and transaction-scoped forced RLS; artifact isolation remains later work | Membership, role and cross-tenant negative tests |
+| FR-03 | Preserve thread history without concurrent overwrite | Atomic thread claim/version checks and completion, scoped history/branch APIs | Thread version/active-run conflict tests |
 | FR-04 | Expose only permitted, ready skills/tools | Tenant/run skill lists and worker unlock checks | Revocation, policy and worker enforcement tests |
 | FR-05 | Execute an explicit, recoverable run lifecycle | Checkpoints; general updates not version-fenced | Crash/replay and lease-fencing tests |
 | FR-06 | Pause side-effecting batches for authorized human decisions | `input_required`, atomic resume claim | Exact-batch digest, expiry and approver-role tests |
@@ -61,9 +61,9 @@ extension. It does not add runtime functionality.
 | FR-09 | Integrate native, HTTP and MCP capabilities | Plugin registry adapters | Destination/auth/schema contract tests |
 | FR-10 | Minimize secret exposure | Run Redis value; union of active-skill secrets copied to task | Invocation-specific credential broker tests |
 | FR-11 | Deliver terminal callbacks reliably and verifiably | Unsigned callback task with retries | Signed delivery, replay protection, DLQ and replay tests |
-| FR-12 | Meter usage per tenant and export an audit trail | Floating-point run cost and basic logs | Unique ledger charges and immutable audit tests |
+| FR-12 | Meter usage per tenant and export an audit trail | NUMERIC cost after Phase 2 cutover and append-only actor-scoped audit; no usage ledger yet | Unique ledger charges and immutable audit tests |
 | FR-13 | Cancel work and enforce tenant suspension | Cooperative cancel endpoint; no fenced suspension/cascade | Fenced cancellation and revocation tests |
-| FR-14 | Select approved agent configuration reproducibly | Request model overrides; fingerprint drift warning | Agent/policy/plugin revision pinning tests |
+| FR-14 | Select approved agent configuration reproducibly | Immutable draft/validated/published agent configuration, pinned policy and registry fingerprint; signed plugin artifacts remain P4 | Agent/policy/plugin revision pinning tests |
 | FR-15 | Publish signed, versioned plugin revisions with declared permissions | Local packs, no signing or permission manifest | Signature/provenance and manifest validation tests (SEC-16) |
 | FR-16 | Let tenants discover and install marketplace plugins under consent and tier policy | Operator allow/deny env only | Consent, tier and re-consent-on-expansion tests (SEC-18) |
 | FR-17 | Revoke or yank plugin revisions and fence affected work | Restart-based reload | Yank/advisory revocation fencing tests (SEC-19) |
@@ -74,7 +74,7 @@ extension. It does not add runtime functionality.
 | FR-22 | Interoperate via A2A, MCP server and an OpenAI-compatible facade with policy parity | Not present | Authn/authz matrix and facade parity tests (SEC-23, SEC-24) |
 | FR-23 | Provide a versioned machine-readable contract for API, events and webhooks | FastAPI-generated OpenAPI only | Spectral lint, breaking-change diff, schema conformance tests |
 | FR-24 | Provide Python and TypeScript SDKs and a unified CLI with safe defaults | Internal Python client, TUI, `haas-plugin` | SDK conformance suite against mock server; credential hygiene (SEC-26) |
-| FR-25 | Deliver user-facing platform capabilities through a keyboard-first, authorized, recoverable terminal workbench alongside backend milestones | Chat/approval TUI only; Phase 0 listing/cancel not wired to it | Track T journey parity, auth/recovery, safe rendering, terminal/accessibility, performance and compatibility gates (TUI-01..07) |
+| FR-25 | Deliver user-facing platform capabilities through a keyboard-first, authorized, recoverable terminal workbench alongside backend milestones | T0/T1 workbench plus command-driven T2 agent/history/branch journeys and capability metadata; durable inspection and later-phase journeys remain targets | Track T journey parity, auth/recovery, safe rendering, terminal/accessibility, performance and compatibility gates (TUI-01..07) |
 
 Proposed availability, latency, recovery and retention objectives are specified in
 [operations](operations-migration.md). They are acceptance targets, not measured results.

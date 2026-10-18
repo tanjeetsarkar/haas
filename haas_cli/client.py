@@ -143,6 +143,79 @@ class HaasClient:
     async def identity(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/me")
 
+    async def capabilities(self) -> dict[str, Any]:
+        return await self._request("GET", "/v1/capabilities")
+
+    async def list_threads(
+        self, *, cursor: str | None = None, search: str = ""
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/v1/threads",
+            params={
+                "search": search,
+                **({"cursor": cursor} if cursor else {}),
+            },
+        )
+
+    async def thread_history(
+        self,
+        thread_id: str,
+        *,
+        offset: int = 0,
+        history_version: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/v1/threads/{quote(thread_id, safe='')}",
+            params={
+                "offset": offset,
+                **(
+                    {"history_version": history_version}
+                    if history_version is not None
+                    else {}
+                ),
+            },
+        )
+
+    async def branch_thread(
+        self, thread_id: str, history_version: int
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/v1/threads/{quote(thread_id, safe='')}/branches",
+            json={"expected_history_version": history_version},
+        )
+
+    async def list_agent_revisions(self, cursor: str | None = None) -> dict[str, Any]:
+        return await self._request(
+            "GET", "/v1/agents/revisions", params={"cursor": cursor} if cursor else {}
+        )
+
+    async def agent_revision(self, revision_id: str) -> dict[str, Any]:
+        return await self._request(
+            "GET", f"/v1/agents/revisions/{quote(revision_id, safe='')}"
+        )
+
+    async def draft_agent(
+        self, name: str, configuration: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/v1/agents/revisions",
+            json={"agent_name": name, "configuration": configuration},
+        )
+
+    async def transition_agent(
+        self, revision_id: str, operation: str
+    ) -> dict[str, Any]:
+        if operation not in {"validate", "publish"}:
+            raise ValueError("Agent operation must be validate or publish.")
+        return await self._request(
+            "POST",
+            f"/v1/agents/revisions/{quote(revision_id, safe='')}/{operation}",
+        )
+
     async def list_memberships(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/admin/memberships")
 
@@ -225,6 +298,8 @@ class HaasClient:
         max_steps: int | None = None,
         max_cost_usd: float | None = None,
         secrets: dict[str, str] | None = None,
+        agent_revision_id: str | None = None,
+        expected_history_version: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "prompt": prompt,
@@ -236,6 +311,15 @@ class HaasClient:
             "max_cost_usd": max_cost_usd,
             "secrets": secrets or {},
         }
+        if agent_revision_id is not None:
+            body = {
+                "prompt": prompt,
+                "thread_id": thread_id,
+                "agent_revision_id": agent_revision_id,
+                "secrets": secrets or {},
+            }
+        if expected_history_version is not None:
+            body["expected_history_version"] = expected_history_version
         return await self._request(
             "POST", "/v1/runs", json={k: v for k, v in body.items() if v is not None}
         )

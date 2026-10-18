@@ -134,6 +134,12 @@ Type `/` to open the suggestion list under the prompt (command name + descriptio
 | `/steps N` | Max LLM steps per run (1–50; server default 15) |
 | `/budget USD` | Max cost per run (above 0, up to 10; server default 0.30) |
 | `/thread [id]` | Show the current thread id, or switch to another one |
+| `/agents [next]` | Browse tenant agent revisions with cursor paging |
+| `/agent draft` | Tenant-admin structured JSON form for a new immutable draft |
+| `/agent show ID` · `/agent validate ID` · `/agent publish ID` | Inspect or advance a revision; validation/publication require tenant-admin authority |
+| `/agent diff ID ID` · `/agent use ID` · `/agent clear` | Compare configuration/policy/registry, pin a published revision, or return to request-level configuration |
+| `/threads [search]` · `/threads next` | Browse/search tenant thread IDs; subsequent pages retain the search |
+| `/history [offset]` · `/branch VERSION` | Browse version-pinned committed messages or explicitly fork the current committed version |
 | `/new` | New conversation: new thread, cost counter reset (settings and secrets are kept) |
 | `/clear` | Clear the screen only |
 | `/quit` | Exit (`/exit`, `/q` also work) |
@@ -152,6 +158,42 @@ through audit events. Auditors receive audit-read access but do not see mutation
 Every operation is still authorized by the API; a hidden button is only a usability aid.
 Human membership grants need a configured OIDC issuer. An API key created in the TUI is
 shown once in the result panel and is not saved; copy it securely before leaving the view.
+
+## Agent revisions and thread history
+
+These are command-driven Chat workflows; draft creation opens a JSON form rather than
+a separate visual agent workspace. A tenant administrator can:
+
+1. Run `/agent draft`, enter a name and structured configuration such as
+   `{"primary_model":"your/granted-model","planner_model":"your/granted-model"}`.
+   Models, skills and budgets must fit the active tenant policy.
+2. Inspect the returned revision with `/agent show ID`, then `/agent validate ID`
+   and `/agent publish ID`. Configuration is immutable even in draft: corrections create
+   a new version. Validation/publication recheck active policy and registry fingerprint;
+   policy/registry changes require a new revision.
+3. Use `/agent diff OLD_ID NEW_ID` to review configuration, policy permissions and
+   registry changes, then `/agent use ID`. Subsequent prompts send that exact revision,
+   not model/budget/preload overrides. `/agent clear` restores request-level settings.
+
+Users with `run.read` can browse revisions and threads; publication needs `tenant.admin`,
+and branching/submitting needs `run.submit`. API authorization is authoritative regardless
+of command visibility. `/v1/me` capability version `1` drives admin visibility and event
+compatibility when present; old servers without metadata retain role-based compatibility.
+Unsupported advertised metadata/event versions produce an explicit error, not an
+assumption that the transport is compatible.
+
+`/threads search-text` searches thread IDs, `/threads next` advances, and `/thread ID`
+selects one. `/history` refreshes committed history and captures its version;
+`/history 20` requests a subsequent bounded page at that version. Refresh from `/history`
+if a version conflict occurs. `/branch VERSION` copies the **current committed snapshot**
+only if that version still matches, records ancestry, and selects the new thread.
+It cannot reconstruct arbitrary historical snapshots.
+
+One active/paused run owns a thread at a time. On admission conflict, wait, explicitly
+cancel through Runs, or branch; never retry by silently overwriting history. A stale
+completion cannot commit over cancellation/newer history. Identity/tenant/new-conversation
+changes reset revision/version pins and cursors. SSE remains finite Redis replay, not the
+durable timeline planned for T3.
 
 The local seed produces a distinct approver identity because the API forbids approving
 one's own run. An authenticated submitter cannot approve its own run in the inline dialog;

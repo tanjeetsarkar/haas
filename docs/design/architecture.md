@@ -39,7 +39,7 @@ flowchart TB
         api["FastAPI<br/>2 Uvicorn processes"]
         orch["Celery orchestrator<br/>q_orchestrator; concurrency 8"]
         tools["Celery tools<br/>q_tools_fast + q_tools_sandbox<br/>same service; concurrency 8"]
-        pg[("PostgreSQL 16<br/>threads + runs")]
+        pg[("PostgreSQL 16<br/>tenant registry + revisions<br/>RLS threads + runs")]
         subgraph redis["One Redis 7.4 instance"]
             r0[("DB 0<br/>SSE streams + secret values")]
             r1[("DB 1<br/>Celery broker")]

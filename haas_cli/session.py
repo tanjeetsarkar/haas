@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import difflib
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -53,6 +54,9 @@ class ChatSession:
     active_skills: list[str] = field(default_factory=list)
     skill_names: list[str] = field(default_factory=list)  # cached for completion
     _costed_runs: set[str] = field(default_factory=set, repr=False)
+    thread_cursor: str | None = None
+    thread_search: str = ""
+    agent_cursor: str | None = None
 
     def __post_init__(self) -> None:
         self.client.set_credential(self.settings.credential)
@@ -64,6 +68,11 @@ class ChatSession:
 
     def new_conversation(self) -> None:
         self.settings.thread_id = None
+        self.settings.history_version = None
+        self.settings.agent_revision_id = None
+        self.thread_cursor = None
+        self.thread_search = ""
+        self.agent_cursor = None
         self.total_cost_usd = 0.0
         self.turns = 0
         self.last_run_id = None
@@ -81,6 +90,11 @@ class ChatSession:
         through `on_approval`. Every server event is forwarded to `on_event`.
         """
         s = self.settings
+        revision_options: dict[str, Any] = {}
+        if s.agent_revision_id:
+            revision_options["agent_revision_id"] = s.agent_revision_id
+        if s.history_version is not None:
+            revision_options["expected_history_version"] = s.history_version
         started = await self.client.create_run(
             prompt,
             thread_id=s.thread_id,
@@ -90,11 +104,13 @@ class ChatSession:
             max_steps=s.max_steps,
             max_cost_usd=s.max_cost_usd,
             secrets=s.secrets,
+            **revision_options,
         )
         run_id = started["run_id"]
         s.thread_id = started["thread_id"]
         self.last_run_id = run_id
         self.turns += 1
+        s.history_version = None
         return await self._follow_run(run_id, on_event, on_approval)
 
     async def attach_run(
@@ -225,6 +241,16 @@ class CommandResult:
 
 COMMAND_HELP: list[tuple[str, str]] = [
     ("/help", "Show this help"),
+    ("/agents [next]", "Browse revision pages"),
+    (
+        "/agent show|validate|publish|use ID",
+        "Inspect, validate, publish or pin a revision; /agent clear unpins",
+    ),
+    ("/agent draft", "Open structured agent configuration form (TUI)"),
+    ("/agent diff ID ID", "Compare revision configuration and permissions"),
+    ("/threads [search|next]", "Browse persistent threads by ID"),
+    ("/history [offset]", "Read a version-pinned page of the current thread"),
+    ("/branch VERSION", "Branch committed history at an explicit version"),
     ("/login", "Sign in with an API key or OIDC bearer token (memory only)"),
     ("/logout", "Clear the in-memory credential"),
     ("/tenant [id]", "Verify and switch the authenticated tenant"),
@@ -263,6 +289,116 @@ async def handle_command(session: ChatSession, line: str) -> CommandResult:
 
     if cmd in ("/quit", "/exit", "/q"):
         out.quit = True
+    elif cmd in {"/agents", "/agent", "/threads", "/history", "/branch"}:
+        try:
+            if cmd == "/agents":
+                if args and args != ["next"]:
+                    return err("Usage: /agents [next]")
+                data = await session.client.list_agent_revisions(
+                    session.agent_cursor if args else None
+                )
+                session.agent_cursor = data["next_cursor"]
+                out.lines = [json.dumps(item, default=str) for item in data["items"]]
+                out.lines.append(
+                    "More: /agents next"
+                    if session.agent_cursor
+                    else "End of revisions."
+                )
+            elif cmd == "/threads":
+                if args != ["next"]:
+                    session.thread_search = " ".join(args)
+                data = await session.client.list_threads(
+                    cursor=session.thread_cursor if args == ["next"] else None,
+                    search=session.thread_search,
+                )
+                session.thread_cursor = data["next_cursor"]
+                out.lines = [json.dumps(item, default=str) for item in data["items"]]
+                out.lines.append(
+                    "More: /threads next"
+                    if session.thread_cursor
+                    else "End of threads."
+                )
+            elif cmd == "/history":
+                if not s.thread_id or (
+                    args and (len(args) != 1 or not args[0].isdigit())
+                ):
+                    return err("Select a thread, then use /history [offset].")
+                data = await session.client.thread_history(
+                    s.thread_id,
+                    offset=int(args[0]) if args else 0,
+                    history_version=s.history_version if args else None,
+                )
+                s.history_version = data["history_version"]
+                out.lines = [
+                    f"History version {s.history_version}; active run: {data['active_run_id']}"
+                ]
+                out.lines.extend(
+                    json.dumps(item, ensure_ascii=True) for item in data["items"]
+                )
+                if data["next_offset"] is not None:
+                    out.lines.append(f"More: /history {data['next_offset']}")
+            elif cmd == "/branch":
+                if not s.thread_id or len(args) != 1 or not args[0].isdigit():
+                    return err(
+                        "Select a thread, inspect /history, then use /branch VERSION."
+                    )
+                data = await session.client.branch_thread(s.thread_id, int(args[0]))
+                s.thread_id = data["thread_id"]
+                s.history_version = data["history_version"]
+                out.lines = [
+                    f"Branched to {s.thread_id} at history version {s.history_version}."
+                ]
+            elif args == ["clear"]:
+                s.agent_revision_id = None
+                out.lines = ["Agent revision unpinned."]
+            elif len(args) == 3 and args[0] == "diff":
+                left = await session.client.agent_revision(args[1])
+                right = await session.client.agent_revision(args[2])
+
+                def compared(revision: dict[str, Any]) -> dict[str, Any]:
+                    return {
+                        "configuration": revision["configuration"],
+                        "policy_rules": revision.get("policy_rules", {}),
+                        "registry_fingerprint": revision.get("registry_fingerprint"),
+                    }
+
+                out.lines = list(
+                    difflib.unified_diff(
+                        json.dumps(
+                            compared(left), indent=2, sort_keys=True
+                        ).splitlines(),
+                        json.dumps(
+                            compared(right), indent=2, sort_keys=True
+                        ).splitlines(),
+                        fromfile=args[1],
+                        tofile=args[2],
+                        lineterm="",
+                    )
+                ) or ["No configuration or permission changes."]
+                out.lines.append(
+                    f"Policy: {left['policy_revision_id']} -> {right['policy_revision_id']}"
+                )
+            elif len(args) == 2 and args[0] in {"show", "use", "validate", "publish"}:
+                if args[0] in {"validate", "publish"}:
+                    data = await session.client.transition_agent(args[1], args[0])
+                else:
+                    data = await session.client.agent_revision(args[1])
+                if args[0] == "use":
+                    if data["state"] != "published":
+                        return err("Only published revisions can be used.")
+                    s.agent_revision_id = args[1]
+                out.lines = [json.dumps(data, indent=2, default=str)]
+            else:
+                return err(
+                    "Usage: /agent show|validate|publish|use ID | diff ID ID | clear; /agent draft in TUI."
+                )
+        except HaasAPIError as exc:
+            recovery = (
+                " Refresh /history, wait/cancel the active run, or explicitly /branch VERSION."
+                if exc.status == 409
+                else ""
+            )
+            return err(str(exc) + recovery)
     elif cmd == "/help":
         width = max(len(c) for c, _ in COMMAND_HELP)
         out.lines = [f"{c.ljust(width)}  {d}" for c, d in COMMAND_HELP]
@@ -366,6 +502,7 @@ async def handle_command(session: ChatSession, line: str) -> CommandResult:
     elif cmd == "/thread":
         if args:
             s.thread_id = args[0]
+            s.history_version = None
             out.lines = [f"Switched to thread {args[0]}."]
         else:
             out.lines = [f"thread: {s.thread_id or '(new — created on first message)'}"]

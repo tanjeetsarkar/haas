@@ -77,7 +77,7 @@ delivery order, not an exploit severity score.
 | ID / STRIDE | Scenario and affected flow | Current control / limitation | Required target treatment | Priority |
 |---|---|---|---|---|
 | TM-01 Spoofing | Caller selects another tenant in create/read/resume/SSE | OIDC/API-key membership verification, canonical tenant selection and initial route action checks; development retains legacy headers and production startup remains blocked pending full policy/admin/audit surfaces | Require verified identity + tenant membership; strip forged internal headers; private API ingress | P0 |
-| TM-02 Elevation / disclosure | Cross-tenant run/thread/secret/artifact reference | Active tenant membership is checked before production API routing; run ownership checks remain, but no RLS/composite FKs or artifact service | Tenant-aware FKs, forced RLS, object grants, negative tests on every operation | P0 |
+| TM-02 Elevation / disclosure | Cross-tenant run/thread/secret/artifact reference | Verified identity/RBAC, tenant-composite run/thread/policy/revision constraints, forced RLS and transaction-local context; production rejects owner/BYPASSRLS API identities and uncut-over legacy data | Preserve qualification; add artifact/object grants and sandbox/credential isolation in later phases | P0 |
 | TM-03 Tampering / elevation | Model or remote observation instructs use of broader tools/secrets | Worker unlock check and active-skill secret declarations | Treat content as data; immutable policy; per-invocation grants; explicit high-risk approvals | P0 |
 | TM-04 Elevation | Malicious native plugin executes at API/orchestrator import time | Static manifest first, but runtime discovery imports Python in privileged processes | Static-only catalog in control plane; approved artifacts; import/execution only in qualified sandbox | P0 |
 | TM-05 Disclosure / lateral movement | Compromised tool reads sibling secrets from broker, memory, scratch or Redis | Reduced tool container privilege; shared Redis and task secret values remain | No sandbox broker/store credential; secret references; per-run runtime/volumes; per-invocation broker | P0 |
@@ -112,6 +112,19 @@ delivery order, not an exploit severity score.
 | TM-34 Tampering | Registry, signing key or CDN compromise distributes malicious artifacts | Not applicable | Sigstore transparency log, provenance verification at install and launch, key ceremony and rotation, mirror digest checks | P0 |
 
 ### Important limits of existing controls
+
+* Phase 2 RLS isolates tenant content for the non-owner API login, including tenant
+  registry, memberships, keys, policies, audit, agent revisions, runs and threads.
+  Principals are a global identity directory. The fixed-path SECURITY DEFINER tenant
+  resolver only returns canonical UUIDs; it is not an identity verifier. Application
+  authentication/RBAC remains mandatory: a compromised API process can set another
+  tenant context. Execution/maintenance roles intentionally have explicit cross-tenant
+  policies and narrow grants; they must never be assigned to the API login.
+* Schema-owner policies support trusted migration/bootstrap operations. Migration
+  credentials and raw-content quarantine are operator-only trust boundaries, not
+  tenant runtime privileges. Nullable legacy development access disappears at cutover.
+* Thread claims/version checks protect committed history, not all execution effects.
+  Durable worker leases, approval-batch fencing and destination idempotency remain P3.
 
 * A DNS preflight check does not bind the subsequent HTTP connection to the same
   resolved address; do not claim it fully defeats rebinding.

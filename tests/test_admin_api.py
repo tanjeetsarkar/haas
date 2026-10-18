@@ -154,7 +154,14 @@ async def test_current_identity_returns_only_verified_authority(monkeypatch):
         response = await client.get("/v1/me", headers=_headers())
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    capabilities = body.pop("capabilities")
+    assert capabilities["version"] == "1"
+    assert "tenant.admin" in capabilities["actions"]
+    assert "audit.read" in capabilities["actions"]
+    assert capabilities["event_schemas"] == ["redis-stream.v1"]
+    assert capabilities["durable_replay"] is False
+    assert body == {
         "tenant_id": "acme",
         "principal_id": _ACTOR_ID,
         "roles": ["auditor", "tenant_admin"],

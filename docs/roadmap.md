@@ -76,7 +76,7 @@ third-party publishers must wait until SEC-05, SEC-08 and SEC-09 pass.
 
 Do the **T0 bridge before Phase 1 implementation**; it closes the gap between Phase 0's
 API and today's chat UI. Subsequent waves ship with their server capabilities, not after GA.
-All new Track T items are targets, not implemented features.
+Uncompleted Track T rows remain targets; completed increments are qualified below.
 
 | Server milestone | Required terminal increment |
 |---|---|
@@ -120,11 +120,17 @@ All new Track T items are targets, not implemented features.
 
 | ID | Item | Depends on | Gates | Status |
 |---|---|---|---|---|
-| p2-schema-expand | Target ERD tables, `(tenant_id, id)` keys, composite FKs, TIMESTAMPTZ, NUMERIC, state checks | p1-tenant-registry | Migration review | ⬜ |
-| p2-rls | Non-owner role, forced RLS, `SET LOCAL` tenant, pool-reuse tests | p2-schema-expand | SEC-03 | ⬜ |
-| p2-agent-revisions | Draft → validate → publish immutable agent revisions; runs pin them | p1-tenant-policy, p2-schema-expand | FR-14 | ⬜ |
-| p2-legacy-migration | Tenant mapping, backfill, quarantine, drain-to-terminal cutover | p2-rls | Migration counts | ⬜ |
-| p2-thread-fencing | `history_version`, one active run per thread, tenant-scoped thread/history/branch APIs | p2-schema-expand | SEC-15 | ⬜ |
+| p2-schema-expand | Tenant/internal UUID keys, TIMESTAMPTZ/NUMERIC shadows, tenant-composite constraints and finite state/cost checks; preserve `/v1` aliases, sync writes and contract required fields at explicit cutover | p1-tenant-registry | Migration review; mapped/unmapped and cross-tenant-write qualification; state rejection; backfill counts | ✅ |
+| p2-rls | Separate non-owner API/execution logins, forced RLS, transaction-local tenant context, pool-reuse tests and fail-closed production startup | p2-schema-expand | SEC-03 | ✅ |
+| p2-agent-revisions | Immutable draft → validated → published revisions; policy/registry validation, audited transitions and revision-pinned admission | p1-tenant-policy, p2-schema-expand | FR-14 configuration pinning; signed plugin artifacts remain P4 | ✅ |
+| p2-legacy-migration | Administrator-referenced audited mapping, bounded backfill, operator-only quarantine, drain-to-terminal cutover and downgrade guards | p2-rls | Migration counts; active-run/unresolved-row refusal | ✅ |
+| p2-thread-fencing | Atomic `history_version`/one-active-run claims and completion; scoped thread/history/branch APIs; cancel/reaper release | p2-schema-expand | SEC-15 | ✅ |
+
+Phase 2 builds core ownership/configuration/history foundations, not empty versions of
+every future ERD entity. Steps/invocations/outbox/events/usage-ledger tables ship with
+their Phase 3 state machines; artifacts, credentials, marketplace and collaboration
+tables remain in their owning phases. Existing data is **not** silently migrated by
+deploying these changes: follow the [operator runbook](design/operations-migration.md#phase-2-operator-runbook).
 
 ## Phase 3 — Durable workflow correctness
 
@@ -181,7 +187,7 @@ All new Track T items are targets, not implemented features.
 |---|---|---|---|---|
 | d-api-contract | OpenAPI 3.1, event JSON Schemas, AsyncAPI, Spectral + oasdiff, deprecation policy (ADR-16) | p0-ci | FR-23 | ⬜ |
 | d-api-ergonomics | Cursors, filters, problem+json, Idempotency-Key, request IDs, rate-limit headers | d-api-contract | FR-23 | ⬜ |
-| d-capabilities | Versioned identity-scoped feature/action capabilities and event-schema compatibility metadata; never substitutes for server authorization | d-api-contract, p1-rbac | TUI-02, TUI-07 | ⬜ |
+| d-capabilities | Version-1 identity-scoped feature/actions and supported legacy event-schema metadata; never substitutes for server authorization; full contract tooling remains d-api-contract | p1-rbac, t1-identity | TUI-02; advertised-version/event compatibility tests | ✅ |
 | d-sdk-python | Sync/async client, typed events, reconnecting streams, approvals, webhook verify, OTel | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
 | d-sdk-typescript | Runtime-agnostic SDK with fetch SSE + auth, ESM/CJS, generated types | d-api-ergonomics, p1-authn | FR-24, SEC-26 | ⬜ |
 | d-cli | Unified `haas` CLI (login, runs, agents, approvals, plugins, dev, webhooks listen, chat); shared SDK/auth/session with Track T and line-oriented/JSON alternatives | d-sdk-python | FR-24, TUI-07 | 🚧 |
@@ -205,9 +211,9 @@ API/SDK queries and negative tests needed for its journey; no direct store/broke
 | t0-run-control | Before P1 | Cursor run browser, filter where supported, attach/reattach, explicit cooperative cancel vs detach, problem details, masked secret form; migrate Esc approval behavior with docs/tests | t0-foundation, p0-quick-wins | TUI-01, TUI-03, TUI-05 | ✅ |
 | t0-qualification | Before P1 | Pilot/snapshot/resize regression baseline, keyboard journeys and mock-API fault fixtures; document finite replay and current cancellation limits | t0-run-control | TUI-01, TUI-03..05 | ✅ |
 | t1-identity | P1 | Login/logout, credential-store or memory-only sessions, environment profiles, tenant switching, auth expiry/revocation and production banner | t0-qualification, p1-authn, p1-tenant-registry | TUI-02, SEC-26 | ✅ |
-| t1-administration | P1 | Role-gated membership/API-key/policy workflows, scoped plugin inventory and audit paging; capability metadata integration remains pending | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | 🚧 |
-| t2-agents | P2 | Draft/validate/publish agent revisions, structured configuration, revision/permission diff and pinned run launcher | t1-administration, p2-agent-revisions | FR-14, TUI-01, TUI-02 | ⬜ |
-| t2-threads | P2 | Persistent thread/history browser, search/paging contracts, explicit branch and active-run/version conflict recovery | t1-identity, t0-run-control, p2-thread-fencing | SEC-15, TUI-03 | ⬜ |
+| t1-administration | P1/P2 | Role/action-gated membership/API-key/policy workflows, scoped plugin inventory and audit paging; capability metadata integrated | t1-identity, p1-admin-api, p1-audit-v1, p1-scoped-inventory, d-capabilities | TUI-01, TUI-02 | ✅ |
+| t2-agents | P2 | Command-driven draft/validate/publish, structured JSON form, configuration/policy/registry diff and pinned run launcher | t1-administration, p2-agent-revisions | FR-14, TUI-01, TUI-02 | ✅ |
+| t2-threads | P2 | Command-driven persistent history, thread-ID search/cursor paging, explicit committed-snapshot branch and active-run/version conflict recovery | t1-identity, t0-run-control, p2-thread-fencing | SEC-15, TUI-03 | ✅ |
 | t3-inspector | P3 | Searchable durable timeline, plans/attempts/tool evidence, replay/gap/reconnect states, correlation IDs, unknown-effect and recovery explanations | t2-threads, p3-steps-invocations, p3-durable-events | TUI-01, TUI-03 | ⬜ |
 | t3-approvals | P3 | Approval inbox, exact-batch argument/destination/permission review, digest/expiry, actor history and truthful cancellation states | t1-administration, t3-inspector, p3-approvals-v2, p3-cancellation | SEC-06, SEC-12, TUI-02, TUI-03 | ⬜ |
 | t3-budgets | P3 | Reserved/observed/settled cost, deadlines and quota indicators, budget denial/recovery; no misleading estimated balances | t3-inspector, p3-budget-ledger | TUI-01, TUI-03 | ⬜ |
@@ -274,16 +280,43 @@ actions or grant endpoint; separately approved, time-limited access remains unav
 Production API startup requires complete HTTPS OIDC configuration and a production
 encryption key; authenticated run admission still fails closed without an active policy.
 `haas dev` provides a distinct loopback-only Compose project with deterministic mocks and
-local test-key seeding. Remaining release work includes scoped capability metadata,
-automated quickstart and full CI qualification. `p0-ci` and `p0-baseline-tests` remain 🚧
+local test-key seeding. Phase 2 database isolation, revision lifecycle, legacy migration
+tooling and atomic thread-history fencing are implemented, together with command-driven
+T2 workflows and scoped capability metadata. Production additionally requires separate
+runtime database identities and completed operator cutover. This is not a GA claim.
+
+Recorded local qualification on Python 3.12 / PostgreSQL 16:
+
+* **312 tests passed**, including nine real PostgreSQL integration tests; combined
+  application/client coverage **75.70%**, exceeding the existing 75% gate.
+* Real non-owner RLS reads/writes, default denial, pool commit/rollback reuse,
+  owner/service-login refusal, real API-key authentication/admin queries, legacy
+  alias continuation, immutable revision pins, concurrent admissions and stale completion.
+* Approved/conflicting/suspended-actor mapping, bounded backfill, quarantine privilege
+  denial, active/unresolved cutover refusal and production bootstrap.
+* Empty-schema upgrade → base → head, concurrent migration runners, staged expansion,
+  active legacy-run migration refusal and non-destructive legacy adoption.
+* All nine deterministic Compose E2E scenarios passed on an isolated project, including
+  in-flight cancellation/trace propagation; the existing development stack was untouched.
+* Ruff, Pyright (zero errors), reproducible OpenAPI snapshot, production Compose config
+  and patch whitespace checks passed.
+
+CI runs PostgreSQL qualification and coverage on both supported Python versions
+(3.11/3.12); only 3.12 was exercised in this local qualification. Remaining release work
+includes automated quickstart and full hosted CI qualification.
+`p0-ci` and `p0-baseline-tests` remain 🚧
 until the GitHub workflow is green on `main`.
 
-## Next execution wave — Finish Phase 1 qualification
+## Next execution wave — Phase 3 durable workflow correctness
 
-The Phase 1 identity, tenant authority, policy, audit and scoped inventory rows are
-complete. T1 administration remains in progress until scoped capability metadata is
-integrated. The local-dev stack still needs an automated CI quickstart, and CI/baseline
-qualification remains open; subsequent T waves ship with their backend capabilities.
+Start with the PostgreSQL transactional outbox/relay and consumer inbox, then execution
+leases/state-version fencing and durable step/invocation outcomes. Add admission
+idempotency, exact-batch approvals, fenced cancellation, budget reservations and durable
+events/reconciliation in dependency order, shipping the T3 inspector/approval/budget
+journeys alongside them. Thread-history fencing is not a substitute for execution leases.
+Worker-time revocation, mediated egress, sandbox isolation and durable replay remain
+unimplemented later-phase controls. The local-dev CI quickstart and hosted CI/baseline
+qualification remain parallel work, not silently completed Phase 2 items.
 
 ## Open decisions
 

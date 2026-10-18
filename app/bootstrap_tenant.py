@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import asyncpg
 
 from app.core.config import settings
 from app.core.store import DistributedStore
@@ -30,7 +31,15 @@ async def bootstrap() -> dict[str, str]:
         raise ValueError("HAAS_BOOTSTRAP_ADMIN_ISSUER must use HTTPS.")
 
     store = DistributedStore()
-    await store.init(pool_max=2)
+    if settings.haas_profile == "prod" and not settings.migration_postgres_dsn:
+        raise ValueError(
+            "Production bootstrap requires a separate MIGRATION_POSTGRES_DSN."
+        )
+    store.pg_pool = await asyncpg.create_pool(
+        settings.migration_postgres_dsn or settings.postgres_dsn,
+        min_size=1,
+        max_size=2,
+    )
     try:
         return await store.bootstrap_tenant(slug, issuer, subject)
     finally:

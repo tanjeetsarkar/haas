@@ -1,6 +1,95 @@
 {
   "components": {
     "schemas": {
+      "AgentConfiguration": {
+        "additionalProperties": false,
+        "properties": {
+          "max_cost_usd": {
+            "default": 0.3,
+            "exclusiveMinimum": 0.0,
+            "maximum": 10.0,
+            "title": "Max Cost Usd",
+            "type": "number"
+          },
+          "max_steps": {
+            "default": 15,
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "planner_model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Planner Model",
+            "type": "string"
+          },
+          "preload_skills": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Preload Skills",
+            "type": "array"
+          },
+          "primary_model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Primary Model",
+            "type": "string"
+          },
+          "skills": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "primary_model",
+          "planner_model"
+        ],
+        "title": "AgentConfiguration",
+        "type": "object"
+      },
+      "BranchThreadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_history_version": {
+            "minimum": 0.0,
+            "title": "Expected History Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_history_version"
+        ],
+        "title": "BranchThreadRequest",
+        "type": "object"
+      },
+      "CreateAgentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "title": "Agent Name",
+            "type": "string"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/AgentConfiguration"
+          }
+        },
+        "required": [
+          "agent_name",
+          "configuration"
+        ],
+        "title": "CreateAgentRequest",
+        "type": "object"
+      },
       "CreateMembershipRequest": {
         "additionalProperties": false,
         "properties": {
@@ -39,6 +128,30 @@
       },
       "CreateRunRequest": {
         "properties": {
+          "agent_revision_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Revision Id"
+          },
+          "expected_history_version": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected History Version"
+          },
           "max_cost_usd": {
             "anyOf": [
               {
@@ -790,6 +903,243 @@
         "summary": "Activate Admin Policy"
       }
     },
+    "/v1/agents/revisions": {
+      "get": {
+        "operationId": "list_agent_revisions_v1_agents_revisions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Agent Revisions V1 Agents Revisions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Revisions"
+      },
+      "post": {
+        "operationId": "draft_agent_revision_v1_agents_revisions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Draft Agent Revision V1 Agents Revisions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Draft Agent Revision"
+      }
+    },
+    "/v1/agents/revisions/{revision_id}": {
+      "get": {
+        "operationId": "get_agent_revision_v1_agents_revisions__revision_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Revision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Agent Revision V1 Agents Revisions  Revision Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Revision"
+      }
+    },
+    "/v1/agents/revisions/{revision_id}/{operation}": {
+      "post": {
+        "operationId": "transition_agent_revision_v1_agents_revisions__revision_id___operation__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Revision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operation",
+            "required": true,
+            "schema": {
+              "enum": [
+                "validate",
+                "publish"
+              ],
+              "title": "Operation",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Transition Agent Revision V1 Agents Revisions  Revision Id   Operation  Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Transition Agent Revision"
+      }
+    },
     "/v1/audit-events": {
       "get": {
         "operationId": "list_audit_events_v1_audit_events_get",
@@ -858,6 +1208,26 @@
           }
         },
         "summary": "List Audit Events"
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "get_capabilities_v1_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Capabilities V1 Capabilities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Capabilities"
       }
     },
     "/v1/me": {
@@ -1280,6 +1650,239 @@
           }
         },
         "summary": "Stream Run Events"
+      }
+    },
+    "/v1/threads": {
+      "get": {
+        "operationId": "list_threads_v1_threads_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 128,
+              "title": "Search",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Threads V1 Threads Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Threads"
+      }
+    },
+    "/v1/threads/{thread_id}": {
+      "get": {
+        "operationId": "thread_history_v1_threads__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "history_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "History Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Thread History V1 Threads  Thread Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread History"
+      }
+    },
+    "/v1/threads/{thread_id}/branches": {
+      "post": {
+        "operationId": "branch_thread_v1_threads__thread_id__branches_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Branch Thread V1 Threads  Thread Id  Branches Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Branch Thread"
       }
     }
   }

@@ -23,8 +23,9 @@ The **[production-readiness roadmap](docs/roadmap.md)** is the living, dependenc
 that tracks progress toward these targets; decisions are indexed in [docs/adr/](docs/adr/README.md).
 
 Current behavior and target requirements are explicitly separated. Authenticated
-tenancy, RBAC/RLS, durable dispatch recovery and per-run sandboxing are production
-design requirements, not implemented guarantees of the current Compose stack.
+tenancy, RBAC and transaction-scoped PostgreSQL RLS are implemented foundations.
+Durable dispatch recovery, worker-time revocation, mediated egress and per-run
+sandboxing remain production requirements, not guarantees of the current Compose stack.
 
 ## Deterministic local development
 
@@ -85,11 +86,16 @@ provider-neutral OIDC JWTs or tenant-scoped API keys against active tenant membe
 and role-based action checks protect run, plugin, tenant administration and audit routes.
 Approvers are separated from submitters; tenant policy revisions, membership/key
 administration and append-only audit are available through the API and `haas` clients.
-Phase 1 identity and tenant-authority controls are now qualified, but this is not a
-production/GA claim: RLS, worker-time policy revocation, mediated egress and other later-phase
-controls remain tracked in the roadmap. Production API startup requires complete HTTPS OIDC
+Phase 1 identity/authority and Phase 2 database/revision/thread controls are qualified,
+but this is not a production/GA claim: worker-time policy revocation, mediated egress and
+other later-phase controls remain tracked in the roadmap. Production API startup requires complete HTTPS OIDC
 configuration and the production encryption key; authenticated runs also require an active
 tenant policy revision.
+Production also requires separate non-owner API and execution-service PostgreSQL logins,
+forced RLS and completed legacy cutover. Do not point runtime services at the migration
+owner account. The [Phase 2 operator runbook](docs/design/operations-migration.md#phase-2-operator-runbook)
+documents provisioning, draining, mapping, quarantine and cutover; automatic migrations
+deliberately refuse active or paused legacy runs.
 The base Compose file does not publish Redis/PostgreSQL ports or start Flower; the dev
 overlay adds loopback-only ports and Flower. Do not combine the dev overlay with production.
 
@@ -107,6 +113,17 @@ Verified identities with tenant-admin or auditor roles also get an Admin workspa
 authorized membership, API-key, policy, scoped-plugin and audit workflows. The unified
 `haas` CLI currently includes `chat`, `profile`, `admin`, and `dev` commands; other CLI
 surfaces remain roadmap work.
+
+Phase 2 workflows are keyboard-first commands in Chat:
+`/agent draft` opens a structured JSON form, `/agents` browses revisions,
+`/agent validate ID` then `/agent publish ID` publishes immutable configuration, and
+`/agent use ID` pins subsequent runs. `/agent diff ID ID` compares configuration,
+policy permissions and registry fingerprints. `/threads [search]`, `/threads next`,
+`/history [offset]` and `/branch VERSION` browse or explicitly branch committed history.
+See the [terminal guide](docs/tui_usage.md#agent-revisions-and-thread-history) for roles
+and conflict recovery. These use scoped `/v1/agents` and `/v1/threads` APIs through the
+shared Python client, not database access. `/v1/capabilities` and `/v1/me` advertise
+identity-scoped actions and supported event schemas; durable replay is explicitly false.
 
 ## Plugins: skills and tools
 
@@ -172,6 +189,20 @@ docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml down
 plugin (`tests/plugins`, HTTP mocked). Rebuild the images using the same Compose file list after changing `app/`;
 `plugins/` is bind-mounted, so plugin changes only need a restart.
 
+Phase 2 qualification additionally requires a **disposable PostgreSQL 16 database**.
+Migrate it with the operator login, then set `HAAS_TEST_POSTGRES_DSN` to run
+[the database suite](tests/test_phase2_database.py), or the full suite with coverage:
+
+```bash
+POSTGRES_DSN="$DISPOSABLE_POSTGRES_DSN" .venv/bin/alembic upgrade head
+HAAS_TEST_POSTGRES_DSN="$DISPOSABLE_POSTGRES_DSN" .venv/bin/pytest \
+  --cov=app --cov=haas_cli --cov-fail-under=75
+```
+
+The database tests create/drop roles and perform legacy cutover. Never use a customer
+database. Without that variable they skip; CI includes them on Python 3.11/3.12 so the
+75% coverage gate measures real database paths rather than excluding those paths.
+
 `python -m scripts.update_openapi_snapshot` deliberately refreshes the checked-in
 [/v1 OpenAPI snapshot](docs/openapi-v1.json). CI fails if the snapshot is stale.
 
@@ -202,19 +233,22 @@ MCP `2026-07-28` Streamable HTTP, Celery canvas, PyPI versions (all dependencies
 | SSRF | Literal/hostname check at registration | Also DNS-resolved check at call time, IPv4-mapped IPv6, webhook URLs validated; optional `SSRF_ALLOWED_HOSTS` for dev |
 | Resume | Redis lock before authz, stale-status race | Tenant check first, atomic `UPDATE … WHERE status='input_required'` |
 | Failures | LLM/aggregate exceptions left runs `running` forever | Retry transient errors, otherwise fail the run + `run_error` event + webhook; planner model rejecting tools falls back to primary |
-| Schema init | DDL on every task | Only the API creates the schema, under a PG advisory lock |
+| Schema init | DDL on every task | Separate advisory-locked Alembic migration job; runtime API/workers never create schema |
 | SSE | Stopped at any historic `input_required`; early exit with >50 buffered events | Stops only while still paused; drains before exit; tenant-checked |
 | Compose | DB/Redis/Flower on all interfaces; tool worker not read-only | Bound to 127.0.0.1; `read_only: true` + tmpfs `/tmp`; one shared image; API health check |
 | Spec naming | `aggregate_and_continue_task` (§2) vs `aggregate_step_task` (§5.8) | `aggregate_step_task` |
 
 ## Known gaps / caveats
 
-* `haas-chat` cannot cancel a run (no cancel endpoint); `Esc` only detaches the UI.
+* Cancellation is cooperative through the API/TUI; `Esc` only detaches. It does not
+  terminate an external effect or sandbox process already in progress.
 * `deepseek/deepseek-r1` as the step-1 planner may emit tool calls as plain text on some providers; override with `/planner` or `HAAS_PLANNER_MODEL`.
 * `data-analyst` datasets live on the shared scratchpad volume (per tenant + thread) and are not garbage-collected.
-* Ephemeral secrets are stored as plain JSON in Redis (spec text says "encrypted"); they are also passed to
-  tool tasks via the broker, so Flower/Redis access should be restricted.
+* Ephemeral Redis secrets are AES-GCM encrypted, but scoped values are still passed to
+  tool tasks via the broker. Restrict Flower/Redis access; invocation credential brokering
+  remains later-phase work.
 * "Idempotency" in the spec diagram (idempotency keys) is not implemented.
-* Orphaned runs (worker crash mid-chord) are not reaped; no cancel endpoint.
+* A stale-run reaper releases orphaned thread claims, but durable crash recovery,
+  worker lease fencing and effect reconciliation remain Phase 3 work.
 * `deepseek/deepseek-r1` on step 1 depends on provider tool support; fallback to the primary model is automatic on HTTP 400/404.
 * Verified against a mock OpenRouter only (no live API key was available); with the placeholder key, real OpenRouter returned 401 and the run failed cleanly.

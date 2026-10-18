@@ -5,12 +5,17 @@
 ## 1. Physical relational model (CURRENT)
 
 The current schema is established by [Alembic migrations](../../migrations/versions/).
-It includes the initial run store and the Phase 1 tenant identity and policy registry.
+It includes the run store, Phase 1 identity/policy registry and Phase 2 tenant keys,
+agent revisions, thread fencing and RLS. Expanded fields remain nullable until the
+explicit operator cutover; production runtime startup refuses that intermediate state.
 JSON arrays do not imply separate normalized entities.
 
 ```mermaid
 erDiagram
-    threads ||..o{ runs : "logical thread_id link; no FK"
+    threads ||--o{ runs : "tenant-composite ownership"
+    tenants ||--o{ agent_revisions : versions
+    agent_revisions ||--o{ runs : pins
+    tenant_policy_revisions ||--o{ agent_revisions : authorizes
     tenants ||--o{ memberships : grants
     principals ||--o{ memberships : receives
     tenants ||--o{ tenant_api_keys : scopes
@@ -25,6 +30,13 @@ erDiagram
         TEXT tenant_id
         JSONB messages_json
         DOUBLE_PRECISION updated_at
+        UUID tenant_uuid FK
+        UUID thread_key UK
+        TIMESTAMPTZ updated_at_ts
+        BIGINT history_version
+        TEXT active_run_id FK "nullable"
+        TEXT parent_thread_id FK "nullable"
+        BIGINT parent_history_version "nullable"
     }
     runs {
         TEXT run_id PK
@@ -39,9 +51,9 @@ erDiagram
         JSONB messages_checkpoint_json
         BOOLEAN last_step_had_error
         TEXT result_text "nullable"
-        DOUBLE_PRECISION total_cost_usd
+        NUMERIC total_cost_usd "double until cutover"
         INTEGER max_steps
-        DOUBLE_PRECISION max_cost_usd
+        NUMERIC max_cost_usd "double until cutover"
         INTEGER step_count
         JSONB fingerprints_json
         TEXT webhook_url "nullable"
@@ -51,6 +63,29 @@ erDiagram
         TEXT registry_fingerprint "nullable"
         UUID submitted_by_principal_id "nullable"
         UUID policy_revision_id "nullable"
+        UUID tenant_uuid FK
+        UUID run_key UK
+        UUID thread_key FK
+        TIMESTAMPTZ created_at_ts
+        TIMESTAMPTZ updated_at_ts
+        NUMERIC total_cost_usd_exact
+        NUMERIC max_cost_usd_exact
+        UUID agent_revision_id FK "nullable"
+        BIGINT thread_history_version "nullable for historical rows"
+    }
+    agent_revisions {
+        UUID tenant_id PK,FK
+        UUID revision_id PK
+        TEXT agent_name UK_part
+        BIGINT version UK_part
+        TEXT state
+        JSONB configuration
+        TEXT digest
+        UUID policy_revision_id FK
+        TEXT registry_fingerprint
+        UUID created_by FK
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ published_at "nullable"
     }
     tenants {
         UUID tenant_id PK
@@ -109,44 +144,52 @@ erDiagram
     }
 ```
 
-The dashed relationship is logical only: the current database does **not** enforce a
-foreign key between runs and threads or tenant equality across runs, threads and registry
-records. `runs.policy_revision_id` references a globally unique revision ID; it is not
-yet a composite tenant-aware foreign key. The active policy pointer is tenant-aware.
+Tenant-composite foreign keys now enforce run/thread aliases, canonical thread keys,
+policy/revision pins and branch ancestry; historical `NOT VALID` constraints are validated
+at cutover. The active policy pointer is tenant-aware.
 Policy revisions and audit events are protected from updates and deletes by database
-triggers. Agent, immutable approval-decision, run-event, invocation, artifact and
+triggers. Agent bodies are immutable from draft creation; validation and publication
+are guarded forward-only transitions. Immutable approval-decision, run-event, invocation, artifact and
 usage-ledger tables do not yet exist.
 
 ### Current column semantics
 
 | Fields | Constraints / meaning |
 |---|---|
-| IDs | Text primary keys; globally unique thread/run IDs, not composite tenant keys |
-| `tenant_id`, `thread_id` on runs | Required text; ownership checked by application paths |
+| IDs | Stable public text aliases plus immutable internal UUID keys and tenant-composite ownership constraints |
+| `tenant_id`, `thread_id` on runs | Legacy selectors/aliases retained; canonical `tenant_uuid` resolves registered UUID/slug or approved mapping |
 | Registry statuses | Check constraints on tenant, principal and membership lifecycle; API roles are membership rows |
 | Tenant policy | Versioned JSONB rules with a SHA-256 digest; model providers/models, plugin digest+skill grants, exact webhook hosts, maximum budgets and retention class |
 | Active policy | Nullable tenant pointer with a composite FK preventing cross-tenant activation; absent policy denies authenticated run admission |
 | API credentials | Tenant-scoped key prefix and SHA-256 hash; raw key is never stored |
-| `status` on runs | Required free text; no database state enum/check constraint |
+| `status` on runs | Check constraint: `running`, `input_required`, `completed`, `failed`, `cancelled`; future workflow states require a migration |
 | `messages_json`, `messages_checkpoint_json` | Required JSONB, default empty array; full message snapshots |
 | `active_skills_json`, `fingerprints_json` | Required JSONB arrays; stored fingerprint history limited to last 20 on checkpoint |
 | `pending_tool_calls_json` | Nullable JSONB containing entire paused batch |
-| `skill_allowlist_json` | Added by startup `ALTER`; NULL is unrestricted only for legacy/development runs; authenticated runs persist the effective policy grant, including an empty array |
-| `registry_fingerprint` | Added by startup `ALTER`; drift diagnostic, not a pinned artifact or signature |
+| `skill_allowlist_json` | Alembic-managed; NULL is unrestricted only for legacy/development runs; authenticated runs persist the effective policy grant, including an empty array |
+| `registry_fingerprint` | Registry snapshot pin on agent revisions and admission; not a content-addressed artifact or signature |
 | `submitted_by_principal_id` | Nullable FK added by migration 0003; null on legacy/development-header runs |
 | `policy_revision_id` | Nullable FK added by migration 0004; authenticated runs pin the immutable policy revision used at admission |
 | `audit_events` | Migration 0005 stores tenant-scoped actor, action, target, request ID and minimized JSON details; rows are append-only |
-| `total_cost_usd`, `max_cost_usd` | Double precision, defaults 0 and 0.30; not an exact monetary ledger |
+| `total_cost_usd`, `max_cost_usd` | NUMERIC after cutover, synchronized NUMERIC shadows during expansion; finite nonnegative observed cost and positive budget; not a reservation/settlement ledger |
 | `max_steps`, `step_count` | Defaults 15 and 0; persisted step count can lag terminal reported step |
 | `last_step_had_error` | Required boolean, default false |
-| Timestamps | Double precision Unix seconds, set by application |
+| Timestamps | Legacy Unix seconds retained alongside synchronized TIMESTAMPTZ fields, required after cutover |
 | Optional text | `result_text`, `webhook_url`, `registry_fingerprint` |
-| Index | `runs_thread_idx(thread_id)`; no explicit tenant/status index or RLS |
+| Indexes and RLS | Tenant/time indexes, one-active-run partial unique index, forced RLS and transaction-local tenant context; runtime logins cannot own protected tables |
 
-The run schema still has legacy startup-created fields and no tenant RLS. The registry and
-policy revisions use versioned Alembic migrations. Finalization updates the run and, for
-completion, thread history using separate statements without an explicit surrounding
-transaction. Concurrent runs can overwrite whole thread histories.
+Admission locks the thread, captures `history_version` and claims one active run in the
+same transaction as run insertion. Successful completion commits run state, history,
+version increment and claim release atomically. Stale completion is rejected without
+emitting a successful worker completion; cancellation/reaping also releases the claim.
+Branches copy committed history at an explicitly checked version and record ancestry;
+they do not reconstruct arbitrary older snapshots.
+
+`legacy_tenant_mappings` and `phase2_quarantine` are operator-only tables, not tenant API
+resources. Quarantine preserves original historical JSON for reviewed resolution and may
+contain sensitive content. Runtime groups have no grants on them. The schema-owner has
+explicit administrator policies; execution/maintenance has deliberately cross-tenant,
+narrow table grants, while the API login has tenant-scoped policies only.
 
 ## 2. Nonrelational state (CURRENT)
 
@@ -166,8 +209,10 @@ secret key does not prove erasure of all copies.
 
 ## 3. Proposed tenancy and configuration ERD (TARGET)
 
-These are logical entities for migration design, **not existing tables or executable
-migrations**. All tenant-owned relationships below must include `tenant_id`.
+These are logical target entities, not a literal migration specification. Phase 1/2
+implement the registry, revisions and core ownership described above; later-phase
+workflow, artifact and ledger entities remain targets. All tenant-owned relationships
+must include `tenant_id`.
 Primary IDs are shown for readability; composite key requirements follow the diagrams.
 
 ```mermaid
@@ -298,9 +343,22 @@ issuer/subject pair and refuses to re-bootstrap an existing slug. Initial action
 RBAC is implemented in [`authorization.py`](../../app/core/authorization.py). Migration
 [`0003_run_submitter`](../../migrations/versions/0003_run_submitter.py) records the
 authenticated submitter for new runs; legacy rows remain unattributed and cannot be
-approved through an authenticated request. Tenant model/plugin/budget policy remains
-in `p1-tenant-policy`. Existing `runs` and `threads` still use text tenant IDs and are
-not yet protected by composite foreign keys or RLS.
+approved through an authenticated request. Immutable tenant model/plugin/budget policy
+and actor-scoped audit are implemented in migrations 0004/0005. Migration
+[`0006_phase2_schema_expand`](../../migrations/versions/0006_phase2_schema_expand.py)
+starts the additive Phase 2 expand step: existing text IDs remain as compatibility
+aliases while runs and threads gain internal UUID keys, nullable canonical tenant UUIDs,
+timestamp/numeric shadows, tenant-composite run/thread ownership constraints, and
+not-yet-validated state/cost checks that constrain new writes.
+Legacy tenant strings resolve only through an approved mapping or an exact tenant UUID
+or slug match; unmapped records remain unassigned rather than defaulting to a tenant.
+The operator mapping CLI verifies active tenant-administrator membership and appends
+an audit event atomically. Direct owner SQL is not an authorization API or proof of approval.
+The `phase2_schema_backfill_status` view reports unresolved tenant and thread ownership
+counts, including unresolved legacy state values. Migrations 0007/0008 add immutable
+agent revisions, atomic thread claims and forced RLS. Historical validation and required
+canonical fields occur in the explicit operator cutover, which production startup requires.
+See the [operator runbook](operations-migration.md#phase-2-operator-runbook).
 
 ## 4. Proposed execution and delivery ERD (TARGET)
 

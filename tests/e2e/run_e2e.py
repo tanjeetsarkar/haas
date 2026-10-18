@@ -275,16 +275,28 @@ def scenario_cancel_and_cursor_listing() -> None:
         "CANCEL this run",
         traceparent=f"00-{expected_trace_id}-{'b' * 16}-01",
     )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        calls = httpx.get(f"{MOCK}/_calls").json()["llm"]
+        if any(
+            call["traceparent"]
+            and call["traceparent"].split("-")[1] == expected_trace_id
+            for call in calls
+        ):
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("Cancellation fixture did not reach the model request.")
     cancelled = httpx.post(f"{API}/v1/runs/{run_id}/cancel", headers=TENANT)
     check(
         cancelled.status_code == 202 and cancelled.json()["status"] == "cancelled",
         "active run cancellation accepted",
     )
+    time.sleep(1.2)
     check(
         run_status(run_id)["status"] == "cancelled",
         "in-flight model completion cannot overwrite cancellation",
     )
-    time.sleep(1.2)
     calls = httpx.get(f"{MOCK}/_calls").json()["llm"]
     traceparents = [call["traceparent"] for call in calls if call["traceparent"]]
     check(

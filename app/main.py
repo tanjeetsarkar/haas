@@ -31,6 +31,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from redis.exceptions import RedisError
 
 from app.core.config import settings, validate_profile_settings
+from app.core.agents import AgentConfiguration
+from app.core.database_context import DatabaseTenantMiddleware
 from app.core.authorization import (
     Action,
     enforce_approval_separation_of_duties,
@@ -108,9 +110,14 @@ async def lifespan(app: FastAPI):
         settings.plugins_dir.mkdir(parents=True, exist_ok=True)
         registry.discover_from_settings(settings)
         await store.init()
-        maintenance = asyncio.create_task(
-            maintenance_loop(store), name="haas-maintenance"
-        )
+        if settings.haas_profile == "dev":
+            maintenance = asyncio.create_task(
+                maintenance_loop(store), name="haas-maintenance"
+            )
+        else:
+            log.info(
+                "Production cross-tenant maintenance requires the separate maintenance service."
+            )
         yield
     finally:
         if maintenance is not None:
@@ -133,6 +140,10 @@ app.add_middleware(
     authenticator=identity_authenticator,
     allow_legacy_header_tenancy=settings.haas_profile == "dev",
 )
+app.add_middleware(
+    DatabaseTenantMiddleware,
+    allow_legacy_dev=settings.haas_profile == "dev",
+)
 app.add_exception_handler(HTTPException, http_exception_problem)
 app.add_exception_handler(RequestValidationError, validation_problem)
 app.add_exception_handler(Exception, unexpected_problem)
@@ -141,6 +152,8 @@ app.add_exception_handler(Exception, unexpected_problem)
 class CreateRunRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=settings.max_prompt_chars)
     thread_id: str | None = None
+    agent_revision_id: UUID | None = None
+    expected_history_version: int | None = Field(default=None, ge=0)
     preload_skills: list[str] = Field(default_factory=list)
     # Optional allowlist for this run; can only narrow the tenant's allowed skills.
     skills: list[str] | None = None
@@ -183,10 +196,213 @@ class CreateTenantPolicyRequest(BaseModel):
     rules: TenantPolicyRules
 
 
+class CreateAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_name: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_-]+$")
+    configuration: AgentConfiguration
+
+
+class BranchThreadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_history_version: int = Field(ge=0)
+
+
+@app.get("/v1/threads", dependencies=[_require_action(Action.RUN_READ)])
+async def list_threads(
+    x_tenant_id: str = Header(default="default-tenant"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = None,
+    search: str = Query(default="", max_length=128),
+) -> dict[str, Any]:
+    rows = await store.list_threads(
+        x_tenant_id,
+        limit=limit + 1,
+        before=_decode_cursor(cursor) if cursor else None,
+        search=search,
+    )
+    items = rows[:limit]
+    return {
+        "items": items,
+        "next_cursor": (
+            _encode_cursor(items[-1]["updated_at"], items[-1]["thread_id"])
+            if len(rows) > limit
+            else None
+        ),
+    }
+
+
+@app.get("/v1/threads/{thread_id}", dependencies=[_require_action(Action.RUN_READ)])
+async def thread_history(
+    thread_id: str,
+    x_tenant_id: str = Header(default="default-tenant"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    history_version: int | None = Query(default=None, ge=0),
+) -> dict[str, Any]:
+    try:
+        thread = await store.get_thread(thread_id, x_tenant_id)
+    except StoreNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if history_version is not None and history_version != thread["history_version"]:
+        raise HTTPException(409, "Thread history changed; restart paging.")
+    messages = thread.pop("messages")
+    thread["items"] = messages[offset : offset + limit]
+    thread["next_offset"] = offset + limit if offset + limit < len(messages) else None
+    return thread
+
+
+@app.post(
+    "/v1/threads/{thread_id}/branches",
+    status_code=201,
+    dependencies=[_require_action(Action.RUN_SUBMIT)],
+)
+async def branch_thread(
+    thread_id: str,
+    req: BranchThreadRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    request_id = str(uuid.uuid4())
+    response.headers["X-Request-ID"] = request_id
+    identity = get_authenticated_identity(request)
+    try:
+        return await store.branch_thread(
+            thread_id,
+            x_tenant_id,
+            expected_history_version=req.expected_history_version,
+            actor_principal_id=identity.principal_id if identity else None,
+            request_id=request_id,
+        )
+    except StoreNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except StoreConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/v1/agents/revisions", dependencies=[_require_action(Action.RUN_READ)])
+async def list_agent_revisions(
+    x_tenant_id: str = Header(default="default-tenant"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    before = _decode_cursor(cursor) if cursor else None
+    if before:
+        try:
+            UUID(before[1])
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid revision cursor.") from exc
+    rows = await store.list_agent_revisions(x_tenant_id, limit=limit + 1, before=before)
+    items = rows[:limit]
+    return {
+        "items": items,
+        "next_cursor": (
+            _encode_cursor(items[-1]["created_at"], items[-1]["revision_id"])
+            if len(rows) > limit
+            else None
+        ),
+    }
+
+
+@app.get(
+    "/v1/agents/revisions/{revision_id}",
+    dependencies=[_require_action(Action.RUN_READ)],
+)
+async def get_agent_revision(
+    revision_id: UUID,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    try:
+        return await store.get_agent_revision(x_tenant_id, str(revision_id))
+    except StoreNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post(
+    "/v1/agents/revisions",
+    status_code=201,
+    dependencies=[_require_action(Action.TENANT_ADMIN)],
+)
+async def draft_agent_revision(
+    req: CreateAgentRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    identity = get_authenticated_identity(request)
+    if identity is None:
+        raise HTTPException(401, "Agent authoring requires a verified identity.")
+    policy = await _get_tenant_policy(x_tenant_id)
+    try:
+        req.configuration.validate_policy(policy, registry)
+        request_id = str(uuid.uuid4())
+        result = await store.create_agent_revision(
+            x_tenant_id,
+            agent_name=req.agent_name,
+            configuration=req.configuration.model_dump(mode="json"),
+            digest=req.configuration.digest(),
+            policy_revision_id=policy.policy_revision_id,
+            registry_fingerprint=registry.fingerprint,
+            actor_principal_id=identity.principal_id,
+            request_id=request_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except StoreConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    response.headers["X-Request-ID"] = request_id
+    return result
+
+
+@app.post(
+    "/v1/agents/revisions/{revision_id}/{operation}",
+    dependencies=[_require_action(Action.TENANT_ADMIN)],
+)
+async def transition_agent_revision(
+    revision_id: UUID,
+    operation: Literal["validate", "publish"],
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    identity = get_authenticated_identity(request)
+    if identity is None:
+        raise HTTPException(401, "Agent authoring requires a verified identity.")
+    policy = await _get_tenant_policy(x_tenant_id)
+    try:
+        revision = await store.get_agent_revision(x_tenant_id, str(revision_id))
+        config = AgentConfiguration.model_validate(revision["configuration"])
+        if config.digest() != revision["digest"]:
+            raise HTTPException(503, "Agent configuration integrity check failed.")
+        config.validate_policy(policy, registry)
+        request_id = str(uuid.uuid4())
+        result = await store.transition_agent_revision(
+            x_tenant_id,
+            str(revision_id),
+            target="validated" if operation == "validate" else "published",
+            actor_principal_id=identity.principal_id,
+            request_id=request_id,
+            policy_revision_id=policy.policy_revision_id,
+            registry_fingerprint=registry.fingerprint,
+        )
+    except StoreNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except StoreConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    response.headers["X-Request-ID"] = request_id
+    return result
+
+
 async def _get_owned_run(run_id: str, tenant_id: str) -> dict[str, Any]:
     run = await store.get_run(run_id)
     # 404 (not 403) for other tenants' runs so run ids are not discoverable.
-    if not run or run["tenant_id"] != tenant_id:
+    if not run or tenant_id not in (
+        run["tenant_id"],
+        str(run["tenant_uuid"]) if run.get("tenant_uuid") is not None else None,
+        run.get("tenant_slug"),
+    ):
         raise HTTPException(status_code=404, detail="Run not found.")
     return run
 
@@ -318,6 +534,35 @@ async def create_run(
 ) -> dict[str, Any]:
     identity = get_authenticated_identity(request)
     policy = await _get_tenant_policy(x_tenant_id) if identity else None
+    if req.agent_revision_id is not None:
+        if policy is None:
+            raise HTTPException(
+                401, "Revision-pinned runs require a verified identity."
+            )
+        try:
+            revision = await store.get_agent_revision(
+                x_tenant_id, str(req.agent_revision_id)
+            )
+        except StoreNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        if (
+            revision["state"] != "published"
+            or str(revision["policy_revision_id"]) != policy.policy_revision_id
+            or revision["registry_fingerprint"] != registry.fingerprint
+        ):
+            raise HTTPException(
+                409, "Revision is unpublished or its policy/inventory changed."
+            )
+        config = AgentConfiguration.model_validate(revision["configuration"])
+        if config.digest() != revision["digest"]:
+            raise HTTPException(503, "Agent configuration integrity check failed.")
+        try:
+            config.validate_policy(policy, registry)
+        except ValueError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        if req.model_fields_set.intersection(AgentConfiguration.model_fields):
+            raise HTTPException(422, "Pinned agent configuration cannot be overridden.")
+        req = req.model_copy(update=config.model_dump())
     try:
         if policy is not None:
             plugin_access = policy.resolve_plugin_access(registry)
@@ -427,24 +672,33 @@ async def create_run(
         )
     history.append({"role": "user", "content": req.prompt})
 
+    try:
+        await store.create_run(
+            run_id=run_id,
+            thread_id=thread_id,
+            tenant_id=x_tenant_id,
+            traceparent=trace_id,
+            primary_model=primary_model,
+            planner_model=planner_model,
+            initial_skills=req.preload_skills,
+            initial_messages=history,
+            max_steps=max_steps,
+            max_cost_usd=max_cost_usd,
+            webhook_url=req.webhook_url,
+            skill_allowlist=allowlist,
+            registry_fingerprint=registry.fingerprint,
+            submitted_by_principal_id=identity.principal_id if identity else None,
+            policy_revision_id=policy.policy_revision_id if policy else None,
+            agent_revision_id=str(req.agent_revision_id)
+            if req.agent_revision_id
+            else None,
+            expected_history_version=req.expected_history_version,
+        )
+    except StoreConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ThreadOwnershipError as exc:
+        raise HTTPException(404, "Thread not found.") from exc
     await store.store_ephemeral_secrets(run_id, req.secrets)
-    await store.create_run(
-        run_id=run_id,
-        thread_id=thread_id,
-        tenant_id=x_tenant_id,
-        traceparent=trace_id,
-        primary_model=primary_model,
-        planner_model=planner_model,
-        initial_skills=req.preload_skills,
-        initial_messages=history,
-        max_steps=max_steps,
-        max_cost_usd=max_cost_usd,
-        webhook_url=req.webhook_url,
-        skill_allowlist=allowlist,
-        registry_fingerprint=registry.fingerprint,
-        submitted_by_principal_id=identity.principal_id if identity else None,
-        policy_revision_id=policy.policy_revision_id if policy else None,
-    )
     await store.publish_event(
         run_id, "run_queued", {"run_id": run_id, "thread_id": thread_id}
     )
@@ -768,7 +1022,28 @@ async def get_current_identity(request: Request) -> dict[str, Any]:
         "roles": sorted(identity.roles),
         "credential_type": identity.credential_type,
         "environment": settings.haas_profile,
+        "capabilities": identity_capabilities(identity.roles),
     }
+
+
+def identity_capabilities(roles: Collection[str]) -> dict[str, Any]:
+    return {
+        "version": "1",
+        "actions": sorted(
+            action.value for action in Action if is_authorized(roles, action)
+        ),
+        "event_schemas": ["redis-stream.v1"],
+        "features": ["agent-revisions.v1", "thread-history.v1", "thread-branches.v1"],
+        "durable_replay": False,
+    }
+
+
+@app.get("/v1/capabilities")
+async def get_capabilities(request: Request) -> dict[str, Any]:
+    identity = get_authenticated_identity(request)
+    if identity is None:
+        raise HTTPException(401, "Authenticated identity required.")
+    return identity_capabilities(identity.roles)
 
 
 @app.get(

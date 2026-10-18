@@ -26,7 +26,7 @@ SECRET_SUBCOMMANDS = [
 ]
 _DESCRIPTIONS = {c.split()[0]: d for c, d in COMMAND_HELP}
 _DESCRIPTIONS["/exit"] = "Exit"
-_COMMAND_ORDER = [c.split()[0] for c, _ in COMMAND_HELP] + ["/exit"]
+_COMMAND_ORDER = list(dict.fromkeys(c.split()[0] for c, _ in COMMAND_HELP)) + ["/exit"]
 
 
 @dataclass

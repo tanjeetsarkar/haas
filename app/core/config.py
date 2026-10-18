@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     haas_worker_role: Literal["orchestrator", "tools"] = "tools"
     app_name: str = "Distributed HaaS Platform"
     postgres_dsn: str = "postgresql://haas:haas_dev_password@localhost:5432/haas_db"
+    migration_postgres_dsn: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"

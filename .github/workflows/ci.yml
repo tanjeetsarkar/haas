@@ -16,6 +16,19 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: phase2-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      POSTGRES_DSN: postgresql://postgres:phase2-ci-only@localhost:5432/postgres
+      HAAS_TEST_POSTGRES_DSN: postgresql://postgres:phase2-ci-only@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,7 +41,12 @@ jobs:
         run: ruff check app haas_cli migrations scripts tests
       - name: Pyright
         run: pyright
-      - name: Unit tests and coverage
+      - name: Migration round trip
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+      - name: Unit and PostgreSQL integration tests with coverage
         run: pytest --cov=app --cov=haas_cli --cov-report=term-missing --cov-report=xml --cov-fail-under=75
       - name: Dependency audit
         run: pip-audit --skip-editable
@@ -56,13 +74,181 @@ jobs:
           second=$!
           wait "$first"
           wait "$second"
+      - name: Verify Phase 2 schema expansion and tenant ownership
+        run: |
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade 0005_audit_v1
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO tenants (tenant_id, slug, status) VALUES
+              ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'phase-two-qa', 'active'),
+              ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'phase-two-other', 'active');
+          INSERT INTO principals (principal_id, issuer, subject, kind) VALUES
+              ('cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+               'https://migration.invalid', 'phase-two-mapper', 'human');
+          INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at)
+          VALUES ('phase-two-thread', 'phase-two-qa', '[]'::jsonb, 1);
+          INSERT INTO runs (
+              run_id, thread_id, tenant_id, traceparent, status,
+              primary_model, planner_model, created_at, updated_at, max_cost_usd
+          ) VALUES (
+              'phase-two-run', 'phase-two-thread', 'phase-two-qa',
+              '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01',
+              'running', 'model-a', 'model-b', 1, 2, 0.30
+          );
+          INSERT INTO runs (
+              run_id, thread_id, tenant_id, traceparent, status,
+              primary_model, planner_model, created_at, updated_at, max_cost_usd
+          ) VALUES (
+              'phase-two-unresolved-run', 'missing-thread', 'phase-two-qa',
+              '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01',
+              'running', 'model-a', 'model-b', 1, 2, 0.30
+          );
+          INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at)
+          VALUES ('phase-two-unmapped-thread', 'unmapped-legacy-tenant', '[]'::jsonb, 1);
+          SQL
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade 0006_phase2_schema_expand
+          if output=$(docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head 2>&1); then
+            echo "Phase 2 migration incorrectly accepted active legacy runs"
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F 'drain legacy runs to terminal'
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+              IF (SELECT count(*) FROM runs WHERE run_id LIKE 'phase-two-%') <> 2
+                 OR (SELECT tenant_uuid FROM runs
+                     WHERE run_id = 'phase-two-run') IS NOT NULL
+                 OR (SELECT unresolved_schema_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'runs') <> 2 THEN
+                  RAISE EXCEPTION 'Phase 2 expansion did not preserve staged legacy rows';
+              END IF;
+          END
+          $$;
+          INSERT INTO legacy_tenant_mappings (
+              legacy_tenant_id, tenant_uuid, approved_by_principal_id, reason
+          ) VALUES (
+              'phase-two-qa-legacy',
+              'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+              'CI schema expansion ownership qualification'
+          );
+          UPDATE threads
+          SET tenant_id = tenant_id
+          WHERE thread_id IN ('phase-two-thread', 'phase-two-unmapped-thread');
+          UPDATE runs
+          SET tenant_id = tenant_id
+          WHERE run_id IN ('phase-two-run', 'phase-two-unresolved-run');
+          INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at)
+          VALUES ('phase-two-alias-thread', 'phase-two-qa-legacy', '[]'::jsonb, 1);
+          INSERT INTO runs (
+              run_id, thread_id, tenant_id, traceparent, status,
+              primary_model, planner_model, created_at, updated_at, max_cost_usd
+          ) VALUES (
+              'phase-two-alias-run', 'phase-two-alias-thread', 'phase-two-qa-legacy',
+              '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01',
+              'running', 'model-a', 'model-b', 1, 2, 0.30
+          );
+          DO $$
+          BEGIN
+              IF (SELECT tenant_uuid FROM runs WHERE run_id = 'phase-two-run')
+                    <> 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'::uuid
+                 OR (SELECT thread_key FROM runs WHERE run_id = 'phase-two-run')
+                    IS NULL
+                 OR (SELECT max_cost_usd_exact FROM runs WHERE run_id = 'phase-two-run')
+                    <> 0.30::numeric
+                 OR (SELECT extract(epoch FROM created_at_ts) FROM runs
+                     WHERE run_id = 'phase-two-run') <> 1
+                 OR (SELECT thread_key FROM runs
+                     WHERE run_id = 'phase-two-unresolved-run') IS NOT NULL
+                 OR (SELECT tenant_uuid FROM runs
+                     WHERE run_id = 'phase-two-unresolved-run')
+                    <> 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'::uuid
+                 OR (SELECT tenant_uuid FROM runs
+                     WHERE run_id = 'phase-two-alias-run')
+                    <> 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'::uuid
+                 OR (SELECT tenant_uuid FROM threads
+                     WHERE thread_id = 'phase-two-unmapped-thread') IS NOT NULL
+                 OR (SELECT unresolved_tenant_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'threads') <> 1
+                 OR (SELECT unresolved_thread_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'runs') <> 1
+                 OR (SELECT unresolved_state_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'runs') <> 0
+                 OR (SELECT unresolved_schema_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'runs') <> 0
+                 OR (SELECT unresolved_schema_rows
+                     FROM phase2_schema_backfill_status
+                     WHERE relation = 'threads') <> 0 THEN
+                  RAISE EXCEPTION 'Phase 2 schema expansion backfill failed';
+              END IF;
+          END
+          $$;
+          UPDATE runs
+          SET total_cost_usd = 0.125, updated_at = updated_at + 1
+          WHERE run_id = 'phase-two-run';
+          DO $$
+          BEGIN
+              IF (SELECT total_cost_usd_exact FROM runs
+                  WHERE run_id = 'phase-two-run') <> 0.125::numeric THEN
+                  RAISE EXCEPTION 'Phase 2 numeric shadow did not track legacy writes';
+              END IF;
+          END
+          $$;
+          SQL
+          if docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "INSERT INTO runs (run_id, thread_id, tenant_id, traceparent, status, primary_model, planner_model, created_at, updated_at) VALUES ('phase-two-cross-tenant-run', 'phase-two-thread', 'phase-two-other', '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01', 'running', 'model-a', 'model-b', 1, 1)"; then
+            echo "Cross-tenant run/thread reference unexpectedly succeeded"
+            exit 1
+          fi
+          if docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "INSERT INTO runs (run_id, thread_id, tenant_id, traceparent, status, primary_model, planner_model, created_at, updated_at) VALUES ('phase-two-invalid-state-run', 'phase-two-thread', 'phase-two-qa', '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01', 'queued', 'model-a', 'model-b', 1, 1)"; then
+            echo "Unsupported run state unexpectedly succeeded"
+            exit 1
+          fi
+          if docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "INSERT INTO runs (run_id, thread_id, tenant_id, traceparent, status, primary_model, planner_model, total_cost_usd, created_at, updated_at) VALUES ('phase-two-invalid-cost-run', 'phase-two-thread', 'phase-two-qa', '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01', 'running', 'model-a', 'model-b', -0.01, 1, 1)"; then
+            echo "Negative exact run cost unexpectedly succeeded"
+            exit 1
+          fi
+          if docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "UPDATE threads SET thread_key = gen_random_uuid() WHERE thread_id = 'phase-two-thread'"; then
+            echo "Thread internal key unexpectedly changed"
+            exit 1
+          fi
+          if docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade 0005_audit_v1; then
+            echo "Downgrade unexpectedly discarded approved tenant mappings"
+            exit 1
+          fi
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 <<'SQL'
+          DELETE FROM runs
+          WHERE run_id IN (
+              'phase-two-run', 'phase-two-unresolved-run', 'phase-two-alias-run'
+          );
+          DELETE FROM threads
+          WHERE thread_id IN (
+              'phase-two-thread', 'phase-two-alias-thread',
+              'phase-two-unmapped-thread'
+          );
+          DELETE FROM legacy_tenant_mappings
+          WHERE legacy_tenant_id = 'phase-two-qa-legacy';
+          DELETE FROM principals
+          WHERE principal_id = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+          DELETE FROM tenants
+          WHERE tenant_id IN (
+              'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+          );
+          SQL
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head
       - name: Verify legacy-schema adoption is non-destructive
         run: |
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade 0001_initial_schema
           docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at) VALUES ('migration-probe', 'ci', '[]'::jsonb, 1)"
           docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -v ON_ERROR_STOP=1 -c "DROP TABLE haas_baseline_ownership; DROP TABLE alembic_version"
           docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head
           docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic downgrade base
           test "$(docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml exec -T postgres psql -U haas -d haas_db -Atqc "SELECT count(*) FROM threads WHERE thread_id = 'migration-probe'")" = "1"
+          docker compose -f docker-compose.yml -f tests/e2e/docker-compose.e2e.yml run --rm migrate alembic upgrade head
       - name: Run E2E scenarios
         run: python tests/e2e/run_e2e.py
       - name: Stop stack

@@ -79,11 +79,6 @@ def decide(messages: list[dict[str, Any]]) -> dict[str, Any]:
 @app.post("/v1/chat/completions")
 async def chat(request: Request) -> JSONResponse:
     body = await request.json()
-    if any(
-        message.get("role") == "user" and "CANCEL" in message.get("content", "")
-        for message in body["messages"]
-    ):
-        await asyncio.sleep(1)
     CALLS.append(
         {
             "model": body["model"],
@@ -94,6 +89,11 @@ async def chat(request: Request) -> JSONResponse:
             "traceparent": request.headers.get("traceparent"),
         }
     )
+    if any(
+        message.get("role") == "user" and "CANCEL" in message.get("content", "")
+        for message in body["messages"]
+    ):
+        await asyncio.sleep(1)
     message = decide(body["messages"])
     # extra field real providers add; the harness must not echo it back
     message["reasoning"] = "mock reasoning"

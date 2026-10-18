@@ -42,6 +42,8 @@ class ChatSettings:
     environment: EnvironmentName = "unknown"
     credential: str | None = field(default=None, repr=False)
     thread_id: str | None = None
+    agent_revision_id: str | None = None
+    history_version: int | None = None
     primary_model: str | None = None
     planner_model: str | None = None
     max_steps: int | None = None

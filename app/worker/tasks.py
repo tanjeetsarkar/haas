@@ -79,14 +79,16 @@ def _is_retryable(exc: BaseException) -> bool:
 async def _fail_run(run_id: str, message: str) -> None:
     """Terminal failure path so a crashed step never leaves a run stuck in `running`."""
     store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX)
+    await store.init(pool_max=TASK_POOL_MAX, service=True)
     try:
         run = await store.get_run(run_id)
         if not run or run["status"] in ("completed", "failed", "cancelled"):
             return
-        await store.finalize_run(
+        committed = await store.finalize_run(
             run_id, run["thread_id"], "failed", message, run["messages"]
         )
+        if not committed:
+            return
         await store.publish_event(run_id, "run_error", {"error": message})
         if run["webhook_url"]:
             cast(Task, deliver_webhook_task).apply_async(
@@ -118,7 +120,7 @@ def llm_step_task(self, run_id: str) -> dict[str, Any]:
 
 async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
     store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX)
+    await store.init(pool_max=TASK_POOL_MAX, service=True)
     try:
         run = await store.get_run(run_id)
         if not run or run["status"] != "running":
@@ -128,9 +130,14 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
         max_steps = int(run["max_steps"])
         if step > max_steps:
             msg = f"Exceeded max_steps budget ({max_steps})."
-            await store.finalize_run(
+            committed = await store.finalize_run(
                 run_id, run["thread_id"], "failed", msg, run["messages"]
             )
+            if not committed:
+                return {
+                    "status": "aborted",
+                    "reason": "Thread claim is no longer current",
+                }
             await store.publish_event(run_id, "run_error", {"error": msg})
             await _maybe_webhook(
                 run, {"run_id": run_id, "status": "failed", "error": msg}
@@ -220,7 +227,7 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
         tool_calls = assistant_msg.get("tool_calls") or []
         if not tool_calls:
             final_text = assistant_msg.get("content") or ""
-            await store.finalize_run(
+            committed = await store.finalize_run(
                 run_id,
                 run["thread_id"],
                 "completed",
@@ -228,6 +235,11 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 messages,
                 cost_delta_usd=completion.cost_usd,
             )
+            if not committed:
+                return {
+                    "status": "aborted",
+                    "reason": "Thread claim is no longer current",
+                }
             await store.publish_event(
                 run_id,
                 "run_completed",
@@ -246,7 +258,7 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
         # USD budget check before executing tools
         if new_total_cost > float(run["max_cost_usd"]):
             err = f"Exceeded max_cost_usd budget (${new_total_cost:.4f} > ${float(run['max_cost_usd']):.4f})."
-            await store.finalize_run(
+            committed = await store.finalize_run(
                 run_id,
                 run["thread_id"],
                 "failed",
@@ -254,6 +266,11 @@ async def _async_llm_step(task_self: Any, run_id: str) -> dict[str, Any]:
                 messages,
                 cost_delta_usd=completion.cost_usd,
             )
+            if not committed:
+                return {
+                    "status": "aborted",
+                    "reason": "Thread claim is no longer current",
+                }
             await store.publish_event(run_id, "run_error", {"error": err})
             await _maybe_webhook(
                 run, {"run_id": run_id, "status": "failed", "error": err}
@@ -532,7 +549,7 @@ async def _async_aggregate_step(
     tool_outcomes: list[dict[str, Any]], run_id: str
 ) -> dict[str, Any]:
     store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX)
+    await store.init(pool_max=TASK_POOL_MAX, service=True)
     try:
         run = await store.get_run(run_id)
         if not run or run["status"] != "running":

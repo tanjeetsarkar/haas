@@ -2,12 +2,31 @@ services:
   haas-api:
     environment:
       HAAS_PROFILE: prod
+      POSTGRES_DSN: ${HAAS_API_POSTGRES_DSN:-}
+      HAAS_OIDC_ISSUER: ${HAAS_OIDC_ISSUER:-}
+      HAAS_OIDC_AUDIENCE: ${HAAS_OIDC_AUDIENCE:-}
+      HAAS_OIDC_JWKS_URL: ${HAAS_OIDC_JWKS_URL:-}
   worker-orchestrator:
     environment:
       HAAS_PROFILE: prod
+      POSTGRES_DSN: ${HAAS_WORKER_POSTGRES_DSN:-}
   worker-tools:
     environment:
       HAAS_PROFILE: prod
   migrate:
     environment:
       HAAS_PROFILE: prod
+      POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:-}
+      MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:-}
+      HAAS_OIDC_ISSUER: ${HAAS_OIDC_ISSUER:-}
+  maintenance:
+    image: haas-distributed:3.0.0
+    command: python -m app.maintenance_service
+    environment:
+      HAAS_PROFILE: prod
+      POSTGRES_DSN: ${HAAS_WORKER_POSTGRES_DSN:-}
+      REDIS_URL: redis://redis:6379/0
+      HAAS_SECRET_ENCRYPTION_KEY: ${HAAS_SECRET_ENCRYPTION_KEY:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
