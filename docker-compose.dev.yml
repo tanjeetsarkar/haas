@@ -11,6 +11,12 @@ services:
     ports:
       - "127.0.0.1:${HAAS_POSTGRES_PORT:-5432}:5432"
 
+  # Self-hosted SearXNG (web-research plugin): expose on localhost for debugging.
+  # The tool worker reaches it by Docker DNS (http://searxng:8080), not via this port.
+  searxng:
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
+
   flower:
     image: haas-distributed:3.0.0
     command: celery -A app.worker.celery_app flower --port=5555

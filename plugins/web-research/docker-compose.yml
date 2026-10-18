@@ -1,0 +1,38 @@
+# SearXNG hosting for the web-research plugin.
+#
+# This is a Docker Compose OVERRIDE. Merge it with the base stack:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#     -f plugins/web-research/docker-compose.yml up -d
+#
+# The `searxng` service joins the default network so `worker-tools` can reach it
+# by Docker DNS at http://searxng:8080 (SEARXNG_URL). The harness SSRF guard is
+# allowlisted for the `searxng` hostname via SSRF_ALLOWED_HOSTS in docker-compose.yml.
+#
+# The ./searxng directory is bind-mounted read-only into the container so the
+# settings.yml shipped with this plugin is the one SearXNG loads. SEARXNG_SECRET
+# must be set in your .env (see .env.example); generate one with:
+#
+#   openssl rand -hex 32
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    # The image's entrypoint loads /etc/searxng/settings.yml and execs granian;
+    # do not override the command. SEARXNG_SECRET overrides server.secret_key.
+    volumes:
+      - ./plugins/web-research/searxng:/etc/searxng:ro
+      - searxng_data:/var/cache/searxng
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-please-regenerate-with-openssl-rand-hex-32}
+      SEARXNG_BASE_URL: ${SEARXNG_URL:-http://searxng:8080}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  searxng_data:

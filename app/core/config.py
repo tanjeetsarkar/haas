@@ -140,6 +140,10 @@ class Settings(BaseSettings):
     # (local development / integration tests only).
     ssrf_allowed_hosts: str = ""
 
+    # Self-hosted SearXNG base URL used by the web-research plugin's `web_search` tool.
+    # Default is the Docker Compose service address; override for non-Compose deployments.
+    searxng_url: str = "http://searxng:8080"
+
     # --- P4 isolation settings (EXEC) ---
     # "static": the API/workers build the tool catalog from catalog JSON produced by a
     # sandboxed `describe` (never importing plugin code); "import" is the legacy dev loader.

@@ -6,6 +6,7 @@ import socket
 import httpx
 import pytest
 
+from app.core.config import settings
 from app.core.context import SecurityViolationError, ToolRemediationError
 
 HTML = """<html><head><title> Release  Notes </title><meta name="description" content="What changed">
@@ -58,7 +59,7 @@ async def test_fetch_page_extracts_readable_text(make_harness):
         and "Nav link" not in out["text"]
     )
     assert out["next_offset"] is None
-    assert "HaaS-WebResearch" in h.requests[0].headers["user-agent"]
+    assert "Chrome/120.0.0.0" in h.requests[0].headers["user-agent"]
 
 
 async def test_fetch_page_paging(make_harness):
@@ -155,53 +156,74 @@ async def test_extract_links_filters_and_dedupes(make_harness):
     assert flt["count"] == 1
 
 
-async def test_web_search_uses_secret_and_cleans_snippets(make_harness):
+async def test_web_search_calls_searxng_and_maps_freshness(make_harness, monkeypatch):
+    monkeypatch.setattr(settings, "searxng_url", "http://example.com")
+
     def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.host == "api.search.brave.com"
-        assert req.headers["x-subscription-token"] == "bk"
-        assert req.url.params["freshness"] == "pw"
+        assert req.url.host == "example.com"
+        assert req.url.path == "/search"
+        assert req.url.params["format"] == "json"
+        assert req.url.params["q"] == "postgres 17"
+        # freshness 'pw' maps to SearXNG time_range 'week'
+        assert req.url.params["time_range"] == "week"
+        # No Brave auth header is sent anymore.
+        assert "x-subscription-token" not in req.headers
         return httpx.Response(
             200,
             json={
-                "web": {
-                    "results": [
-                        {
-                            "title": "T",
-                            "url": "https://x.org",
-                            "description": "<strong>Hi</strong>  there",
-                            "age": "1 day ago",
-                        }
-                    ]
-                }
+                "results": [
+                    {
+                        "title": "T",
+                        "url": "https://x.org",
+                        "content": "Hi  there",
+                        "publishedDate": "2024-01-02T03:04:05",
+                    }
+                ]
             },
         )
 
-    h = make_harness("web_tools.py", handler, secrets={"BRAVE_API_KEY": "bk"})
+    # No secrets supplied: SearXNG is keyless.
+    h = make_harness("web_tools.py", handler)
     out = json.loads(await h.call("web_search", query="postgres 17", freshness="pw"))
     assert out["results"] == [
         {
             "title": "T",
             "url": "https://x.org",
             "snippet": "Hi there",
-            "age": "1 day ago",
+            "age": "2024-01-02T03:04:05",
         }
     ]
     with pytest.raises(ToolRemediationError, match="freshness"):
         await h.call("web_search", query="postgres 17", freshness="forever")
 
 
-@pytest.mark.parametrize("status,match", [(401, "rejected"), (429, "quota")])
-async def test_web_search_errors(make_harness, status, match):
-    h = make_harness(
-        "web_tools.py",
-        lambda r: httpx.Response(status),
-        secrets={"BRAVE_API_KEY": "bk"},
-    )
+async def test_web_search_respects_searxng_url_override(make_harness, monkeypatch):
+    monkeypatch.setattr(settings, "searxng_url", "http://other.example.org")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.host == "other.example.org"
+        return httpx.Response(200, json={"results": []})
+
+    h = make_harness("web_tools.py", handler)
+    out = json.loads(await h.call("web_search", query="anything"))
+    assert out["count"] == 0 and out["results"] == []
+
+
+@pytest.mark.parametrize("status,match", [(429, "rate limit"), (500, "HTTP 500")])
+async def test_web_search_errors(make_harness, monkeypatch, status, match):
+    monkeypatch.setattr(settings, "searxng_url", "http://example.com")
+    h = make_harness("web_tools.py", lambda r: httpx.Response(status))
     with pytest.raises(ToolRemediationError, match=match):
         await h.call("web_search", query="anything")
 
 
-async def test_web_search_without_secret_is_denied(make_harness):
-    h = make_harness("web_tools.py", lambda r: httpx.Response(200, json={}))
-    with pytest.raises(SecurityViolationError):
-        await h.call("web_search", query="anything")
+async def test_web_search_needs_no_secret(make_harness, monkeypatch):
+    # web_search must work with an empty secret vault (SearXNG is keyless).
+    monkeypatch.setattr(settings, "searxng_url", "http://example.com")
+    h = make_harness(
+        "web_tools.py",
+        lambda r: httpx.Response(200, json={"results": []}),
+        secrets={},
+    )
+    out = json.loads(await h.call("web_search", query="anything"))
+    assert out["count"] == 0

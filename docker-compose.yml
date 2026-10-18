@@ -132,6 +132,12 @@ services:
       PLUGINS_STRICT: ${PLUGINS_STRICT:-false}
       BILLING_MCP_URL: ${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}
       BILLING_WEBHOOK_URL: ${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}
+      # Self-hosted SearXNG used by the web-research plugin's `web_search` tool.
+      # The `searxng` service is defined by plugins/web-research/docker-compose.yml.
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      # SSRF guard allowlist: the tool worker calls SearXNG by Docker DNS service name,
+      # which resolves to a private address; allowlist it so validate_safe_outbound_url passes.
+      SSRF_ALLOWED_HOSTS: ${SSRF_ALLOWED_HOSTS:-searxng}
     cap_drop:
       - ALL
     security_opt:

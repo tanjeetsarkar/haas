@@ -1,0 +1,44 @@
+# SearXNG settings for the web-research plugin.
+#
+# This is a private, keyless metasearch instance used by the `web_search` tool.
+# It is NOT a public instance: the bot limiter is off, the JSON API is on, and it
+# binds to all interfaces so the tool worker can reach it over the Compose network.
+#
+# Regenerate `server.secret_key` with:  openssl rand -hex 32
+# and set it via the SEARXNG_SECRET env var (see .env.example).
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "haas-web-research"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  # Overridden at load time by the SEARXNG_SECRET env var (see docker-compose.yml).
+  # Set a non-empty literal here as the fallback; SearXNG refuses to start without one.
+  secret_key: "ultrasecretkey-change-me-via-SEARXNG_SECRET"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+outgoing:
+  request_timeout: 20.0
+  max_request_timeout: 25.0
+  useragent_suffix: ""
+  # No proxies by default; SearXNG reaches the public engines directly.
+
+ui:
+  default_locale: ""
+  default_theme: simple
+  center_alignment: true
+  results_on_new_tab: true

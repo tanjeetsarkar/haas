@@ -1,9 +1,12 @@
-"""Web research tools: SSRF-safe page fetching, link extraction and web search (Brave Search API).
+"""Web research tools: SSRF-safe page fetching, link extraction and web search (self-hosted SearXNG).
 
 * `web_fetch_page` / `web_extract_links` need no secret. Every hop (including redirects) is checked by
   the harness SSRF guard with DNS resolution, responses are size-capped, and only text content
   types are accepted.
-* `web_search` needs the run secret `BRAVE_API_KEY` (declared by the `web-research` skill).
+* `web_search` calls the self-hosted SearXNG instance at `SEARXNG_URL` (default
+  `http://searxng:8080`, defined by `plugins/web-research/docker-compose.yml`). No secret is
+  required; the `searxng` hostname is allowlisted via `SSRF_ALLOWED_HOSTS` so the SSRF guard
+  permits the Docker-DNS service address.
 """
 
 from __future__ import annotations
@@ -16,13 +19,14 @@ from urllib.parse import urljoin, urlparse
 
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.core.context import (
     RunContext,
     ToolRemediationError,
     validate_safe_outbound_url,
 )
 
-USER_AGENT = "Mozilla/5.0 (compatible; HaaS-WebResearch/1.0)"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 MAX_BYTES = 2_000_000
 MAX_REDIRECTS = 5
 TEXT_TYPES = (
@@ -68,7 +72,13 @@ BLOCK_TAGS = {
     "h5",
     "h6",
 }
-SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+# SearXNG time_range values mapped from the tool's `freshness` codes.
+FRESHNESS_TO_TIME_RANGE = {
+    "pd": "day",
+    "pw": "week",
+    "pm": "month",
+    "py": "year",
+}
 
 
 class _Extractor(HTMLParser):
@@ -296,45 +306,45 @@ def register(registry) -> None:
 
     @registry.tool(
         name="web_search",
-        description="Searches the web (Brave Search) and returns titles, URLs and snippets. Read-only. Follow up with web_fetch_page to read sources.",
+        description="Searches the web via the self-hosted SearXNG instance and returns titles, URLs and snippets. Read-only. Follow up with web_fetch_page to read sources.",
         args_schema=SearchArgs,
     )
     async def web_search(ctx: RunContext, args: SearchArgs) -> str:
         assert ctx.http_client is not None
-        params = {"q": args.query, "count": args.count}
+        base = settings.searxng_url.rstrip("/")
+        # The SSRF guard allowlists the `searxng` hostname (SSRF_ALLOWED_HOSTS) so the
+        # Docker-DNS service address passes validate_safe_outbound_url.
+        search_url = validate_safe_outbound_url(f"{base}/search", resolve_dns=True)
+        params = {"format": "json", "q": args.query, "pageno": 1}
         if args.freshness:
             if not re.fullmatch(r"p[dwmy]", args.freshness):
                 raise ToolRemediationError("freshness must be one of pd, pw, pm, py.")
-            params["freshness"] = args.freshness
+            params["time_range"] = FRESHNESS_TO_TIME_RANGE[args.freshness]
         resp = await ctx.http_client.get(
-            SEARCH_URL,
+            search_url,
             params=params,
-            headers={
-                "X-Subscription-Token": ctx.get_secret("BRAVE_API_KEY"),
-                "Accept": "application/json",
-            },
-            timeout=15.0,
+            headers={"Accept": "application/json"},
+            timeout=20.0,
             follow_redirects=False,
         )
-        if resp.status_code in (401, 403):
-            raise ToolRemediationError(
-                "Brave Search rejected BRAVE_API_KEY. Ask the operator for a valid key."
-            )
         if resp.status_code == 429:
             raise ToolRemediationError(
-                "Search quota/rate limit reached; do not retry now. Use known URLs instead."
+                "SearXNG rate limit reached; do not retry now. Use known URLs instead."
             )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise ToolRemediationError(
+                f"SearXNG answered HTTP {resp.status_code}. Check SEARXNG_URL and that the "
+                "searxng service is running."
+            )
+        data = resp.json()
         results = [
             {
                 "title": r.get("title"),
                 "url": r.get("url"),
-                "snippet": " ".join(
-                    re.sub(r"<[^>]+>", "", r.get("description", "")).split()
-                )[:300],
-                "age": r.get("age"),
+                "snippet": " ".join((r.get("content") or "").split())[:300],
+                "age": r.get("publishedDate"),
             }
-            for r in resp.json().get("web", {}).get("results", [])[: args.count]
+            for r in data.get("results", [])[: args.count]
         ]
         return json.dumps(
             {"query": args.query, "count": len(results), "results": results}
