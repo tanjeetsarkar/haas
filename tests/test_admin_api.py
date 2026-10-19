@@ -149,6 +149,7 @@ async def test_submitter_cannot_use_tenant_admin_api(monkeypatch):
 
 async def test_current_identity_returns_only_verified_authority(monkeypatch):
     monkeypatch.setattr(main_module.settings, "haas_profile", "prod")
+    monkeypatch.setattr(main_module.settings, "output_delta_enabled", False)
     client, _store = await _client(monkeypatch, {"tenant_admin", "auditor"})
     async with client:
         response = await client.get("/v1/me", headers=_headers())

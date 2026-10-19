@@ -16,6 +16,7 @@ x-app-env: &app-env
   TENANT_SKILL_ALLOWLISTS: ${TENANT_SKILL_ALLOWLISTS:-}
   BILLING_MCP_URL: ${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}
   BILLING_WEBHOOK_URL: ${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}
+  OUTPUT_DELTA_ENABLED: ${OUTPUT_DELTA_ENABLED:-false}
 
 services:
   redis:

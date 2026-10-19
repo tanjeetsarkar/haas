@@ -316,6 +316,7 @@ COMMAND_HELP: list[tuple[str, str]] = [
     ("/budget [USD]", "Max cost per run in USD (0-10]"),
     ("/thread [id]", "Show or switch conversation thread"),
     ("/new", "Start a fresh conversation (new thread)"),
+    ("/copy [N|all]", "Copy code block N (default: last) or the whole last answer"),
     ("/clear", "Clear the screen (keeps the conversation)"),
     ("/quit", "Exit"),
 ]

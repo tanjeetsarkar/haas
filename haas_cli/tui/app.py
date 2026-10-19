@@ -21,11 +21,11 @@ from textual.widgets import (
     DataTable,
     Footer,
     Input,
-    Markdown,
     Static,
     TextArea,
 )
-from textual.widgets.markdown import MarkdownStream
+import re
+from textual.widgets.markdown import Markdown, MarkdownFence, MarkdownStream
 
 from haas_cli.client import (
     OUTPUT_DELTA_EVENT,
@@ -73,6 +73,40 @@ def pending_calls_from(raw_calls: Any) -> list[PendingCall] | None:
             return None
         calls.append(PendingCall(call_id, name, arguments))
     return calls
+
+FENCE_RE = re.compile(r"^(```|~~~)[^\n]*\n(.*?)^\1[ \t]*$", re.M | re.S)
+
+
+def code_blocks(markdown: str) -> list[str]:
+    return [m.group(2).rstrip("\n") for m in FENCE_RE.finditer(markdown)]
+
+
+class CopyableFence(MarkdownFence):
+    """Code block that copies itself on click."""
+
+    DEFAULT_CSS = """
+    CopyableFence {
+        border: round $primary-darken-2;
+        border-title-color: $text-muted;
+        border-subtitle-color: $text-muted;
+    }
+    CopyableFence:hover { border: round $accent; }
+    """
+
+    def on_mount(self) -> None:
+        self.border_title = str(self.lexer or "text")
+        self.border_subtitle = "click to copy"
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        cast("ChatApp", self.app).copy_code(self.code)
+
+
+class HaasMarkdown(Markdown):
+    def get_block_class(self, block_name: str):
+        if block_name in ("fence", "code_block"):
+            return CopyableFence
+        return super().get_block_class(block_name)
 
 
 class PromptInput(TextArea):
@@ -645,6 +679,8 @@ class ChatApp(App[None]):
     .user { margin: 1 0 0 0; color: $text; background: $boost; padding: 0 1; }
     .assistant { margin: 1 0 0 0; padding: 0 1; border-left: thick $success; }
     .assistant MarkdownBlock { margin-bottom: 0; }
+    .assistant, .live-output { padding: 0 1; }
+    .live-output.settled { color: $text-muted; }
     .note { color: $text-muted; margin: 0 0 0 2; }
     .live-output { margin: 1 0 0 0; padding: 0 1; border-left: thick $warning; }
     .live-output.settled { border-left: thick $panel; color: $text-muted; }
@@ -728,6 +764,7 @@ class ChatApp(App[None]):
         Binding("ctrl+n", "new_chat", "New chat"),
         Binding("ctrl+f", "toggle_follow", "Follow"),
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("f2", "copy_last_code", "Copy code"),
     ]
 
     def __init__(
@@ -769,6 +806,7 @@ class ChatApp(App[None]):
         self._preview_truncated = False
         self._preview_dirty = False
         self.transcript_trimmed = 0
+        self._answers: list[str] = []
 
     # ---- layout -------------------------------------------------------------------------
 
@@ -862,6 +900,8 @@ class ChatApp(App[None]):
             self.theme = f"textual-{self.session.settings.theme}"
         else:
             self.theme = self._system_theme
+        self.session.output_deltas = True  # server ignores the request if it has deltas disabled
+        self._main("#chat", VerticalScroll).anchor()  # stick to bottom unless the user scrolls up
         table = self._main("#runs-table", DataTable)
         table.add_columns("Run ID", "Status", "Thread", "Steps", "Cost")
         self._main("#approvals-table", DataTable).add_columns(
@@ -1021,9 +1061,8 @@ class ChatApp(App[None]):
         features = (
             capabilities.get("features") if isinstance(capabilities, dict) else None
         )
-        self.session.output_deltas = isinstance(features, list) and (
-            OUTPUT_DELTA_FEATURE in features
-        )
+        if isinstance(features, list):
+            self.session.output_deltas = OUTPUT_DELTA_FEATURE in features
         self.session.settings.environment = verified["environment"]
         self._refresh_admin_visibility()
         return verified
@@ -1220,6 +1259,19 @@ class ChatApp(App[None]):
         if command == "/profile":
             await self.action_switch_profile(argument)
             return
+        if command == "/copy":
+            if not self._answers:
+                await self._note("Nothing to copy yet.", style="yellow")
+            elif argument == "all":
+                self.copy_code(self._answers[-1])
+            else:
+                blocks = code_blocks(self._answers[-1])
+                n = int(argument) if argument and argument.isdigit() else len(blocks)
+                if 1 <= n <= len(blocks):
+                    self.copy_code(blocks[n - 1])
+                else:
+                    await self._note(f"{len(blocks)} code block(s) in the last answer.", style="yellow")
+            return
         if command == "/admin":
             await self.action_show_admin()
             return
@@ -1376,7 +1428,18 @@ class ChatApp(App[None]):
         self._phase = "resuming"
         return decision
 
-    
+    async def _start_preview(self, key: tuple[int, int, int]) -> None:
+        if self._preview_stream is not None:
+            await self._preview_stream.stop()
+            self._preview_stream = None
+        if self._preview_markdown is not None:
+            await self._preview_markdown.remove()
+        self._preview_key = key
+        self._preview_text = ""
+        self._preview_truncated = False
+        self._preview_markdown = HaasMarkdown("", classes="live-output")
+        await self._add(self._preview_markdown)
+        self._preview_stream = Markdown.get_stream(self._preview_markdown)
 
     async def _on_output_delta(self, d: dict[str, Any]) -> None:
         try:
@@ -1387,64 +1450,66 @@ class ChatApp(App[None]):
         if not isinstance(text, str):
             return
         if key != self._preview_key:
-            # A new step, retry or provider-call attempt restarts the live buffer.
-            self._preview_key = key
-            self._preview_text = ""
-            self._preview_truncated = False
-            # Stop any existing stream
-            if self._preview_stream is not None:
-                await self._preview_stream.stop()
-                self._preview_stream = None
-            if self._preview_markdown is not None:
-                await self._preview_markdown.remove()
-                self._preview_markdown = None
-            # Create new Markdown widget for live preview
-            self._preview_markdown = Markdown("", classes="live-output")
-            await self._add(self._preview_markdown)
-            # Get stream for efficient updates
-            self._preview_stream = Markdown.get_stream(self._preview_markdown)
-        if len(self._preview_text) < MAX_RENDERED_OUTPUT:
-            self._preview_text += text[: MAX_RENDERED_OUTPUT - len(self._preview_text)]
-        if d.get("truncated") or len(self._preview_text) >= MAX_RENDERED_OUTPUT:
+            await self._start_preview(key)
+        stream = self._preview_stream
+        if stream is None:
+            return
+        room = MAX_RENDERED_OUTPUT - len(self._preview_text)
+        if room > 0:
+            piece = sanitize_terminal_text(text[:room])
+            self._preview_text += piece
+            await stream.write(piece)
+        if (d.get("truncated") or len(text) >= room) and not self._preview_truncated:
             self._preview_truncated = True
-            # Add truncation indicator to the stream
-            if self._preview_stream is not None:
-                await self._preview_stream.write("\n\n[... truncated ...]")
-        # Write to stream for real-time Markdown rendering
-        if self._preview_stream is not None:
-            await self._preview_stream.write(text)
-        # Don't settle on final - let the next event (tool_dispatched, run_completed, etc.) handle it
-        # This matches the original behavior where preview persists until the next durable event
+            await stream.write("\n\n*[preview truncated; final answer follows]*")
 
     async def _settle_preview(self, *, discard: bool) -> None:
-        """Closes the live preview when the durable log moves past the streamed call."""
-        # Stop the stream if active
+        """Interim text (a step that went on to call tools): dim it, keep it."""
         if self._preview_stream is not None:
             await self._preview_stream.stop()
             self._preview_stream = None
-        
-        preview_markdown = self._preview_markdown
-        self._preview_markdown = None
-        self._preview_key = None
-        self._preview_dirty = False
-        
-        if preview_markdown is None:
-            self._preview_text = ""
-            self._preview_truncated = False
+        md, self._preview_markdown = self._preview_markdown, None
+        text, self._preview_text = self._preview_text, ""
+        self._preview_key, self._preview_truncated = None, False
+        if md is None:
             return
-            
-        if discard or not self._preview_text.strip():
-            await preview_markdown.remove()
+        if discard or not text.strip():
+            await md.remove()
         else:
-            # Update the markdown content with the final text and dim it
-            preview_markdown.update(
-                sanitize_terminal_text(
-                    self._preview_text, limit=MAX_RENDERED_OUTPUT
-                )
-            )
-            preview_markdown.add_class("settled")
-        self._preview_text = ""
-        self._preview_truncated = False
+            md.add_class("settled")
+
+    async def _finish_answer(self, output: str) -> None:
+        """Final answer: reuse the live widget if there is one, otherwise reveal progressively."""
+        self._answers.append(output)
+        md = self._preview_markdown
+        if md is not None:
+            streamed = self._preview_text
+            if self._preview_stream is not None:
+                await self._preview_stream.stop()
+                self._preview_stream = None
+            self._preview_markdown, self._preview_text, self._preview_key = None, "", None
+            md.remove_class("live-output")
+            md.add_class("assistant")
+            if streamed.strip() != output.strip():  # truncated or retried: show the authoritative text
+                await md.update(output)
+            return
+        md = HaasMarkdown("", classes="assistant")
+        await self._add(md)
+        await self._reveal(md, output)
+
+    async def _reveal(self, md: Markdown, text: str) -> None:
+        """Fallback when the server sent no deltas: cosmetic progressive render (~1 s max)."""
+        stream = Markdown.get_stream(md)
+        step = max(24, len(text) // 120)
+        try:
+            for i in range(0, len(text), step):
+                await stream.write(text[i : i + step])
+                await asyncio.sleep(0.008)
+        except asyncio.CancelledError:
+            await stream.stop()
+            await md.update(text)
+            raise
+        await stream.stop()
 
     async def _on_event(self, ev: SSEEvent) -> None:
         d = ev.data
@@ -1452,14 +1517,13 @@ class ChatApp(App[None]):
             if isinstance(d, dict):
                 await self._on_output_delta(d)
             return
-        if self._preview_markdown is not None:
+        if self._preview_markdown is not None and ev.event != "run_completed":
             retry = (
                 ev.event == "step_started"
                 and self._preview_key is not None
                 and str(d.get("step")) == str(self._preview_key[0])
             )
-            # The durable run_completed output supersedes the advisory preview.
-            await self._settle_preview(discard=retry or ev.event == "run_completed")
+            await self._settle_preview(discard=retry)
         if ev.event == "run_queued":
             self.healthy = True
             self._phase = "queued"
@@ -1494,15 +1558,11 @@ class ChatApp(App[None]):
         elif ev.event == "tool_result":
             await self._tool_result(d)
         elif ev.event == "run_completed":
-            await self._add(
-                Markdown(
-                    sanitize_terminal_text(
-                        d.get("output", ""), limit=MAX_RENDERED_OUTPUT
-                    )
-                    or "_(empty response)_",
-                    classes="assistant",
-                )
+            output = (
+                sanitize_terminal_text(d.get("output", ""), limit=MAX_RENDERED_OUTPUT)
+                or "_(empty response)_"
             )
+            await self._finish_answer(output)
             await self._note(
                 (
                     f"DONE | {d.get('steps_used', '?')} step(s) | "
@@ -1600,6 +1660,23 @@ class ChatApp(App[None]):
         card.set_class(not err, "done")
 
     # ---- actions ------------------------------------------------------------------------
+
+    def copy_code(self, code: str) -> None:
+        self.copy_to_clipboard(code)  # OSC 52
+        try:
+            import pyperclip  # optional fallback for terminals without OSC 52
+
+            pyperclip.copy(code)
+        except Exception:
+            pass
+        self.notify(f"Copied {len(code.splitlines())} line(s)", timeout=2)
+
+    def action_copy_last_code(self) -> None:
+        blocks = code_blocks(self._answers[-1]) if self._answers else []
+        if blocks:
+            self.copy_code(blocks[-1])
+        else:
+            self.notify("No code block in the last answer", severity="warning")
 
     async def action_login(self) -> None:
         if self.busy:
@@ -2677,8 +2754,12 @@ class ChatApp(App[None]):
 
     def action_toggle_follow(self) -> None:
         self._follow = not self._follow
+        chat = self._main("#chat", VerticalScroll)
         if self._follow:
-            self._main("#chat", VerticalScroll).scroll_end(animate=False)
+            chat.anchor()
+            chat.scroll_end(animate=False)
+        else:
+            chat.release_anchor()
         self._refresh_bars()
 
     async def action_new_chat(self) -> None:

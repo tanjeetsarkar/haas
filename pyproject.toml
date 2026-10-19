@@ -30,6 +30,7 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.50b0",
     "opentelemetry-instrumentation-celery>=0.50b0",
     "python-multipart>=0.0.32",
+    "pyperclip>=1.11.0",
 ]
 
 [project.optional-dependencies]
