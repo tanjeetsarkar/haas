@@ -7,9 +7,11 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.deps import PrincipalInfo, requires, tenant_scope
+from app.core.authorization import Action
 from app.main import store
 
 router = APIRouter()
@@ -207,7 +209,7 @@ class MCPServerConfigResponse(BaseModel):
 
 # Delegation endpoints
 @router.post("/v1/agent-mesh/delegations", response_model=DelegationResponse)
-async def create_delegation(request: DelegationCreateRequest) -> DelegationResponse:
+async def create_delegation(request: DelegationCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> DelegationResponse:
     """Create a delegation (spawn child agent)."""
     async with store.connection() as conn:
         # Verify parent run exists
@@ -227,7 +229,7 @@ async def create_delegation(request: DelegationCreateRequest) -> DelegationRespo
             raise HTTPException(status_code=404, detail="Agent revision not found")
         
         # Create child run
-        child_run_id = str(uuid.uuid4())
+        child_run_id = f"run_{uuid.uuid4().hex[:16]}"
         await conn.execute(
             """
             INSERT INTO runs (
@@ -274,6 +276,9 @@ async def create_delegation(request: DelegationCreateRequest) -> DelegationRespo
 async def list_delegations(
     parent_run_id: str | None = Query(None),
     status: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.AGENT_COLLABORATE)
+
 ) -> list[DelegationResponse]:
     """List delegations."""
     async with store.connection() as conn:
@@ -300,7 +305,7 @@ async def list_delegations(
 
 
 @router.get("/v1/agent-mesh/delegations/{delegation_id}", response_model=DelegationResponse)
-async def get_delegation(delegation_id: str) -> DelegationResponse:
+async def get_delegation(delegation_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> DelegationResponse:
     """Get a delegation."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -323,7 +328,7 @@ async def get_delegation(delegation_id: str) -> DelegationResponse:
 
 # Agent Messages
 @router.post("/v1/agent-mesh/messages", response_model=AgentMessageResponse)
-async def send_agent_message(request: AgentMessageCreateRequest) -> AgentMessageResponse:
+async def send_agent_message(request: AgentMessageCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> AgentMessageResponse:
     """Send a message between agents."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -355,6 +360,9 @@ async def list_agent_messages(
     to_agent: str | None = Query(None),
     message_type: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.RUN_READ)
+
 ) -> list[AgentMessageResponse]:
     """List agent messages for a run."""
     async with store.connection() as conn:
@@ -384,7 +392,7 @@ async def list_agent_messages(
 
 # Workspace (CAS-versioned)
 @router.post("/v1/agent-mesh/workspace", response_model=WorkspaceEntryResponse)
-async def write_workspace_entry(request: WorkspaceEntryCreateRequest) -> WorkspaceEntryResponse:
+async def write_workspace_entry(request: WorkspaceEntryCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> WorkspaceEntryResponse:
     """Write a workspace entry with CAS (Compare-And-Swap)."""
     async with store.connection() as conn:
         async with conn.transaction():
@@ -420,7 +428,7 @@ async def write_workspace_entry(request: WorkspaceEntryCreateRequest) -> Workspa
                     request.key,
                     json.dumps(current["value"]),
                     current["version"],
-                    "current_user",
+                    principal.principal_id,
                 )
                 
                 # Update entry
@@ -434,7 +442,7 @@ async def write_workspace_entry(request: WorkspaceEntryCreateRequest) -> Workspa
                     """,
                     json.dumps(request.value),
                     new_version,
-                    "current_user",
+                    principal.principal_id,
                     request.run_id,
                     request.agent_id,
                     request.key,
@@ -457,14 +465,14 @@ async def write_workspace_entry(request: WorkspaceEntryCreateRequest) -> Workspa
                     request.agent_id,
                     request.key,
                     json.dumps(request.value),
-                    "current_user",
+                    principal.principal_id,
                 )
     
     return WorkspaceEntryResponse(**dict(row))
 
 
 @router.get("/v1/agent-mesh/workspace/{run_id}/{agent_id}/{key}", response_model=WorkspaceEntryResponse)
-async def read_workspace_entry(run_id: str, agent_id: str, key: str) -> WorkspaceEntryResponse:
+async def read_workspace_entry(run_id: str, agent_id: str, key: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> WorkspaceEntryResponse:
     """Read a workspace entry."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -486,7 +494,7 @@ async def read_workspace_entry(run_id: str, agent_id: str, key: str) -> Workspac
 
 
 @router.get("/v1/agent-mesh/workspace/{run_id}/{agent_id}", response_model=list[WorkspaceEntryResponse])
-async def list_workspace_entries(run_id: str, agent_id: str) -> list[WorkspaceEntryResponse]:
+async def list_workspace_entries(run_id: str, agent_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> list[WorkspaceEntryResponse]:
     """List all workspace entries for an agent in a run."""
     async with store.connection() as conn:
         rows = await conn.fetch(
@@ -506,7 +514,7 @@ async def list_workspace_entries(run_id: str, agent_id: str) -> list[WorkspaceEn
 
 # Agent Cards
 @router.post("/v1/agent-mesh/agent-cards", response_model=AgentCardResponse)
-async def create_agent_card(request: AgentCardCreateRequest) -> AgentCardResponse:
+async def create_agent_card(request: AgentCardCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> AgentCardResponse:
     """Create an agent card."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -535,6 +543,9 @@ async def create_agent_card(request: AgentCardCreateRequest) -> AgentCardRespons
 @router.get("/v1/agent-mesh/agent-cards", response_model=list[AgentCardResponse])
 async def list_agent_cards(
     agent_revision_id: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.AGENT_COLLABORATE)
+
 ) -> list[AgentCardResponse]:
     """List agent cards."""
     async with store.connection() as conn:
@@ -556,7 +567,7 @@ async def list_agent_cards(
 
 
 @router.get("/v1/agent-mesh/agent-cards/{card_id}", response_model=AgentCardResponse)
-async def get_agent_card(card_id: str) -> AgentCardResponse:
+async def get_agent_card(card_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> AgentCardResponse:
     """Get an agent card."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -577,7 +588,7 @@ async def get_agent_card(card_id: str) -> AgentCardResponse:
 
 # Topologies
 @router.post("/v1/agent-mesh/topologies", response_model=TopologyResponse)
-async def create_topology(request: TopologyCreateRequest) -> TopologyResponse:
+async def create_topology(request: TopologyCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> TopologyResponse:
     """Create and validate a multi-agent topology."""
     # In a full implementation, this would validate the topology config
     # against the agent revisions and their capabilities
@@ -608,7 +619,7 @@ async def create_topology(request: TopologyCreateRequest) -> TopologyResponse:
 
 
 @router.get("/v1/agent-mesh/topologies", response_model=list[TopologyResponse])
-async def list_topologies() -> list[TopologyResponse]:
+async def list_topologies(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> list[TopologyResponse]:
     """List topologies."""
     async with store.connection() as conn:
         rows = await conn.fetch(
@@ -625,7 +636,7 @@ async def list_topologies() -> list[TopologyResponse]:
 
 # Run Tree
 @router.get("/v1/runs/{run_id}/tree", response_model=RunTreeResponse)
-async def get_run_tree(run_id: str) -> RunTreeResponse:
+async def get_run_tree(run_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> RunTreeResponse:
     """Get the run tree for a multi-agent run."""
     async with store.connection() as conn:
         # Get root run
@@ -691,7 +702,7 @@ async def get_run_tree(run_id: str) -> RunTreeResponse:
 
 # HACP Mailbox
 @router.post("/v1/agent-mesh/mailbox/send", response_model=MailboxMessageResponse)
-async def send_mailbox_message(request: MailboxMessageCreateRequest) -> MailboxMessageResponse:
+async def send_mailbox_message(request: MailboxMessageCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> MailboxMessageResponse:
     """Send a message to a HACP mailbox."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -721,6 +732,9 @@ async def get_mailbox_messages(
     mailbox_id: str,
     recipient: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.AGENT_COLLABORATE)
+
 ) -> list[MailboxMessageResponse]:
     """Get messages from a HACP mailbox."""
     async with store.connection() as conn:
@@ -744,7 +758,7 @@ async def get_mailbox_messages(
 
 # A2A
 @router.get("/v1/agent-mesh/a2a/agent-cards/{agent_revision_id}", response_model=A2AAgentCardResponse)
-async def get_a2a_agent_card(agent_revision_id: str) -> A2AAgentCardResponse:
+async def get_a2a_agent_card(agent_revision_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> A2AAgentCardResponse:
     """Get an A2A agent card for an agent revision."""
     async with store.connection() as conn:
         card = await conn.fetchrow(
@@ -773,7 +787,7 @@ async def get_a2a_agent_card(agent_revision_id: str) -> A2AAgentCardResponse:
 
 # MCP Server
 @router.post("/v1/agent-mesh/mcp/servers", response_model=MCPServerConfigResponse)
-async def create_mcp_server(request: MCPServerConfigRequest) -> MCPServerConfigResponse:
+async def create_mcp_server(request: MCPServerConfigRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> MCPServerConfigResponse:
     """Create an MCP server configuration for an agent."""
     # In a full implementation, this would register the MCP server
     # and generate the endpoint URL
@@ -791,7 +805,7 @@ async def create_mcp_server(request: MCPServerConfigRequest) -> MCPServerConfigR
 
 
 @router.get("/v1/agent-mesh/mcp/servers", response_model=list[MCPServerConfigResponse])
-async def list_mcp_servers() -> list[MCPServerConfigResponse]:
+async def list_mcp_servers(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> list[MCPServerConfigResponse]:
     """List MCP servers."""
     # In a full implementation, this would query a database table
     return []
@@ -799,7 +813,7 @@ async def list_mcp_servers() -> list[MCPServerConfigResponse]:
 
 # Observability
 @router.get("/v1/agent-mesh/observability/{run_id}")
-async def get_run_observability(run_id: str) -> dict[str, Any]:
+async def get_run_observability(run_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> dict[str, Any]:
     """Get observability data for a multi-agent run."""
     async with store.connection() as conn:
         # Get run tree with costs

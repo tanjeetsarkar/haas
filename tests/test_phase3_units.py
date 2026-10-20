@@ -163,15 +163,31 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
     monkeypatch.setattr(tasks, "execute_tool_task", execute)
     monkeypatch.setattr(tasks, "deliver_webhook_task", webhook)
 
+    async def _noop(*args, **kwargs):
+        return None
+
     class Store:
+        rds = type("FakeRedis", (), {"set": _noop, "expire": _noop, "hset": _noop})()
+
         async def get_scoped_secrets(self, run_id: str, keys: set[str]):
             return {k: f"{run_id}:{k}" for k in keys}
+
+        async def resolve_secret_bindings(self, tenant_id, run_id, names, *, plugin_id=None, tool_name=None):
+            return {}
+
+        async def record_credential_grants(self, tenant_id, run_id, rows):
+            pass
+
+        async def egress_policy_for_run(self, tenant_id, run_id):
+            from app.core.egress import EgressPolicy
+            return EgressPolicy()
 
     publish = tasks.make_outbox_publisher(Store())  # type: ignore[arg-type]
     await publish(
         {
             "message_id": "m1",
             "run_id": "r1",
+            "tenant_id": "tenant-1",
             "destination": "orchestrator",
             "payload": {"run_id": "r1", "action": "step", "expected_state_version": 3},
         }
@@ -180,9 +196,10 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
         {
             "message_id": "m2",
             "run_id": "r1",
+            "tenant_id": "tenant-1",
             "destination": "tool",
             "payload": {
-                "envelope": {"body": {}},
+                "envelope": {"body": {"invocation_id": "inv-1", "tool_call": {"name": "bash"}}},
                 "queue": "q_tools_sandbox",
                 "secret_keys": ["GH"],
             },
@@ -192,6 +209,7 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
         {
             "message_id": "m3",
             "run_id": "r1",
+            "tenant_id": "tenant-1",
             "destination": "webhook",
             "payload": {"url": "https://hook.example", "body": {"ok": True}},
         }
@@ -208,13 +226,13 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
             "task_id": "m1",
         }
     ]
-    assert execute.calls == [
-        {
-            "kwargs": {"envelope": {"body": {}}, "scoped_secrets": {"GH": "r1:GH"}},
-            "queue": "q_tools_sandbox",
-            "task_id": "m2",
-        }
-    ]
+    assert execute.calls[0]["kwargs"]["envelope"] == {
+        "body": {"invocation_id": "inv-1", "tool_call": {"name": "bash"}}
+    }
+    assert isinstance(execute.calls[0]["kwargs"]["credential_grants"], list)
+    assert execute.calls[0]["kwargs"]["egress_policy"] is not None
+    assert execute.calls[0]["queue"] == "q_tools_sandbox"
+    assert execute.calls[0]["task_id"] == "m2"
     assert webhook.calls[0]["args"] == ["https://hook.example", {"ok": True}]
     with pytest.raises(ValueError, match="Unknown outbox destination"):
         await publish(

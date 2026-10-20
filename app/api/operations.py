@@ -6,9 +6,11 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.deps import PrincipalInfo, requires, requires_any, tenant_scope
+from app.core.authorization import Action
 from app.main import store
 
 router = APIRouter()
@@ -200,7 +202,7 @@ class MetricsResponse(BaseModel):
 
 # Webhook Endpoint CRUD
 @router.post("/v1/webhooks/endpoints", response_model=WebhookEndpointResponse)
-async def create_webhook_endpoint(request: WebhookEndpointCreateRequest) -> WebhookEndpointResponse:
+async def create_webhook_endpoint(request: WebhookEndpointCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires_any(Action.RUN_SUBMIT, Action.RUN_READ)) -> WebhookEndpointResponse:
     """Create a webhook endpoint."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -209,7 +211,7 @@ async def create_webhook_endpoint(request: WebhookEndpointCreateRequest) -> Webh
                 endpoint_id, tenant_id, url, events, enabled, description, created_by
             ) VALUES (
                 gen_random_uuid(),
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5
             )
             RETURNING endpoint_id::text, tenant_id::text, url, events, enabled, description,
@@ -219,7 +221,7 @@ async def create_webhook_endpoint(request: WebhookEndpointCreateRequest) -> Webh
             request.events,
             request.enabled,
             request.description,
-            "current_user",
+            principal.principal_id,
         )
     
     return WebhookEndpointResponse(**dict(row))
@@ -228,6 +230,8 @@ async def create_webhook_endpoint(request: WebhookEndpointCreateRequest) -> Webh
 @router.get("/v1/webhooks/endpoints", response_model=list[WebhookEndpointResponse])
 async def list_webhook_endpoints(
     enabled_only: bool = Query(True),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires_any(Action.RUN_SUBMIT, Action.RUN_READ),
 ) -> list[WebhookEndpointResponse]:
     """List webhook endpoints."""
     async with store.connection() as conn:
@@ -235,7 +239,7 @@ async def list_webhook_endpoints(
             SELECT endpoint_id::text, tenant_id::text, url, events, enabled, description,
                    created_by::text, created_at, updated_at
             FROM webhook_endpoints
-            WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         if enabled_only:
             query += " AND enabled = true"
@@ -247,7 +251,7 @@ async def list_webhook_endpoints(
 
 
 @router.get("/v1/webhooks/endpoints/{endpoint_id}", response_model=WebhookEndpointResponse)
-async def get_webhook_endpoint(endpoint_id: str) -> WebhookEndpointResponse:
+async def get_webhook_endpoint(endpoint_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires_any(Action.RUN_SUBMIT, Action.RUN_READ)) -> WebhookEndpointResponse:
     """Get a webhook endpoint."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -267,7 +271,7 @@ async def get_webhook_endpoint(endpoint_id: str) -> WebhookEndpointResponse:
 
 
 @router.patch("/v1/webhooks/endpoints/{endpoint_id}", response_model=WebhookEndpointResponse)
-async def update_webhook_endpoint(endpoint_id: str, request: WebhookEndpointUpdateRequest) -> WebhookEndpointResponse:
+async def update_webhook_endpoint(endpoint_id: str, request: WebhookEndpointUpdateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires_any(Action.RUN_SUBMIT, Action.RUN_READ)) -> WebhookEndpointResponse:
     """Update a webhook endpoint."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -296,7 +300,7 @@ async def update_webhook_endpoint(endpoint_id: str, request: WebhookEndpointUpda
 
 
 @router.delete("/v1/webhooks/endpoints/{endpoint_id}")
-async def delete_webhook_endpoint(endpoint_id: str) -> dict[str, str]:
+async def delete_webhook_endpoint(endpoint_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires_any(Action.RUN_SUBMIT, Action.RUN_READ)) -> dict[str, str]:
     """Delete a webhook endpoint."""
     async with store.connection() as conn:
         result = await conn.execute(
@@ -312,7 +316,7 @@ async def delete_webhook_endpoint(endpoint_id: str) -> dict[str, str]:
 
 # Webhook Signing Keys
 @router.post("/v1/webhooks/signing-keys", response_model=WebhookSigningKeyResponse)
-async def create_webhook_signing_key(request: WebhookSigningKeyCreateRequest) -> WebhookSigningKeyResponse:
+async def create_webhook_signing_key(request: WebhookSigningKeyCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> WebhookSigningKeyResponse:
     """Create a webhook signing key."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -321,7 +325,7 @@ async def create_webhook_signing_key(request: WebhookSigningKeyCreateRequest) ->
                 key_id, tenant_id, secret_envelope, status
             ) VALUES (
                 $1,
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $2, 'active'
             )
             RETURNING key_id, tenant_id::text, status, retire_at, revoked_at, created_at
@@ -336,13 +340,16 @@ async def create_webhook_signing_key(request: WebhookSigningKeyCreateRequest) ->
 @router.get("/v1/webhooks/signing-keys", response_model=list[WebhookSigningKeyResponse])
 async def list_webhook_signing_keys(
     active_only: bool = Query(True),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.RUN_SUBMIT)
+
 ) -> list[WebhookSigningKeyResponse]:
     """List webhook signing keys."""
     async with store.connection() as conn:
         query = """
             SELECT key_id, tenant_id::text, status, retire_at, revoked_at, created_at
             FROM webhook_signing_keys
-            WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         if active_only:
             query += " AND status <> 'revoked'"
@@ -354,7 +361,7 @@ async def list_webhook_signing_keys(
 
 
 @router.post("/v1/webhooks/signing-keys/{key_id}/rotate", response_model=WebhookSigningKeyResponse)
-async def rotate_webhook_signing_key(key_id: str, request: WebhookSigningKeyRotateRequest) -> WebhookSigningKeyResponse:
+async def rotate_webhook_signing_key(key_id: str, request: WebhookSigningKeyRotateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> WebhookSigningKeyResponse:
     """Rotate a webhook signing key (mark old as retiring, create new)."""
     async with store.connection() as conn:
         async with conn.transaction():
@@ -376,7 +383,7 @@ async def rotate_webhook_signing_key(key_id: str, request: WebhookSigningKeyRota
                     key_id, tenant_id, secret_envelope, status
                 ) VALUES (
                     $1,
-                    (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                    principal.tenant_id,
                     $2, 'active'
                 )
                 RETURNING key_id, tenant_id::text, status, retire_at, revoked_at, created_at
@@ -389,7 +396,7 @@ async def rotate_webhook_signing_key(key_id: str, request: WebhookSigningKeyRota
 
 
 @router.post("/v1/webhooks/signing-keys/{key_id}/revoke")
-async def revoke_webhook_signing_key(key_id: str) -> dict[str, str]:
+async def revoke_webhook_signing_key(key_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> dict[str, str]:
     """Revoke a webhook signing key immediately."""
     async with store.connection() as conn:
         result = await conn.execute(
@@ -413,6 +420,9 @@ async def list_webhook_deliveries(
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.RUN_SUBMIT)
+
 ) -> WebhookDeliveryListResponse:
     """List webhook deliveries with cursor pagination."""
     async with store.connection() as conn:
@@ -427,7 +437,7 @@ async def list_webhook_deliveries(
                        next_attempt_at, last_status_code, last_error, last_latency_ms,
                        replay_count, created_at, updated_at, completed_at
                 FROM webhook_deliveries
-                WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+                WHERE TRUE  -- tenant isolation via RLS
                   AND ($1::text IS NULL OR status = $1)
                   AND (created_at, delivery_id) > ($2::timestamptz, $3::uuid)
                 ORDER BY created_at, delivery_id
@@ -446,7 +456,7 @@ async def list_webhook_deliveries(
                        next_attempt_at, last_status_code, last_error, last_latency_ms,
                        replay_count, created_at, updated_at, completed_at
                 FROM webhook_deliveries
-                WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+                WHERE TRUE  -- tenant isolation via RLS
                   AND ($1::text IS NULL OR status = $1)
                 ORDER BY created_at, delivery_id
                 LIMIT $2
@@ -465,7 +475,7 @@ async def list_webhook_deliveries(
 
 
 @router.get("/v1/webhooks/deliveries/{delivery_id}", response_model=WebhookDeliveryResponse)
-async def get_webhook_delivery(delivery_id: str) -> WebhookDeliveryResponse:
+async def get_webhook_delivery(delivery_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> WebhookDeliveryResponse:
     """Get a webhook delivery."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -487,7 +497,7 @@ async def get_webhook_delivery(delivery_id: str) -> WebhookDeliveryResponse:
 
 
 @router.post("/v1/webhooks/deliveries/replay", response_model=dict[str, int])
-async def replay_webhook_deliveries(request: WebhookReplayRequest) -> dict[str, int]:
+async def replay_webhook_deliveries(request: WebhookReplayRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.RUN_SUBMIT)) -> dict[str, int]:
     """Replay webhook deliveries."""
     async with store.connection() as conn:
         async with conn.transaction():
@@ -511,7 +521,7 @@ async def replay_webhook_deliveries(request: WebhookReplayRequest) -> dict[str, 
 
 # Quotas
 @router.get("/v1/quotas", response_model=TenantQuotaResponse)
-async def get_tenant_quota() -> TenantQuotaResponse:
+async def get_tenant_quota(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires_any(Action.TENANT_ADMIN, Action.RUN_SUBMIT)) -> TenantQuotaResponse:
     """Get the tenant's quota configuration."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -520,7 +530,7 @@ async def get_tenant_quota() -> TenantQuotaResponse:
                    requests_per_minute, principal_requests_per_minute,
                    sse_connections, weight, updated_at
             FROM tenant_quotas
-            WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
             """,
         )
     
@@ -541,13 +551,13 @@ async def get_tenant_quota() -> TenantQuotaResponse:
 
 
 @router.put("/v1/quotas", response_model=TenantQuotaResponse)
-async def set_tenant_quota(request: TenantQuotaRequest) -> TenantQuotaResponse:
+async def set_tenant_quota(request: TenantQuotaRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.TENANT_ADMIN)) -> TenantQuotaResponse:
     """Set or update the tenant's quota configuration."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
             """
             SELECT haas_ops_set_quota(
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5, $6
             )
             """,
@@ -564,7 +574,7 @@ async def set_tenant_quota(request: TenantQuotaRequest) -> TenantQuotaResponse:
 
 # Platform Operations (admin only)
 @router.post("/v1/ops/restore-epoch", response_model=RestoreEpochResponse)
-async def bump_restore_epoch(request: RestoreEpochRequest) -> RestoreEpochResponse:
+async def bump_restore_epoch(request: RestoreEpochRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.TENANT_ADMIN)) -> RestoreEpochResponse:
     """Bump the platform restore epoch (fences all runs, resets in-flight deliveries)."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -581,7 +591,7 @@ async def bump_restore_epoch(request: RestoreEpochRequest) -> RestoreEpochRespon
 
 
 @router.get("/v1/ops/metrics", response_model=MetricsResponse)
-async def get_platform_metrics() -> MetricsResponse:
+async def get_platform_metrics(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> MetricsResponse:
     """Get platform metrics (admin only)."""
     async with store.connection() as conn:
         rows = await conn.fetch("SELECT * FROM haas_ops_metrics()")
@@ -591,7 +601,7 @@ async def get_platform_metrics() -> MetricsResponse:
 
 # Cells
 @router.post("/v1/ops/cells", response_model=CellResponse)
-async def create_cell(request: CellCreateRequest) -> CellResponse:
+async def create_cell(request: CellCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> CellResponse:
     """Register a new cell."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -610,7 +620,7 @@ async def create_cell(request: CellCreateRequest) -> CellResponse:
 
 
 @router.get("/v1/ops/cells", response_model=list[CellResponse])
-async def list_cells() -> list[CellResponse]:
+async def list_cells(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> list[CellResponse]:
     """List all cells."""
     async with store.connection() as conn:
         rows = await conn.fetch(
@@ -621,7 +631,7 @@ async def list_cells() -> list[CellResponse]:
 
 
 @router.get("/v1/ops/cells/{cell_id}", response_model=CellResponse)
-async def get_cell(cell_id: str) -> CellResponse:
+async def get_cell(cell_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> CellResponse:
     """Get a cell."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -636,7 +646,7 @@ async def get_cell(cell_id: str) -> CellResponse:
 
 
 @router.patch("/v1/ops/cells/{cell_id}", response_model=CellResponse)
-async def update_cell(cell_id: str, status: str = Query(..., pattern="^(active|draining|drained)$")) -> CellResponse:
+async def update_cell(cell_id: str, status: str = Query(..., pattern="^(active|draining|drained)$"), principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> CellResponse:
     """Update cell status."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -660,6 +670,9 @@ async def update_cell(cell_id: str, status: str = Query(..., pattern="^(active|d
 async def list_placements(
     cell_id: str | None = Query(None),
     is_default: bool = Query(False),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.PLATFORM_OPERATE)
+
 ) -> list[TenantPlacementResponse]:
     """List tenant placements."""
     async with store.connection() as conn:
@@ -673,7 +686,7 @@ async def list_placements(
 
 
 @router.post("/v1/ops/placements/{tenant_id}/move", response_model=TenantMoveResponse)
-async def begin_tenant_move(tenant_id: str, request: TenantMoveRequest) -> TenantMoveResponse:
+async def begin_tenant_move(tenant_id: str, request: TenantMoveRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> TenantMoveResponse:
     """Begin moving a tenant to a different cell."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -690,7 +703,7 @@ async def begin_tenant_move(tenant_id: str, request: TenantMoveRequest) -> Tenan
 
 
 @router.post("/v1/ops/placements/{tenant_id}/move/finish", response_model=TenantMoveResponse)
-async def finish_tenant_move(tenant_id: str, request: TenantMoveFinishRequest) -> TenantMoveResponse:
+async def finish_tenant_move(tenant_id: str, request: TenantMoveFinishRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> TenantMoveResponse:
     """Finish moving a tenant (commit or rollback)."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -704,7 +717,7 @@ async def finish_tenant_move(tenant_id: str, request: TenantMoveFinishRequest) -
 
 
 @router.post("/v1/ops/fence-runs")
-async def fence_runs(tenant_id: str | None = None) -> dict[str, int]:
+async def fence_runs(tenant_id: str | None = None, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.PLATFORM_OPERATE)) -> dict[str, int]:
     """Fence runs (increment lease epoch) for a tenant or all tenants."""
     async with store.connection() as conn:
         count = await conn.fetchval(

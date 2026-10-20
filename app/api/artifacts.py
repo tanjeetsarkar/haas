@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.deps import PrincipalInfo, requires, tenant_scope
+from app.core.authorization import Action
+from app.core.object_store import content_key
+from app.core.retention import effective_policy
 from app.main import store
 
 router = APIRouter()
-
-ARTIFACTS_STORAGE_ROOT = Path(os.getenv("HAAS_ARTIFACTS_STORAGE_DIR", "/var/lib/haas/artifacts")).resolve()
 
 
 class ArtifactCreateRequest(BaseModel):
@@ -153,40 +153,71 @@ def _compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _generate_object_key(tenant_id: str, run_id: str, artifact_id: str, name: str) -> str:
-    return f"{tenant_id}/{run_id}/{artifact_id}/{name}"
-
-
 @router.post("/v1/artifacts", response_model=ArtifactCreateResponse)
 async def create_artifact(
     request: ArtifactCreateRequest,
     file: UploadFile = File(...),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.ARTIFACT_WRITE)
+
 ) -> ArtifactCreateResponse:
     """Create a new artifact by uploading content."""
     # Read file content
     content = await file.read()
     size_bytes = len(content)
     sha256 = _compute_sha256(content)
-    
-    # Generate artifact ID and object key
+
+    # Generate artifact ID
     artifact_id = str(uuid.uuid4())
-    
-    # Get tenant_id from database
+    tenant_id = principal.tenant_id
+
+    # Get tenant_uuid and check retention policy/quota in a single transaction
     async with store.connection() as conn:
+        # Get tenant info
         tenant_row = await conn.fetchrow(
-            "SELECT tenant_id::text FROM tenants WHERE status = 'active' LIMIT 1"
+            "SELECT tenant_id::text, tenant_uuid::text, retention_class, retention_overrides "
+            "FROM tenants WHERE tenant_id = $1",
+            tenant_id
         )
-        tenant_id = tenant_row["tenant_id"] if tenant_row else "default"
-    
-    object_key = _generate_object_key(tenant_id, request.run_id, artifact_id, request.name)
-    
-    # Store the artifact content
-    storage_path = ARTIFACTS_STORAGE_ROOT / object_key
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    storage_path.write_bytes(content)
-    
-    # Insert artifact record
-    async with store.connection() as conn:
+        if not tenant_row:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        
+        tenant_uuid = tenant_row["tenant_uuid"]
+        
+        # Check artifact quota
+        retention_overrides = tenant_row["retention_overrides"] or {}
+        policy = effective_policy(tenant_row["retention_class"], retention_overrides)
+        quota_bytes = policy.get("artifact_quota_bytes", 0)
+        
+        if quota_bytes > 0:
+            # Check current artifact usage
+            current_usage = await conn.fetchval(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts "
+                "WHERE tenant_id = $1 AND deleted_at IS NULL",
+                tenant_id
+            )
+            if current_usage + size_bytes > quota_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Artifact quota exceeded: {current_usage + size_bytes} > {quota_bytes} bytes"
+                )
+        
+        # Check legal holds
+        legal_hold = await conn.fetchrow(
+            "SELECT 1 FROM legal_holds WHERE tenant_uuid = $1 AND released_at IS NULL "
+            "AND (scope = 'tenant' OR (scope = 'run' AND subject_id = $2) OR (scope = 'thread' AND subject_id = (SELECT thread_id FROM runs WHERE run_id = $2)))",
+            tenant_uuid, request.run_id
+        )
+        if legal_hold:
+            raise HTTPException(status_code=409, detail="Artifact creation blocked by legal hold")
+        
+        # Generate content-addressed object key
+        object_key = content_key(tenant_uuid, tenant_id, sha256)
+        
+        # Store the artifact content in object store
+        await store.object_store.put(object_key, content)
+        
+        # Insert artifact record
         await conn.execute(
             """
             INSERT INTO artifacts (
@@ -197,7 +228,7 @@ async def create_artifact(
             """,
             uuid.UUID(artifact_id),
             tenant_id,
-            uuid.UUID(tenant_id),
+            tenant_uuid,
             request.run_id,
             request.name,
             request.content_type,
@@ -205,22 +236,40 @@ async def create_artifact(
             sha256,
             object_key,
             request.source,
-            request.created_by,
+            principal.principal_id,
             json.dumps(request.metadata),
             request.expires_at,
         )
-    
+        
+        # Insert audit event
+        await store._insert_audit_event(
+            conn,
+            tenant_id=uuid.UUID(tenant_id),
+            actor_principal_id=uuid.UUID(principal.principal_id),
+            action="artifact.created",
+            target_type="artifact",
+            target_id=artifact_id,
+            request_id=uuid.uuid4(),
+            details={
+                "name": request.name,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+                "run_id": request.run_id,
+                "source": request.source,
+            },
+        )
+
     return ArtifactCreateResponse(
         artifact_id=artifact_id,
         object_key=object_key,
         size_bytes=size_bytes,
         sha256=sha256,
-        upload_url=None,  # Could implement presigned URLs for large files
+        upload_url=None,
     )
 
 
 @router.get("/v1/artifacts/{artifact_id}", response_model=ArtifactResponse)
-async def get_artifact(artifact_id: str) -> ArtifactResponse:
+async def get_artifact(artifact_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.ARTIFACT_READ)) -> ArtifactResponse:
     """Get artifact metadata."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -245,6 +294,9 @@ async def list_artifacts(
     run_id: str = Query(...),
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.ARTIFACT_READ)
+
 ) -> ArtifactListResponse:
     """List artifacts for a run with cursor pagination."""
     async with store.connection() as conn:
@@ -293,7 +345,7 @@ async def list_artifacts(
 
 
 @router.get("/v1/artifacts/{artifact_id}/download")
-async def download_artifact(artifact_id: str):
+async def download_artifact(artifact_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.ARTIFACT_READ)):
     """Download artifact content."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -304,20 +356,22 @@ async def download_artifact(artifact_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Artifact not found")
     
-    storage_path = ARTIFACTS_STORAGE_ROOT / row["object_key"]
-    if not storage_path.exists():
+    # Get content from object store
+    try:
+        content = await store.object_store.get(row["object_key"])
+    except Exception:
         raise HTTPException(status_code=404, detail="Artifact content not found")
-    
-    from fastapi.responses import FileResponse
-    return FileResponse(
-        storage_path,
+
+    from fastapi.responses import Response
+    return Response(
+        content=content,
         media_type=row["content_type"],
-        filename=row["name"],
+        headers={"Content-Disposition": f'attachment; filename="{row["name"]}"'},
     )
 
 
 @router.delete("/v1/artifacts/{artifact_id}")
-async def delete_artifact(artifact_id: str) -> dict[str, str]:
+async def delete_artifact(artifact_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.ARTIFACT_WRITE)) -> dict[str, str]:
     """Soft delete an artifact (marks deleted_at)."""
     async with store.connection() as conn:
         result = await conn.execute(
@@ -333,7 +387,7 @@ async def delete_artifact(artifact_id: str) -> dict[str, str]:
 
 # Retention Policy endpoints
 @router.get("/v1/retention/policy", response_model=RetentionPolicyResponse)
-async def get_retention_policy() -> RetentionPolicyResponse:
+async def get_retention_policy(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.ARTIFACT_READ)) -> RetentionPolicyResponse:
     """Get the tenant's retention policy."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -341,7 +395,7 @@ async def get_retention_policy() -> RetentionPolicyResponse:
             SELECT tenant_uuid::text, run_events_ttl_days, artifacts_ttl_days,
                    messages_ttl_days, artifact_quota_bytes, updated_by::text, updated_at
             FROM retention_policies
-            WHERE tenant_uuid = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
             """,
         )
     
@@ -361,7 +415,7 @@ async def get_retention_policy() -> RetentionPolicyResponse:
 
 
 @router.put("/v1/retention/policy", response_model=RetentionPolicyResponse)
-async def set_retention_policy(request: RetentionPolicyRequest) -> RetentionPolicyResponse:
+async def set_retention_policy(request: RetentionPolicyRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.TENANT_ADMIN)) -> RetentionPolicyResponse:
     """Set or update the tenant's retention policy."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -370,7 +424,7 @@ async def set_retention_policy(request: RetentionPolicyRequest) -> RetentionPoli
                 tenant_uuid, run_events_ttl_days, artifacts_ttl_days,
                 messages_ttl_days, artifact_quota_bytes, updated_by, updated_at
             ) VALUES (
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5, now()
             )
             ON CONFLICT (tenant_uuid) DO UPDATE SET
@@ -387,7 +441,7 @@ async def set_retention_policy(request: RetentionPolicyRequest) -> RetentionPoli
             request.artifacts_ttl_days,
             request.messages_ttl_days,
             request.artifact_quota_bytes,
-            "current_user",  # Would come from auth context
+            principal.principal_id,
         )
     
     return RetentionPolicyResponse(**dict(row))
@@ -395,7 +449,7 @@ async def set_retention_policy(request: RetentionPolicyRequest) -> RetentionPoli
 
 # Legal Hold endpoints
 @router.post("/v1/retention/legal-holds", response_model=LegalHoldResponse)
-async def create_legal_hold(request: LegalHoldRequest) -> LegalHoldResponse:
+async def create_legal_hold(request: LegalHoldRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.TENANT_ADMIN)) -> LegalHoldResponse:
     """Create a legal hold."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -404,7 +458,7 @@ async def create_legal_hold(request: LegalHoldRequest) -> LegalHoldResponse:
                 hold_id, tenant_uuid, scope, subject_id, reason, placed_by, placed_at
             ) VALUES (
                 gen_random_uuid(),
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, now()
             )
             RETURNING hold_id::text, tenant_uuid::text, scope, subject_id, reason,
@@ -413,7 +467,7 @@ async def create_legal_hold(request: LegalHoldRequest) -> LegalHoldResponse:
             request.scope,
             request.subject_id,
             request.reason,
-            "current_user",  # Would come from auth context
+            principal.principal_id,
         )
     
     return LegalHoldResponse(**dict(row))
@@ -423,6 +477,9 @@ async def create_legal_hold(request: LegalHoldRequest) -> LegalHoldResponse:
 async def list_legal_holds(
     scope: str | None = Query(None),
     active_only: bool = Query(True),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.ARTIFACT_READ)
+
 ) -> list[LegalHoldResponse]:
     """List legal holds."""
     async with store.connection() as conn:
@@ -430,7 +487,7 @@ async def list_legal_holds(
             SELECT hold_id::text, tenant_uuid::text, scope, subject_id, reason,
                    placed_by::text, placed_at, released_by::text, released_at, release_reason
             FROM legal_holds
-            WHERE tenant_uuid = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         params = []
         if scope:
@@ -446,7 +503,7 @@ async def list_legal_holds(
 
 
 @router.post("/v1/retention/legal-holds/{hold_id}/release", response_model=LegalHoldResponse)
-async def release_legal_hold(hold_id: str, release_reason: str | None = None) -> LegalHoldResponse:
+async def release_legal_hold(hold_id: str, release_reason: str | None = None, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.TENANT_ADMIN)) -> LegalHoldResponse:
     """Release a legal hold."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -457,7 +514,7 @@ async def release_legal_hold(hold_id: str, release_reason: str | None = None) ->
             RETURNING hold_id::text, tenant_uuid::text, scope, subject_id, reason,
                       placed_by::text, placed_at, released_by::text, released_at, release_reason
             """,
-            "current_user",  # Would come from auth context
+            principal.principal_id,
             release_reason,
             uuid.UUID(hold_id),
         )
@@ -470,7 +527,7 @@ async def release_legal_hold(hold_id: str, release_reason: str | None = None) ->
 
 # Erasure Request endpoints
 @router.post("/v1/retention/erasure-requests", response_model=ErasureRequestResponse)
-async def create_erasure_request(request: ErasureRequestRequest) -> ErasureRequestResponse:
+async def create_erasure_request(request: ErasureRequestRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.ARTIFACT_WRITE)) -> ErasureRequestResponse:
     """Create an erasure request."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -480,7 +537,7 @@ async def create_erasure_request(request: ErasureRequestRequest) -> ErasureReque
                 reason, requested_by, requested_at
             ) VALUES (
                 gen_random_uuid(),
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5, now()
             )
             RETURNING request_id::text, tenant_uuid::text, kind, subject_type, subject_ids,
@@ -491,7 +548,7 @@ async def create_erasure_request(request: ErasureRequestRequest) -> ErasureReque
             request.subject_type,
             request.subject_ids,
             request.reason,
-            "current_user",  # Would come from auth context
+            principal.principal_id,
         )
     
     return ErasureRequestResponse(**dict(row))
@@ -500,6 +557,9 @@ async def create_erasure_request(request: ErasureRequestRequest) -> ErasureReque
 @router.get("/v1/retention/erasure-requests", response_model=list[ErasureRequestResponse])
 async def list_erasure_requests(
     status: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.ARTIFACT_READ)
+
 ) -> list[ErasureRequestResponse]:
     """List erasure requests."""
     async with store.connection() as conn:
@@ -508,7 +568,7 @@ async def list_erasure_requests(
                    reason, status, requested_by::text, requested_at, attempts,
                    last_error, completed_at, manifest_sha256, receipt_hmac, receipt_key_id
             FROM erasure_requests
-            WHERE tenant_uuid = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         params = []
         if status:
@@ -526,6 +586,9 @@ async def list_retention_tombstones(
     data_class: str | None = Query(None),
     subject_type: str | None = Query(None),
     subject_id: str | None = Query(None),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.ARTIFACT_READ)
+
 ) -> list[RetentionTombstoneResponse]:
     """List retention tombstones."""
     async with store.connection() as conn:
@@ -534,7 +597,7 @@ async def list_retention_tombstones(
                    subject_type, subject_id, reason, policy, records_erased,
                    bytes_erased, manifest_sha256, request_id::text, erased_by, erased_at
             FROM retention_tombstones
-            WHERE tenant_uuid = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         params = []
         if data_class:

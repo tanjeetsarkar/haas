@@ -24,6 +24,16 @@ from app.core.context import (
     ToolRemediationError,
     validate_safe_outbound_url,
 )
+from app.core.credentials import (
+    GrantError,
+    prepare_tool_dispatch,
+    redeem_grants,
+)
+from app.core import egress
+from app.core.egress import (
+    EgressPolicy,
+    InMemoryEgressMeter,
+)
 from app.core.envelope import (
     EnvelopeError,
     arguments_digest,
@@ -42,6 +52,7 @@ from app.core.workflow import (
     effect_key,
 )
 from app.worker.celery_app import celery_app
+from app.sandbox.execution import execute_in_sandbox, SandboxSetupError
 
 log = logging.getLogger("haas.tasks")
 
@@ -109,12 +120,16 @@ def make_outbox_publisher(store: DistributedStore) -> Publisher:
                 task_id=message_id,
             )
         elif destination == "tool":
-            # Secrets stay in the encrypted Redis vault until the moment of dispatch.
-            scoped = await store.get_scoped_secrets(
-                str(message["run_id"]), set(payload.get("secret_keys") or [])
-            )
+            # The credential broker seals each allowed secret into a single-use,
+            # audience-bound grant. Only opaque grant references travel over the
+            # broker; raw secret values never leave Redis.
+            dispatch = await prepare_tool_dispatch(store, message)
             cast(Task, execute_tool_task).apply_async(
-                kwargs={"envelope": payload["envelope"], "scoped_secrets": scoped},
+                kwargs={
+                    "envelope": payload["envelope"],
+                    "credential_grants": dispatch["credential_grants"],
+                    "egress_policy": dispatch["egress_policy"],
+                },
                 queue=payload["queue"],
                 task_id=message_id,
             )
@@ -607,7 +622,8 @@ def execute_tool_task(
     self,
     *,
     envelope: dict[str, Any],
-    scoped_secrets: dict[str, str] | None = None,
+    credential_grants: list[str] | None = None,
+    egress_policy: EgressPolicy | None = None,
 ) -> dict[str, Any]:
     """
     Runs on `worker-tools` (`q_tools_fast` or `q_tools_sandbox`).
@@ -618,7 +634,13 @@ def execute_tool_task(
     except EnvelopeError as exc:
         log.warning("rejected tool envelope: %s", exc)
         return {"status": "rejected", "reason": str(exc)}
-    status, outcome = _run_async(_execute_envelope(body, scoped_secrets or {}))
+    status, outcome = _run_async(
+        _execute_envelope(
+            body, 
+            credential_grants=credential_grants or [],
+            egress_policy=egress_policy,
+        )
+    )
     cast(Task, record_tool_outcome_task).apply_async(
         kwargs={
             "run_id": body["run_id"],
@@ -632,7 +654,10 @@ def execute_tool_task(
 
 
 async def _execute_envelope(
-    body: dict[str, Any], scoped_secrets: dict[str, str]
+    body: dict[str, Any],
+    *,
+    credential_grants: list[str],
+    egress_policy: EgressPolicy | None = None,
 ) -> tuple[str, dict[str, Any]]:
     call = body["tool_call"]
     name, call_id, raw_args = call["name"], call["id"], call["arguments"]
@@ -675,6 +700,25 @@ async def _execute_envelope(
             )
         else:
             allowlist = body.get("skill_allowlist")
+            # Redeem credential grants into scoped secrets (single-use GETDEL).
+            granted_secrets: dict[str, str] = {}
+            try:
+                if credential_grants:
+                    redeemed = await redeem_grants(
+                        credential_grants,
+                        tool_name=name,
+                        invocation_id=body["invocation_id"],
+                        run_id=body["run_id"],
+                        redis=redis,
+                    )
+                    granted_secrets = redeemed
+            except GrantError as exc:
+                granted_secrets = {}
+                log.warning(
+                    "credential grant redeemed failed for %s: %s",
+                    body["invocation_id"],
+                    exc,
+                )
             outcome = await _async_execute_tool(
                 run_id=body["run_id"],
                 thread_id=body["thread_id"],
@@ -682,13 +726,14 @@ async def _execute_envelope(
                 traceparent=body["traceparent"],
                 active_skills=skills,
                 allowed_secrets=set(body.get("allowed_secrets") or []),
-                scoped_secrets=scoped_secrets,
+                scoped_secrets=granted_secrets,
                 tool_call={
                     "id": call_id,
                     "function": {"name": name, "arguments": raw_args},
                 },
                 skill_allowlist=set(allowlist) if allowlist is not None else None,
                 effect_key=key,
+                egress_policy=egress_policy,
             )
         status = "failed" if outcome["is_error"] else "succeeded"
         await redis.setex(
@@ -724,6 +769,7 @@ async def _async_execute_tool(
     tool_call: dict[str, Any],
     skill_allowlist: set[str] | None = None,
     effect_key: str = "",
+    egress_policy: EgressPolicy | None = None,
 ) -> dict[str, Any]:
     tc_id = tool_call["id"]
     fn_name = tool_call["function"]["name"]
@@ -757,6 +803,8 @@ async def _async_execute_tool(
         )
 
     async with httpx.AsyncClient() as http_client:
+        # Create an egress meter for this tool invocation
+        meter = InMemoryEgressMeter()
         ctx = RunContext(
             run_id=run_id,
             thread_id=thread_id,
@@ -769,12 +817,64 @@ async def _async_execute_tool(
             http_client=http_client,
             effect_key=effect_key,
         )
+        # Bind the egress policy and meter to context vars for egress_request
+        if egress_policy is not None:
+            egress.active_policy.set(egress_policy)
+            egress.active_meter.set(meter)
         args = (ctx, validated_args) if tool.injects_context else (validated_args,)
+
+        # Execute tool either in sandbox or in-process
+        if settings.sandbox_mode == "sandbox":
+            try:
+                ok, observation, error_msg = await execute_in_sandbox(
+                    tool_name=fn_name,
+                    validated_args=validated_args,
+                    secrets=scoped_secrets,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    tenant_id=tenant_id,
+                    traceparent=traceparent,
+                    active_skills=active_skills,
+                    skill_allowlist=skill_allowlist,
+                    allowed_secrets=allowed_secrets,
+                    effect_key=effect_key,
+                    egress_policy=egress_policy,
+                )
+                if ok:
+                    return _outcome(
+                        tc_id,
+                        fn_name,
+                        fp,
+                        active_skills,
+                        _bound_observation(fn_name, tc_id, observation),
+                        False,
+                    )
+                return _outcome(
+                    tc_id,
+                    fn_name,
+                    fp,
+                    active_skills,
+                    f"Sandbox Error [{error_msg}]",
+                    True,
+                )
+            except SandboxSetupError:
+                # Fall through to in-process execution
+                pass
+            except Exception as exc:
+                return _outcome(
+                    tc_id,
+                    fn_name,
+                    fp,
+                    active_skills,
+                    f"Sandbox Runtime Error: {exc}",
+                    True,
+                )
+
+        # In-process execution (fallback or when sandbox_mode != "sandbox")
         try:
             if inspect.iscoroutinefunction(tool.handler):
                 awaitable = tool.handler(*args)
             else:
-                # Sync handlers run in a worker thread so the timeout can actually fire.
                 awaitable = asyncio.to_thread(tool.handler, *args)
             raw_out = await asyncio.wait_for(
                 awaitable, timeout=settings.per_tool_timeout_sec

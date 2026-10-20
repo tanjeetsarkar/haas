@@ -15,6 +15,8 @@ import redis.asyncio as aioredis
 
 from app.core.config import settings
 from app.core.database_context import tenant_context
+from app.core.egress import EgressPolicy
+from app.core.object_store import build_object_store
 from app.core.secret_vault import decrypt_secrets, encrypt_secrets
 from app.core.areas import (
     access as _access,
@@ -135,6 +137,7 @@ class DistributedStore(
             dsn=settings.postgres_dsn, min_size=1, max_size=pool_max
         )
         self.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        self.object_store = build_object_store(settings)
         if settings.haas_profile == "prod":
             async with self.pool.acquire() as conn:
                 safe = await conn.fetchval(
@@ -894,6 +897,133 @@ class DistributedStore(
             return {}
         full = decrypt_secrets(run_id, raw)
         return {k: v for k, v in full.items() if k in allowed_keys}
+
+    async def resolve_secret_bindings(
+        self,
+        tenant_id: str,
+        run_id: str,
+        names: set[str],
+        *,
+        plugin_id: str | None = None,
+        tool_name: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve secret binding values for a tool invocation.
+
+        Looks up active secret_bindings for the tenant and returns
+        the plaintext value plus provenance info.
+        """
+        async with self.connection() as conn:
+            resolved: dict[str, dict[str, Any]] = {}
+            for name in names:
+                row = await conn.fetchrow(
+                    """
+                    SELECT encrypted_value, provider, provider_reference,
+                           allowed_plugins, allowed_tools, version
+                    FROM secret_bindings
+                    WHERE tenant_id = $1
+                      AND name = $2
+                      AND deleted_at IS NULL
+                    """,
+                    tenant_id,
+                    name,
+                )
+                if row is None:
+                    resolved[name] = {"value": None, "source": "missing"}
+                    continue
+
+                if row["provider"] == "inline":
+                    resolved[name] = {
+                        "value": row["encrypted_value"],
+                        "source": "binding",
+                        "binding_id": str(row["binding_id"]) if row.get("binding_id") else None,
+                        "version": row["version"],
+                    }
+                elif row["provider"] == "env":
+                    ref = row.get("provider_reference")
+                    resolved[name] = {
+                        "value": f"<env:{ref}>",
+                        "source": "binding",
+                        "binding_id": str(row["binding_id"]) if row.get("binding_id") else None,
+                        "version": row["version"],
+                    }
+                else:
+                    resolved[name] = {"value": None, "source": "unknown"}
+
+                # Filter by plugin/tool allowlists if specified
+                if plugin_id and plugin_id not in (row.get("allowed_plugins") or []):
+                    resolved[name] = {"value": None, "source": "plugin_disallowed"}
+                if tool_name and tool_name not in (row.get("allowed_tools") or []):
+                    resolved[name] = {"value": None, "source": "tool_disallowed"}
+
+            return resolved
+
+    async def record_credential_grants(
+        self, tenant_id: str, run_id: str, rows: list[dict[str, Any]]
+    ) -> None:
+        """Record credential grant entries in PostgreSQL for audit.
+
+        Each row should contain: grant_id, invocation_id, secret_name,
+        source, binding_id, binding_version, audience, plugin_digest, expires_at
+        """
+        if not rows:
+            return
+        async with self.connection() as conn:
+            for row in rows:
+                await conn.execute(
+                    """
+                    INSERT INTO credential_grants
+                        (grant_id, tenant_id, run_id, invocation_id, secret_name,
+                         source, binding_id, binding_version, audience,
+                         plugin_digest, created_at, expires_at)
+                    VALUES
+                        ($1::uuid, $2::text, $3::text, $4::text, $5::text,
+                         $6::text, $7::uuid, $8::integer, $9::text,
+                         $10::text, now(), $11::timestamptz)
+                    ON CONFLICT (grant_id) DO NOTHING
+                    """,
+                    UUID(row["grant_id"]),
+                    tenant_id,
+                    run_id,
+                    row.get("invocation_id", ""),
+                    row["secret_name"],
+                    row.get("source", "binding"),
+                    UUID(row["binding_id"]) if row.get("binding_id") else None,
+                    row.get("binding_version"),
+                    row.get("audience", ""),
+                    row.get("plugin_digest", ""),
+                    row["expires_at"],
+                )
+
+    async def egress_policy_for_run(
+        self, tenant_id: str, run_id: str
+    ) -> EgressPolicy:
+        """Return the tenant's egress policy for a given run.
+
+        Reads from the egress_policies table (tenant-scoped) and merges
+        with the global default from settings.
+        """
+        from app.core.egress import EgressPolicy, normalize_host_pattern
+
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT allow_hosts, allow_cidrs, max_bytes_per_run, version "
+                "FROM egress_policies WHERE tenant_id = $1",
+                tenant_id,
+            )
+            if row is None:
+                return EgressPolicy()
+
+            cap = int(row["max_bytes_per_run"]) if row["max_bytes_per_run"] else None
+            return EgressPolicy(
+                allow_hosts=tuple(
+                    normalize_host_pattern(h) for h in row["allow_hosts"]
+                ),
+                allow_cidrs=tuple(
+                    str(c) for c in row["allow_cidrs"]
+                ),
+                max_bytes_per_run=cap,
+                version=int(row["version"] or 0),
+            )
 
     async def clear_ephemeral_secrets(self, run_id: str) -> None:
         await self.rds.delete(f"haas:secrets:{run_id}")

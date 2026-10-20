@@ -7,8 +7,11 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.api.deps import PrincipalInfo, requires, tenant_scope
+from app.core.authorization import Action
 
 from app.main import store
 
@@ -139,7 +142,7 @@ class RedactionTestResponse(BaseModel):
 
 # Secret Binding endpoints
 @router.post("/v1/secrets/bindings", response_model=SecretBindingResponse)
-async def create_secret_binding(request: SecretBindingCreateRequest) -> SecretBindingResponse:
+async def create_secret_binding(request: SecretBindingCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> SecretBindingResponse:
     """Create a new secret binding."""
     # Validate provider shape
     if request.provider == "inline":
@@ -156,7 +159,7 @@ async def create_secret_binding(request: SecretBindingCreateRequest) -> SecretBi
     async with store.connection() as conn:
         # Check for duplicate name
         existing = await conn.fetchrow(
-            "SELECT 1 FROM secret_bindings WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1) AND name = $1 AND deleted_at IS NULL",
+            "SELECT 1 FROM secret_bindings WHERE TRUE  -- tenant isolation via RLS AND name = $1 AND deleted_at IS NULL",
             request.name,
         )
         if existing:
@@ -169,7 +172,7 @@ async def create_secret_binding(request: SecretBindingCreateRequest) -> SecretBi
                 encrypted_value, allowed_plugins, allowed_tools, description, created_by
             ) VALUES (
                 gen_random_uuid(),
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5, $6, $7, $8
             )
             RETURNING binding_id::text, tenant_id::text, name, provider, provider_reference,
@@ -183,7 +186,7 @@ async def create_secret_binding(request: SecretBindingCreateRequest) -> SecretBi
             request.allowed_plugins,
             request.allowed_tools,
             request.description,
-            "current_user",  # Would come from auth context
+            principal.principal_id,  # Would come from auth context
         )
     
     return SecretBindingResponse(**dict(row))
@@ -192,6 +195,8 @@ async def create_secret_binding(request: SecretBindingCreateRequest) -> SecretBi
 @router.get("/v1/secrets/bindings", response_model=list[SecretBindingResponse])
 async def list_secret_bindings(
     include_deleted: bool = Query(False),
+    principal: PrincipalInfo = Depends(tenant_scope),
+    _auth: None = requires(Action.SECRET_ADMIN),
 ) -> list[SecretBindingResponse]:
     """List secret bindings."""
     async with store.connection() as conn:
@@ -200,7 +205,7 @@ async def list_secret_bindings(
                    version, allowed_plugins, allowed_tools, description,
                    created_by::text, created_at, rotated_at, deleted_at
             FROM secret_bindings
-            WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
         """
         if not include_deleted:
             query += " AND deleted_at IS NULL"
@@ -212,7 +217,7 @@ async def list_secret_bindings(
 
 
 @router.get("/v1/secrets/bindings/{binding_id}", response_model=SecretBindingResponse)
-async def get_secret_binding(binding_id: str) -> SecretBindingResponse:
+async def get_secret_binding(binding_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> SecretBindingResponse:
     """Get a secret binding."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -233,7 +238,7 @@ async def get_secret_binding(binding_id: str) -> SecretBindingResponse:
 
 
 @router.patch("/v1/secrets/bindings/{binding_id}", response_model=SecretBindingResponse)
-async def update_secret_binding(binding_id: str, request: SecretBindingUpdateRequest) -> SecretBindingResponse:
+async def update_secret_binding(binding_id: str, request: SecretBindingUpdateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> SecretBindingResponse:
     """Update a secret binding."""
     async with store.connection() as conn:
         # Get current binding
@@ -289,7 +294,7 @@ async def update_secret_binding(binding_id: str, request: SecretBindingUpdateReq
 
 
 @router.delete("/v1/secrets/bindings/{binding_id}")
-async def delete_secret_binding(binding_id: str) -> dict[str, str]:
+async def delete_secret_binding(binding_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> dict[str, str]:
     """Soft delete a secret binding."""
     async with store.connection() as conn:
         result = await conn.execute(
@@ -305,7 +310,7 @@ async def delete_secret_binding(binding_id: str) -> dict[str, str]:
 
 # Credential Grant endpoints
 @router.post("/v1/credentials/grants", response_model=CredentialGrantResponse)
-async def create_credential_grant(request: CredentialGrantRequest) -> CredentialGrantResponse:
+async def create_credential_grant(request: CredentialGrantRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> CredentialGrantResponse:
     """Create a credential grant for a tool invocation."""
     async with store.connection() as conn:
         # Validate binding if provided
@@ -330,7 +335,7 @@ async def create_credential_grant(request: CredentialGrantRequest) -> Credential
                 created_at, expires_at
             ) VALUES (
                 gen_random_uuid(),
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, $4, $5, $6, $7, $8, now(), $9
             )
             RETURNING grant_id::text, tenant_id::text, run_id, invocation_id, secret_name,
@@ -352,7 +357,7 @@ async def create_credential_grant(request: CredentialGrantRequest) -> Credential
 
 
 @router.get("/v1/credentials/grants/{grant_id}", response_model=CredentialGrantResponse)
-async def get_credential_grant(grant_id: str) -> CredentialGrantResponse:
+async def get_credential_grant(grant_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> CredentialGrantResponse:
     """Get a credential grant (for tool worker to redeem)."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -373,7 +378,7 @@ async def get_credential_grant(grant_id: str) -> CredentialGrantResponse:
 
 
 @router.post("/v1/credentials/grants/{grant_id}/redeem")
-async def redeem_credential_grant(grant_id: str) -> dict[str, Any]:
+async def redeem_credential_grant(grant_id: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> dict[str, Any]:
     """Redeem a credential grant - returns the secret value (once)."""
     async with store.connection() as conn:
         async with conn.transaction():
@@ -429,7 +434,7 @@ async def redeem_credential_grant(grant_id: str) -> dict[str, Any]:
 
 # Egress Policy endpoints
 @router.get("/v1/egress/policy", response_model=EgressPolicyResponse)
-async def get_egress_policy() -> EgressPolicyResponse:
+async def get_egress_policy(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> EgressPolicyResponse:
     """Get the tenant's egress policy."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -437,7 +442,7 @@ async def get_egress_policy() -> EgressPolicyResponse:
             SELECT tenant_id::text, allow_hosts, allow_cidrs, max_bytes_per_run,
                    version, updated_by::text, updated_at
             FROM egress_policies
-            WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)
+            WHERE TRUE  -- tenant isolation via RLS
             """,
         )
     
@@ -457,7 +462,7 @@ async def get_egress_policy() -> EgressPolicyResponse:
 
 
 @router.put("/v1/egress/policy", response_model=EgressPolicyResponse)
-async def set_egress_policy(request: EgressPolicyRequest) -> EgressPolicyResponse:
+async def set_egress_policy(request: EgressPolicyRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> EgressPolicyResponse:
     """Set or update the tenant's egress policy."""
     async with store.connection() as conn:
         row = await conn.fetchrow(
@@ -466,7 +471,7 @@ async def set_egress_policy(request: EgressPolicyRequest) -> EgressPolicyRespons
                 tenant_id, allow_hosts, allow_cidrs, max_bytes_per_run,
                 version, updated_by, updated_at
             ) VALUES (
-                (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1),
+                principal.tenant_id,
                 $1, $2, $3, 1, $4, now()
             )
             ON CONFLICT (tenant_id) DO UPDATE SET
@@ -482,21 +487,21 @@ async def set_egress_policy(request: EgressPolicyRequest) -> EgressPolicyRespons
             request.allow_hosts,
             request.allow_cidrs,
             request.max_bytes_per_run,
-            "current_user",  # Would come from auth context
+            principal.principal_id,  # Would come from auth context
         )
     
     return EgressPolicyResponse(**dict(row))
 
 
 @router.post("/v1/egress/check")
-async def check_egress_allowed(url: str) -> dict[str, Any]:
+async def check_egress_allowed(url: str, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> dict[str, Any]:
     """Check if a URL is allowed by the egress policy."""
     from urllib.parse import urlparse
     import ipaddress
     
     async with store.connection() as conn:
         policy = await conn.fetchrow(
-            "SELECT allow_hosts, allow_cidrs FROM egress_policies WHERE tenant_id = (SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)"
+            "SELECT allow_hosts, allow_cidrs FROM egress_policies WHERE TRUE  -- tenant isolation via RLS"
         )
     
     if not policy:
@@ -537,7 +542,7 @@ async def check_egress_allowed(url: str) -> dict[str, Any]:
 
 # Redaction endpoints
 @router.post("/v1/redaction/rules", response_model=RedactionRuleResponse)
-async def create_redaction_rule(request: RedactionRuleRequest) -> RedactionRuleResponse:
+async def create_redaction_rule(request: RedactionRuleRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> RedactionRuleResponse:
     """Create a redaction rule."""
     # In a full implementation, this would store rules in a database table
     # For now, return a mock response
@@ -555,7 +560,7 @@ async def create_redaction_rule(request: RedactionRuleRequest) -> RedactionRuleR
 
 
 @router.get("/v1/redaction/rules", response_model=list[RedactionRuleResponse])
-async def list_redaction_rules() -> list[RedactionRuleResponse]:
+async def list_redaction_rules(principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> list[RedactionRuleResponse]:
     """List redaction rules."""
     # In a full implementation, this would query a database table
     # For now, return default rules
@@ -586,7 +591,7 @@ async def list_redaction_rules() -> list[RedactionRuleResponse]:
 
 
 @router.post("/v1/redaction/test", response_model=RedactionTestResponse)
-async def test_redaction(request: RedactionTestRequest) -> RedactionTestResponse:
+async def test_redaction(request: RedactionTestRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.SECRET_ADMIN)) -> RedactionTestResponse:
     """Test redaction rules against text."""
     import re
     

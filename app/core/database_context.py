@@ -17,7 +17,7 @@ class DatabaseTenantMiddleware:
         values = [
             value.decode("latin-1")
             for key, value in scope["headers"]
-            if key.lower() == b"x-tenant-id"
+            if key.lower() in (b"x-haas-tenant", b"x-tenant-id")
         ]
         selected = values[0].strip() if len(values) == 1 else ""
         if not values and self.allow_legacy_dev:

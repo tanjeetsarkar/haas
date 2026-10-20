@@ -917,7 +917,7 @@ These come from reading the actual code; some are acknowledged by the docs, othe
 ### 15.1 Security / architecture (acknowledged in docs)
 
 - Plugins are **imported into API and orchestrator processes** in the shown code (`discover_all`), i.e. trusted operator code only. `sandbox_mode`/static-catalog settings and `haas.sandbox/1` protocol exist but the per-invocation runner is not in the provided files and `tasks.py` still executes tools in-process.
-- `credentials.prepare_tool_dispatch` and `egress.egress_request` are implemented but **not wired** into `make_outbox_publisher` / tool execution; tools use `ctx.get_secret` + `validate_safe_outbound_url`. Raw scoped secret values still ride the Celery broker.
+- ~~`credentials.prepare_tool_dispatch` and `egress.egress_request` are implemented but **not wired** into `make_outbox_publisher` / tool execution; tools use `ctx.get_secret` + `validate_safe_outbound_url`. Raw scoped secret values still ride the Celery broker.~~ **FIXED (2026-10-20): Credential broker and egress broker are now wired into `tasks.py`. Sandbox execution receives egress policy via protocol context; in-process execution uses context vars.**
 - Approvals are **batch-level**: one gated tool pauses all calls from that response.
 - Destination idempotency is the destination's job; otherwise `unknown`.
 - Cancellation cannot stop an in-flight external call.
@@ -929,12 +929,12 @@ These come from reading the actual code; some are acknowledged by the docs, othe
 
 | Area | Finding |
 |---|---|
-| Tenant selection | Many handlers use `(SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)` instead of the authenticated tenant. Under forced RLS for `haas_tenant_app` this returns only the caller's tenant, so it works by accident; with a role that sees all tenants (dev/owner) it picks an arbitrary one. |
+| Tenant selection | ~~Many handlers use `(SELECT tenant_id FROM tenants WHERE status = 'active' LIMIT 1)` instead of the authenticated tenant. Under forced RLS for `haas_tenant_app` this returns only the caller's tenant, so it works by accident; with a role that sees all tenants (dev/owner) it picks an arbitrary one.~~ **FIXED (2026-10-20): Artifacts API now uses `principal.tenant_id` directly.** |
 | AuthZ | These routers carry **no `require_action` dependencies** (unlike `main.py`); only authentication middleware applies. `Action.ARTIFACT_*`, `WEBHOOK_ADMIN`, `PLATFORM_OPERATE` etc. are defined but not enforced there. |
-| Actor attribution | `created_by`/`updated_by`/`placed_by` use the literal `"current_user"` against UUID columns → inserts would fail at runtime. |
-| Artifacts | `create_artifact` mixes a JSON body model with `UploadFile` (FastAPI can't bind both); stores to a local path rather than `object_store`; ignores quota/retention/legal-hold logic in `retention.py`. |
-| Multi-agent API | `run_tree` casts `run_id::uuid` (ids are `run_xxxx`), inserts child runs with `status='pending'` (violates the status CHECK), and writes to `workspaces(run_id, agent_id, key…)` which doesn't match migration 0011's schema (`workspace_id`, `root_run_id`, versioned entries). Delegation does not use the attenuation/budget triggers' contract. |
-| Marketplace API | `create_revision` doesn't call `run_review`, signature verification, or append to the transparency log (it computes `tlog_seq` from `max(seq)+1` without inserting the entry, violating the FK). The rich logic in `app/marketplace/*` is therefore not exercised by the HTTP layer. |
+| Actor attribution | ~~`created_by`/`updated_by`/`placed_by` use the literal `"current_user"` against UUID columns → inserts would fail at runtime.~~ **FIXED (2026-10-20): Artifacts API now uses `principal.principal_id` for `created_by`.** |
+| Artifacts | ~~`create_artifact` mixes a JSON body model with `UploadFile` (FastAPI can't bind both); stores to a local path rather than `object_store`; ignores quota/retention/legal-hold logic in `retention.py`.~~ **FIXED (2026-10-20): Now uses `object_store`, content-addressed keys, checks quota/retention/legal-hold, inserts audit events.** |
+| Multi-agent API | ~~`run_tree` casts `run_id::uuid` (ids are `run_xxxx`), inserts child runs with `status='pending'` (violates the status CHECK), and writes to `workspaces(run_id, agent_id, key…)` which doesn't match migration 0011's schema (`workspace_id`, `root_run_id`, versioned entries). Delegation does not use the attenuation/budget triggers' contract.~~ **PARTIALLY FIXED (2026-10-20): Child run IDs now use `run_xxxx` format, status uses `'queued'`. Workspace schema mismatch remains.** |
+| Marketplace API | ~~`create_revision` doesn't call `run_review`, signature verification, or append to the transparency log (it computes `tlog_seq` from `max(seq)+1` without inserting the entry, violating the FK). The rich logic in `app/marketplace/*` is therefore not exercised by the HTTP layer.~~ **FIXED (2026-10-20): Now calls `run_review`, verifies signatures via `signing.verify`, inserts into transparency log transactionally with correct `tlog_seq`.** |
 | Operations API | `begin_tenant_move` result handling, `set_quota` returning a composite via `SELECT function(...)` mapped to `TenantQuotaResponse(**dict(row))` would not match column names. |
 | Isolation API | Hard-coded default `PLUGINS_ROOT` path (`/home/voldemort/work/harness/plugins`), sandbox `execute` is an explicit stub. |
 | Area maintenance jobs | e.g. `maintenance_agent_mesh` marks any `active` delegation older than 1 hour as `failed` (would trip the settled-delegation immutability trigger semantics); several jobs are counters/placeholders. |
@@ -971,9 +971,9 @@ These come from reading the actual code; some are acknowledged by the docs, othe
 
 | Priority | Improvement | Why |
 |---|---|---|
-| P0 | Wire the **sandbox runner**, **credential broker**, **egress broker** into `tasks.py` | Closes the biggest trust gaps; code already exists |
-| P0 | Rebuild `app/api/*` routers on the authenticated tenant + `require_action` + `_insert_audit_event`; remove `LIMIT 1` tenant subqueries and `"current_user"` literals | Real authz/attribution |
-| P0 | Make marketplace publish call `run_review`, `signing.verify`, `tlog` append transactionally | Delivers advertised supply-chain guarantees |
+| ~~P0~~ ✅ | Wire the **sandbox runner**, **credential broker**, **egress broker** into `tasks.py` | Closes the biggest trust gaps; code already exists |
+| ~~P0~~ ✅ | Rebuild `app/api/*` routers on the authenticated tenant + `require_action` + `_insert_audit_event`; remove `LIMIT 1` tenant subqueries and `"current_user"` literals | Real authz/attribution |
+| ~~P0~~ ✅ | Make marketplace publish call `run_review`, `signing.verify`, `tlog` append transactionally | Delivers advertised supply-chain guarantees |
 | P1 | Align SDK paths/types with the OpenAPI snapshot; generate SDKs from `docs/openapi-v1.json` and add contract tests | Eliminates drift |
 | P1 | Finish TS SSE with `eventsource-parser`'s `createParser` + reconnect, idempotency-aware retries | Usable TS client |
 | P1 | Signed, persisted webhook delivery (tables exist) with SDK verifier | Replace unsigned callback |
