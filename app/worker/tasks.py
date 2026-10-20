@@ -44,6 +44,16 @@ from app.core.llm import CompletionResult, OpenRouterGateway, repair_tool_json
 from app.core.output_stream import DeltaPublisher
 from app.core.plugins import registry
 from app.core.store import DistributedStore
+from app.core.webhooks import (
+    SIGNATURE_HEADER,
+    WEBHOOK_ID_HEADER,
+    KEY_ID_HEADER,
+    build_signature_header,
+    decrypt_signing_key,
+    get_active_signing_keys,
+    record_delivery_attempt,
+    update_delivery_status,
+)
 from app.core.workflow import (
     UNKNOWN_OUTCOME,
     Lease,
@@ -915,19 +925,146 @@ async def _async_execute_tool(
     name="haas.deliver_webhook_task",
     bind=True,
     queue="q_orchestrator",
-    max_retries=3,
+    max_retries=5,
 )
-def deliver_webhook_task(self, webhook_url: str, payload: dict[str, Any]) -> None:
+def deliver_webhook_task(self, delivery_id: str) -> None:
+    """Deliver a signed webhook with retry logic.
+    
+    This task fetches the delivery record, signs the payload with HMAC-SHA256,
+    and delivers it to the webhook endpoint. On failure, it retries with
+    exponential backoff. After max_retries, the delivery is marked as dead.
+    """
+    store = DistributedStore()
+    import asyncio
+    asyncio.run(_deliver_webhook_async(self, store, delivery_id))
+
+
+async def _deliver_webhook_async(task: Task, store: DistributedStore, delivery_id: str) -> None:
+    async with store.connection() as conn:
+        # Fetch delivery record
+        delivery = await conn.fetchrow(
+            """
+            SELECT delivery_id, tenant_id, run_id, endpoint_id, event_type, url, body,
+                   attempts, max_attempts, next_attempt_at, status
+            FROM webhook_deliveries
+            WHERE delivery_id = $1
+            """,
+            delivery_id,
+        )
+    
+    if not delivery:
+        log.warning("Webhook delivery %s not found", delivery_id)
+        return
+    
+    if delivery["status"] not in ("pending", "retrying", "in_flight"):
+        log.info("Webhook delivery %s not in deliverable state: %s", delivery_id, delivery["status"])
+        return
+    
+    # Mark as in_flight
+    async with store.connection() as conn:
+        update_delivery_status(conn, delivery_id, "in_flight", attempt=delivery["attempts"])
+    
     try:
-        validate_safe_outbound_url(webhook_url, resolve_dns=True)
+        # Validate URL
+        validate_safe_outbound_url(delivery["url"], resolve_dns=True)
     except (SecurityViolationError, ToolRemediationError) as exc:
         log.warning("Webhook blocked: %s", exc)
+        async with store.connection() as conn:
+            record_delivery_attempt(
+                conn, delivery_id, delivery["tenant_id"], delivery["attempts"] + 1,
+                "blocked", None, None, str(exc), [], delivery["restore_epoch"]
+            )
+            update_delivery_status(conn, delivery_id, "blocked")
         return
+    
+    # Get signing keys
+    async with store.connection() as conn:
+        keys = get_active_signing_keys(conn, delivery["tenant_id"])
+    
+    if not keys:
+        log.error("No active signing keys for tenant %s", delivery["tenant_id"])
+        async with store.connection() as conn:
+            record_delivery_attempt(
+                conn, delivery_id, delivery["tenant_id"], delivery["attempts"] + 1,
+                "failed", None, None, "No active signing keys", [], delivery["restore_epoch"]
+            )
+            update_delivery_status(conn, delivery_id, "dead")
+        return
+    
+    # Decrypt secrets and build signature
+    secrets = [decrypt_signing_key(secret_env) for _, secret_env in keys]
+    key_ids = [kid for kid, _ in keys]
+    payload_bytes = json.dumps(delivery["body"], separators=(",", ":")).encode("utf-8")
+    timestamp = int(time.time())
+    signature_header = build_signature_header(payload_bytes, secrets, timestamp)
+    
+    # Prepare headers
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "HaaS-Webhook/1.0",
+        SIGNATURE_HEADER: signature_header,
+        WEBHOOK_ID_HEADER: delivery_id,
+        KEY_ID_HEADER: key_ids[0] if key_ids else "",
+    }
+    
+    start_time = time.monotonic()
+    attempt_num = delivery["attempts"] + 1
+    
     try:
-        with httpx.Client(timeout=10.0, follow_redirects=False) as client:
-            client.post(webhook_url, json=payload).raise_for_status()
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.post(delivery["url"], content=payload_bytes, headers=headers)
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            
+            if response.is_success:
+                async with store.connection() as conn:
+                    record_delivery_attempt(
+                        conn, delivery_id, delivery["tenant_id"], attempt_num,
+                        "succeeded", response.status_code, latency_ms, None, key_ids, delivery["restore_epoch"]
+                    )
+                    update_delivery_status(
+                        conn, delivery_id, "succeeded", attempt=attempt_num,
+                        status_code=response.status_code, latency_ms=latency_ms,
+                        completed_at="now()"
+                    )
+                log.info("Webhook delivery %s succeeded (attempt %d)", delivery_id, attempt_num)
+            else:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {response.status_code}",
+                    request=response.request,
+                    response=response
+                )
+    except httpx.HTTPStatusError as exc:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        status_code = exc.response.status_code
     except httpx.HTTPError as exc:
-        if self.request.retries >= self.max_retries:
-            log.error("Webhook delivery to %s failed permanently: %s", webhook_url, exc)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        status_code = None
+        
+        async with store.connection() as conn:
+            record_delivery_attempt(
+                conn, delivery_id, delivery["tenant_id"], attempt_num,
+                "failed", status_code, latency_ms, str(exc), key_ids, delivery["restore_epoch"]
+            )
+        
+        if attempt_num >= delivery["max_attempts"]:
+            async with store.connection() as conn:
+                update_delivery_status(
+                    conn, delivery_id, "dead", attempt=attempt_num,
+                    status_code=status_code, latency_ms=latency_ms,
+                    error=str(exc), completed_at="now()"
+                )
+            log.error("Webhook delivery %s failed permanently after %d attempts: %s",
+                      delivery_id, attempt_num, exc)
             return
-        raise self.retry(exc=exc, countdown=2 ** (self.request.retries + 1))
+        
+        # Schedule retry with exponential backoff
+        next_attempt = int(time.time()) + (2 ** attempt_num)
+        async with store.connection() as conn:
+            update_delivery_status(
+                conn, delivery_id, "retrying", attempt=attempt_num,
+                next_attempt_at=next_attempt, status_code=status_code,
+                latency_ms=latency_ms, error=str(exc)
+            )
+        log.warning("Webhook delivery %s failed (attempt %d), retrying: %s",
+                    delivery_id, attempt_num, exc)
+        raise task.retry(exc=exc, countdown=2 ** attempt_num)

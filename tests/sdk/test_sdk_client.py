@@ -265,26 +265,48 @@ def test_artifacts_endpoints() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         path = request.url.path
-        if path == "/v1/runs/r1/artifacts" and request.method == "POST":
+        if path == "/v1/artifacts" and request.method == "POST":
             return httpx.Response(
-                201, json={"artifact_id": "a1", "run_id": "r1", "name": "x.txt", "size_bytes": 3}
+                201,
+                json={
+                    "artifact_id": "a1",
+                    "run_id": "r1",
+                    "name": "x.txt",
+                    "size_bytes": 3,
+                    "sha256": "abc123",
+                    "content_type": "text/plain",
+                    "object_key": "key1",
+                    "source": "api",
+                    "created_by": None,
+                    "metadata": {},
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "expires_at": None,
+                    "deleted_at": None,
+                    "tenant_id": "tenant1",
+                },
             )
-        if path == "/v1/runs/r1/artifacts":
-            return httpx.Response(200, json={"items": [{"artifact_id": "a1"}]})
-        if path == "/v1/artifacts/a1/content":
+        if path == "/v1/artifacts":
+            return httpx.Response(200, json={"items": [{"artifact_id": "a1", "run_id": "r1", "name": "x.txt", "size_bytes": 3, "sha256": "abc123", "content_type": "text/plain", "object_key": "key1", "source": "api", "created_by": None, "metadata": {}, "created_at": "2024-01-01T00:00:00Z", "expires_at": None, "deleted_at": None, "tenant_id": "tenant1"}]})
+        if path == "/v1/artifacts/a1/download":
             return httpx.Response(206, content=b"bc")
         if request.method == "DELETE":
             return httpx.Response(204)
-        return httpx.Response(200, json={"artifact_id": "a1", "content_type": "text/plain"})
+        return httpx.Response(200, json={"artifact_id": "a1", "run_id": "r1", "name": "x.txt", "size_bytes": 3, "sha256": "abc123", "content_type": "text/plain", "object_key": "key1", "source": "api", "created_by": None, "metadata": {}, "created_at": "2024-01-01T00:00:00Z", "expires_at": None, "deleted_at": None, "tenant_id": "tenant1"})
 
     with _client(handler) as haas:
-        uploaded = haas.artifacts.upload("r1", b"abc", filename="x.txt", content_type="text/plain")
+        uploaded = haas.artifacts.upload(run_id="r1", content=b"abc", filename="x.txt", content_type="text/plain")
         assert uploaded.artifact_id == "a1" and uploaded.size_bytes == 3
         assert [a.artifact_id for a in haas.artifacts.list("r1")] == ["a1"]
         assert haas.artifacts.get("a1").content_type == "text/plain"
         assert haas.artifacts.content("a1", start=1, end=2) == b"bc"
         haas.artifacts.delete("a1")
+    # Check the upload request was made to /v1/artifacts with multipart form
+    assert seen[0].url.path == "/v1/artifacts"
+    assert seen[0].method == "POST"
     assert b'name="file"; filename="x.txt"' in seen[0].content
+    assert seen[1].url.path == "/v1/artifacts" and seen[1].method == "GET"
+    assert seen[2].url.path == "/v1/artifacts/a1" and seen[2].method == "GET"
+    assert seen[3].url.path == "/v1/artifacts/a1/download" and seen[3].method == "GET"
     assert seen[3].headers["range"] == "bytes=1-2"
     assert seen[4].method == "DELETE"
 

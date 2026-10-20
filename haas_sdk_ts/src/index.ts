@@ -5,7 +5,7 @@
  */
 
 export { HaaSClient, createClientFromEnv } from './client';
-export { EventSourceParser } from 'eventsource-parser';
+export type { EventSourceParser } from 'eventsource-parser';
 
 // Re-export all types
 export type {

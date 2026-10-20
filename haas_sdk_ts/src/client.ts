@@ -5,7 +5,7 @@
  * for interacting with the HaaS /v1 REST API and SSE event streams.
  */
 
-import { EventSourceParser } from 'eventsource-parser';
+import { createParser, ParsedEvent } from 'eventsource-parser';
 import {
   ClientOptions,
   StreamOptions,
@@ -202,12 +202,13 @@ export class HaaSClient {
 
   /**
    * Make an HTTP request with retry logic
+   * Only retries idempotent requests (GET, DELETE, or requests with Idempotency-Key)
    */
   private async request<T>(
     method: string,
     path: string,
     options: {
-      params?: Record<string, string | number | boolean | undefined>;
+      params?: Record<string, string | number | boolean | undefined> | URLSearchParams | RunListParams | RunEventsParams | ApprovalListParams | ThreadHistoryParams | AgentRevisionListParams | ArtifactListParams | WebhookDeliveryListParams;
       body?: unknown;
       headers?: Record<string, string>;
       idempotent?: boolean;
@@ -218,17 +219,28 @@ export class HaaSClient {
     
     const url = new URL(`${this.baseUrl}${path}`);
     if (params) {
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null) {
-          url.searchParams.append(key, String(value));
-        }
-      });
+      if (params instanceof URLSearchParams) {
+        params.forEach((value, key) => {
+          if (value !== undefined && value !== null) {
+            url.searchParams.append(key, String(value));
+          }
+        });
+      } else {
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined && value !== null) {
+            url.searchParams.append(key, String(value));
+          }
+        });
+      }
     }
 
     const requestHeaders = this.getHeaders({
       ...headers,
       ...this.getIdempotencyHeaders(idempotencyKey),
     });
+
+    // Determine if this request is safe to retry
+    const isRetryable = idempotent || method === 'GET' || method === 'DELETE' || !!idempotencyKey;
 
     let lastError: Error | null = null;
     
@@ -254,7 +266,7 @@ export class HaaSClient {
         if (response.status >= 400) {
           let detail: string;
           try {
-            const errorBody = await response.json();
+            const errorBody = await response.json() as { detail?: string; message?: string };
             detail = errorBody.detail || errorBody.message || JSON.stringify(errorBody);
           } catch {
             detail = await response.text();
@@ -286,9 +298,20 @@ export class HaaSClient {
           throw error;
         }
 
-        // Wait before retry
+        // Only retry if the request is idempotent
+        if (!isRetryable) {
+          throw error;
+        }
+
+        // Wait before retry - honor Retry-After header
         if (attempt < this.maxRetries) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          let delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          if (lastError instanceof HaaSAPIError) {
+            const retryAfter = lastError.status === 429 ?               parseInt(lastError.message.match(/Retry after (\d+)s/)?.[1] || '0') : 0;
+            if (retryAfter > 0) {
+              delay = Math.min(retryAfter * 1000, 60000);
+            }
+          }
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
@@ -306,8 +329,34 @@ export class HaaSClient {
     let failures = 0;
 
     while (true) {
-      const parser = EventSourceParser.create((event) => {
-        // Events are yielded via the generator
+      // Create a queue to bridge the parser callback and the async generator
+      const eventQueue: SSEEvent[] = [];
+      let parseError: Error | null = null;
+
+      const parser = createParser((event: { type: string; data?: string | number; id?: string; event?: string; error?: Error }) => {
+        // Handle different event types from eventsource-parser
+        if (event.type === 'error') {
+          parseError = event.error || new Error('SSE parse error');
+          return;
+        }
+        // event can be { type: 'event', event: string, data: string, id: string | undefined }
+        // or { type: 'reconnect-interval', data: number }
+        if (event.type === 'reconnect-interval') {
+          return;
+        }
+        if (event.type !== 'event') {
+          return;
+        }
+        const sseEvent: SSEEvent = {
+          event: event.event || 'message',
+          data: event.data ? JSON.parse(String(event.data)) : {},
+          id: event.id,
+        };
+        eventQueue.push(sseEvent);
+        // Update cursor for reconnection
+        if (sseEvent.id) {
+          cursor = sseEvent.id;
+        }
       });
 
       try {
@@ -328,7 +377,7 @@ export class HaaSClient {
         if (response.status >= 400) {
           let detail: string;
           try {
-            const errorBody = await response.json();
+            const errorBody = await response.json() as { detail?: string; message?: string };
             detail = errorBody.detail || errorBody.message || JSON.stringify(errorBody);
           } catch {
             detail = await response.text();
@@ -343,16 +392,30 @@ export class HaaSClient {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
 
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+        let done = false;
+        while (!done) {
+          // Yield any queued events
+          while (eventQueue.length > 0) {
+            yield eventQueue.shift()!;
+          }
 
+          const { done: readerDone, value } = await reader.read();
+          done = readerDone;
+          if (value) {
             const chunk = decoder.decode(value, { stream: true });
             parser.feed(chunk);
           }
-        } finally {
-          reader.releaseLock();
+
+          if (parseError) {
+            throw parseError;
+          }
+        }
+
+        reader.releaseLock();
+
+        // Yield any remaining events
+        while (eventQueue.length > 0) {
+          yield eventQueue.shift()!;
         }
 
         // Stream ended cleanly
@@ -371,28 +434,15 @@ export class HaaSClient {
         if (error instanceof HaaSAPIError || error instanceof HaaSStreamClosedError) {
           throw error;
         }
-        
+
         failures++;
         if (failures > this.streamMaxReconnects) {
           throw new HaaSConnectionError(`Lost connection to event stream: ${error instanceof Error ? error.message : String(error)}`);
         }
-        
+
         await new Promise(resolve => setTimeout(resolve, this.streamReconnectDelay));
       }
     }
-  }
-
-  /**
-   * Parse SSE events from a stream
-   */
-  private parseSSEEvents(parser: ReturnType<typeof EventSourceParser.create>): SSEEvent[] {
-    const events: SSEEvent[] = [];
-    
-    // The parser calls the callback for each event
-    // We need to capture them - this is a simplified version
-    // In practice, you'd use the parser's callback mechanism
-    
-    return events;
   }
 
   // =========================================================================
@@ -1092,12 +1142,17 @@ export class HaaSClient {
 
 /**
  * Create a client from environment variables
+ * @param env - Optional environment variables object (defaults to process.env in Node.js)
  */
-export function createClientFromEnv(): HaaSClient {
+export function createClientFromEnv(env?: Record<string, string | undefined>): HaaSClient {
+  // Use provided env, or fall back to process.env in Node.js environments
+  // Use globalThis.process to avoid TypeScript errors when @types/node is not installed
+  const envVars = env || (typeof globalThis !== 'undefined' && 'process' in globalThis && (globalThis as any).process?.env ? (globalThis as any).process.env : {});
+  
   return new HaaSClient({
-    baseUrl: process.env.HAAS_API_URL || 'http://localhost:8000',
-    apiKey: process.env.HAAS_API_KEY,
-    tenant: process.env.HAAS_TENANT_ID,
+    baseUrl: envVars.HAAS_API_URL || 'http://localhost:8000',
+    apiKey: envVars.HAAS_API_KEY,
+    tenant: envVars.HAAS_TENANT_ID,
   });
 }
 
