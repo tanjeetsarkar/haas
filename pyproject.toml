@@ -47,6 +47,9 @@ dev = [
 ]
 tui = ["textual>=0.86"]
 
+[project.entry-points.pytest11]
+haas_sdk = "haas_sdk.pytest_plugin"
+
 [project.scripts]
 haas = "haas_cli.cli:main"
 haas-chat = "haas_cli.chat:main"

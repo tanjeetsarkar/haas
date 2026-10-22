@@ -27,8 +27,12 @@ ROWS = [
 
 @pytest.fixture
 def stub_store(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def list_runs(tenant_id: str, *, limit: int, before: Any = None) -> list[dict[str, Any]]:
-        rows = [r for r in ROWS if before is None or (r["created_at"], r["run_id"]) < before]
+    async def list_runs(
+        tenant_id: str, *, limit: int, before: Any = None
+    ) -> list[dict[str, Any]]:
+        rows = [
+            r for r in ROWS if before is None or (r["created_at"], r["run_id"]) < before
+        ]
         return [dict(r) for r in rows[:limit]]
 
     async def get_run(run_id: str) -> dict[str, Any] | None:
@@ -36,10 +40,17 @@ def stub_store(monkeypatch: pytest.MonkeyPatch) -> None:
             return None
         return {**ROWS[-2], "tenant_id": "t", "event_sequence": 2}
 
-    async def list_run_events(run_id: str, *, after: int, limit: int) -> list[dict[str, Any]]:
+    async def list_run_events(
+        run_id: str, *, after: int, limit: int
+    ) -> list[dict[str, Any]]:
         items = [
             {"sequence": 1, "type": "run_started", "data": {}, "schema_version": 1},
-            {"sequence": 2, "type": "run_completed", "data": {"result": "ok"}, "schema_version": 1},
+            {
+                "sequence": 2,
+                "type": "run_completed",
+                "data": {"result": "ok"},
+                "schema_version": 1,
+            },
         ]
         return [i for i in items if i["sequence"] > after][:limit]
 
@@ -49,8 +60,11 @@ def stub_store(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_async_sdk_pages_filters_and_errors_against_app(stub_store: None) -> None:
+    # No credential: in dev mode the server accepts header tenancy without auth.
     async with AsyncHaas(
-        base_url="http://test", tenant="t", transport=httpx.ASGITransport(app=app)
+        base_url="http://test",
+        tenant="t",
+        transport=httpx.ASGITransport(app=app),
     ) as haas:
         page = await haas.runs.list(limit=5, status="failed", thread_id="thd-a")
         assert page.items and all(
@@ -59,7 +73,8 @@ async def test_async_sdk_pages_filters_and_errors_against_app(stub_store: None) 
         every = [r.run_id async for r in haas.runs.iter(page_size=7)]
         assert every == [r["run_id"] for r in ROWS]
         events = await haas.runs.events("run-01", after=1)
-        assert [e.type for e in events] == ["run_completed"] and events[0].sequence == 2
+        assert [e.type for e in events.items] == ["run_completed"]
+        assert events.items[0].sequence == 2
         with pytest.raises(NotFoundError) as info:
             await haas.runs.get("nope")
         assert info.value.request_id

@@ -26,8 +26,16 @@ class SSEParser:
             except json.JSONDecodeError:
                 data = {"raw": raw}
             if not isinstance(data, dict):
+                # SDK-EVT-01: non-dict JSON is wrapped so `RunEvent.data` stays a dict.
                 data = {"value": data}
-            event = RunEvent(type=self._event, data=data, id=self._id)
+            event = RunEvent(
+                type=self._event,
+                data=data,
+                sequence=int(self._id)
+                if self._id is not None and self._id.isdigit()
+                else None,
+                event_id=self._id,
+            )
             self._id, self._event, self._data = None, "message", []
             return event
         if line.startswith(":"):

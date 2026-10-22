@@ -1,9 +1,12 @@
-"""Webhook signature verification.
+"""Webhook signature verification (stable, §13).
 
 Deliveries carry ``HaaS-Webhook-Id``, ``HaaS-Key-Id`` and
 ``HaaS-Signature: t=<unix>,v1=<hex>`` where ``hex = HMAC-SHA256(secret, f"{t}." + body)``.
 During secret rotation the header may contain several ``v1=`` values; any match is
-accepted. Verify against the *raw* request body, before JSON parsing.
+accepted. Verify against the *raw* request body, before JSON parsing (SDK-WH-01).
+
+Server deliveries are unsigned today (§13.1): treat callbacks as hints and
+reconcile with `runs.get(run_id)` before acting.
 """
 
 from __future__ import annotations
@@ -38,15 +41,19 @@ def _body(payload: str | bytes) -> bytes:
 
 def compute_signature(payload: str | bytes, secret: str | bytes, timestamp: int) -> str:
     key = secret.encode("utf-8") if isinstance(secret, str) else secret
-    return hmac.new(key, f"{timestamp}.".encode() + _body(payload), hashlib.sha256).hexdigest()
+    return hmac.new(
+        key, f"{timestamp}.".encode() + _body(payload), hashlib.sha256
+    ).hexdigest()
 
 
 def sign(
     payload: str | bytes, secrets: Secrets, *, timestamp: int | None = None
 ) -> str:
-    """Build a ``HaaS-Signature`` header value (useful for tests and local tooling)."""
+    """Build a ``HaaS-Signature`` header value (tests and local tooling)."""
     ts = int(time.time()) if timestamp is None else int(timestamp)
-    parts = [f"t={ts}"] + [f"v1={compute_signature(payload, s, ts)}" for s in _secrets(secrets)]
+    parts = [f"t={ts}"] + [
+        f"v1={compute_signature(payload, s, ts)}" for s in _secrets(secrets)
+    ]
     return ",".join(parts)
 
 
@@ -77,18 +84,21 @@ def verify_signature(
     tolerance: int = DEFAULT_TOLERANCE,
     now: float | None = None,
 ) -> int:
-    """Raise :class:`WebhookVerificationError` unless valid; return the signed timestamp."""
+    """Raise `WebhookVerificationError` unless valid; return the signed timestamp."""
     if not header:
         raise WebhookVerificationError(f"missing {SIGNATURE_HEADER} header")
     timestamp, signatures = parse_signature_header(header)
     current = time.time() if now is None else now
+    # SDK-WH-03: tolerance 0 disables the timestamp check (documented as unsafe).
     if tolerance > 0 and abs(current - timestamp) > tolerance:
-        raise WebhookVerificationError("signature timestamp outside the tolerance window")
+        raise WebhookVerificationError(
+            "signature timestamp outside the tolerance window"
+        )
     for secret in _secrets(secrets):
         expected = compute_signature(payload, secret, timestamp)
         matched = False
         for candidate in signatures:
-            # Evaluate every candidate so timing does not reveal which one matched.
+            # SDK-WH-02: evaluate every candidate so timing reveals nothing.
             matched |= hmac.compare_digest(expected, candidate)
         if matched:
             return timestamp
@@ -126,7 +136,7 @@ def construct_event(
     tolerance: int = DEFAULT_TOLERANCE,
     now: float | None = None,
 ) -> WebhookEvent:
-    """Verify a delivery and return the parsed :class:`WebhookEvent`."""
+    """Verify a delivery and return the parsed `WebhookEvent` (SDK-WH-05)."""
     body = _body(payload)
     timestamp = verify_signature(
         body, _header(headers, SIGNATURE_HEADER), secrets, tolerance=tolerance, now=now

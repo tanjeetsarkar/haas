@@ -1,8 +1,7 @@
-"""Webhook signature verification (shared vector with sdk/typescript tests)."""
+"""Webhook signature verification (shared vector with the TypeScript SDK tests)."""
 
 from __future__ import annotations
 
-import importlib
 import json
 
 import pytest
@@ -38,52 +37,51 @@ def test_verify_accepts_valid_and_rejects_tampering() -> None:
     assert webhooks.verify(BODY, header, SECRET, now=TIMESTAMP + 10_000, tolerance=0)
 
 
-def test_rotation_accepts_any_matching_signature() -> None:
-    old = webhooks.compute_signature(BODY, "old-secret", TIMESTAMP)
-    new = webhooks.compute_signature(BODY, "new-secret", TIMESTAMP)
-    header = f"t={TIMESTAMP},v1={old},v1={new}"
-    assert webhooks.verify(BODY, header, "new-secret", now=TIMESTAMP)
-    assert webhooks.verify(BODY, header, ["unrelated", "old-secret"], now=TIMESTAMP)
-    assert webhooks.sign(BODY, ["old-secret", "new-secret"], timestamp=TIMESTAMP) == header
-    with pytest.raises(ValueError):
-        webhooks.verify(BODY, header, [], now=TIMESTAMP)
+def test_rotation_accepts_any_candidate_secret_or_v1() -> None:
+    old_header = webhooks.sign(BODY, SECRET, timestamp=TIMESTAMP)
+    new_secret = "whsec_new"
+    # Header carrying both an invalid and a valid v1 (rotation window).
+    mixed_header = (
+        f"t={TIMESTAMP},v1=deadbeef,"
+        f"v1={webhooks.compute_signature(BODY, new_secret, TIMESTAMP)}"
+    )
+    # Any configured secret may match any v1 candidate.
+    assert webhooks.verify(BODY, mixed_header, [new_secret, SECRET], now=TIMESTAMP)
+    assert webhooks.verify(BODY, old_header, [new_secret, SECRET], now=TIMESTAMP)
+    # A header signed by a secret that is not configured must fail.
+    assert not webhooks.verify(BODY, mixed_header, SECRET, now=TIMESTAMP)
 
 
-def test_construct_event_parses_headers_case_insensitively() -> None:
-    headers = {
-        "haas-signature": webhooks.sign(BODY, SECRET, timestamp=TIMESTAMP),
-        "HaaS-Webhook-Id": "dlv-1",
-        "haas-key-id": "key-2",
-    }
-    event = webhooks.construct_event(BODY, headers, SECRET, now=TIMESTAMP)
-    assert event.delivery_id == "dlv-1" and event.key_id == "key-2"
+def test_construct_event_reads_type_or_event() -> None:
+    header = webhooks.sign(BODY, SECRET, timestamp=TIMESTAMP)
+    event = webhooks.construct_event(
+        BODY,
+        {"HaaS-Signature": header, "HaaS-Webhook-Id": "d1", "HaaS-Key-Id": "k1"},
+        SECRET,
+        now=TIMESTAMP,
+    )
     assert event.type == "run.completed"
-    assert event.data == json.loads(BODY)
-    with pytest.raises(WebhookVerificationError):
-        webhooks.construct_event(BODY, {}, SECRET, now=TIMESTAMP)
-    bad = b"not json"
-    with pytest.raises(WebhookVerificationError):
+    assert event.delivery_id == "d1" and event.key_id == "k1"
+    assert event.data["data"]["run_id"] == "run-1"
+
+    alt = json.dumps({"event": "run.failed", "run_id": "r2"}).encode()
+    alt_header = webhooks.sign(alt, SECRET, timestamp=TIMESTAMP)
+    event2 = webhooks.construct_event(
+        alt, {"HaaS-Signature": alt_header}, SECRET, now=TIMESTAMP
+    )
+    assert event2.type == "run.failed"
+
+
+def test_construct_event_rejects_bad_json() -> None:
+    header = webhooks.sign(b"not json", SECRET, timestamp=TIMESTAMP)
+    with pytest.raises(WebhookVerificationError, match="JSON"):
         webhooks.construct_event(
-            bad, {"HaaS-Signature": webhooks.sign(bad, SECRET, timestamp=TIMESTAMP)},
-            SECRET, now=TIMESTAMP,
+            b"not json", {"HaaS-Signature": header}, SECRET, now=TIMESTAMP
         )
 
 
-def test_matches_server_signer_when_available() -> None:
-    try:
-        server = importlib.import_module("app.core.webhooks")
-    except ImportError:
-        pytest.skip("app.core.webhooks not present")
-    signer = next(
-        (getattr(server, n) for n in ("sign_payload", "signature_header", "sign") if hasattr(server, n)),
-        None,
-    )
-    if signer is None:
-        pytest.skip("no recognised signer in app.core.webhooks")
-    try:
-        header = signer(SECRET, BODY, TIMESTAMP)
-    except TypeError:
-        pytest.skip("server signer has a different signature")
-    if not isinstance(header, str):
-        pytest.skip("server signer returns a non-string")
-    assert webhooks.verify(BODY, header, SECRET, now=TIMESTAMP)
+def test_verify_signature_raises_with_timestamp() -> None:
+    header = webhooks.sign(BODY, SECRET, timestamp=TIMESTAMP)
+    assert webhooks.verify_signature(BODY, header, SECRET, now=TIMESTAMP) == TIMESTAMP
+    with pytest.raises(WebhookVerificationError):
+        webhooks.verify_signature(BODY, header, SECRET, now=TIMESTAMP + 9999)

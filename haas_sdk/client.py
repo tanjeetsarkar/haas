@@ -3,37 +3,67 @@
 from __future__ import annotations
 
 import time
+import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import datetime
+from decimal import Decimal
 from types import TracebackType
-from typing import Any, BinaryIO, TypeVar
+from typing import Any, TypeVar
 
 import httpx
 
 from haas_sdk import _specs as specs
-from haas_sdk._core import Call, ClientOptions, api_error, retry_delay
+from haas_sdk._core import (
+    Call,
+    ClientOptions,
+    api_error,
+    retry_delay,
+    stream_cursor,
+)
 from haas_sdk._sse import SSEParser
-from haas_sdk.errors import APIError, HaasConnectionError, StreamClosedError
+from haas_sdk.compat import check_compat
+from haas_sdk.errors import (
+    APIError,
+    HaasConnectionError,
+    StreamClosedError,
+)
+from haas_sdk.handles import RunHandle
 from haas_sdk.models import (
     AgentRevision,
-    ApprovalBatch,
-    Artifact,
+    ApiKey,
+    ApprovalReview,
+    AuditEvent,
+    Capabilities,
+    Decision,
+    DecisionReceipt,
+    EventPage,
+    Identity,
+    IssuedApiKey,
+    Membership,
     Page,
+    PluginCatalog,
+    PolicyRevision,
     Run,
     RunEvent,
+    RunReceipt,
+    RunSteps,
+    RunUsage,
     Thread,
+    ThreadHistory,
 )
+from haas_sdk.pagination import paginate
 
 T = TypeVar("T")
+MONEY = float | Decimal
 
 
 class Haas:
-    """Blocking client for the HaaS ``/v1`` API.
+    """Blocking client for the HaaS `/v1` API.
 
-    >>> with Haas(base_url="http://localhost:8000", api_key="hk_test_...") as haas:
-    ...     run = haas.runs.create("Summarise the release notes")
-    ...     for event in haas.runs.stream(run["run_id"]):
-    ...         print(event.type)
+    >>> with Haas(base_url="http://localhost:8000", api_key="hk_test_abc") as haas:
+    ...     handle = haas.runs.start("Summarise the release notes")
+    ...     run = handle.wait()
+    ...     print(run.result)
     """
 
     def __init__(
@@ -50,6 +80,8 @@ class Haas:
         transport: httpx.BaseTransport | None = None,
         http_client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        allow_test_keys: bool = False,
+        verify_server: bool = False,
     ) -> None:
         self.options = ClientOptions.resolve(
             base_url,
@@ -60,17 +92,26 @@ class Haas:
             stream_max_reconnects=stream_max_reconnects,
             stream_reconnect_delay=stream_reconnect_delay,
             default_headers=default_headers,
+            allow_test_keys=allow_test_keys,
         )
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(
-            base_url=self.options.base_url, timeout=timeout, transport=transport
+            base_url=self.options.base_url,
+            timeout=timeout,
+            transport=transport,
+            follow_redirects=False,  # SDK-SEC-06
         )
         self._sleep = sleep
+        self.auth_expired = False
+        self._verify_server = verify_server
+        self._compat_checked = False
         self.runs = Runs(self)
         self.approvals = Approvals(self)
         self.threads = Threads(self)
         self.agents = Agents(self)
-        self.artifacts = Artifacts(self)
+        self.plugins = Plugins(self)
+        self.admin = Admin(self)
+        self.preview = Preview(self)
 
     def __enter__(self) -> Haas:
         return self
@@ -83,15 +124,31 @@ class Haas:
     ) -> None:
         self.close()
 
+    def __repr__(self) -> str:
+        # SDK-CFG-06: never include the credential.
+        return (
+            f"Haas(base_url={self.options.base_url!r}, tenant={self.options.tenant!r})"
+        )
+
     def close(self) -> None:
         if self._owns_http:
             self._http.close()
 
-    def me(self) -> dict[str, Any]:
+    def set_credential(self, api_key: str | None) -> None:
+        """Replace the in-memory credential and clear `auth_expired` (§6.6)."""
+        self.options.api_key = api_key
+        self.auth_expired = False
+
+    def me(self) -> Identity:
         return self._run(specs.me())
 
-    def capabilities(self) -> dict[str, Any]:
-        return self._run(specs.capabilities())
+    def capabilities(self) -> Capabilities:
+        return Capabilities.from_dict(self._run(specs.capabilities()))
+
+    def require_compat(self) -> None:
+        """SDK-COMPAT-01: raise `IncompatibleServerError` unless the server is /v1."""
+        self._compat_checked = True  # set first: the check itself issues a request
+        check_compat(self.capabilities())
 
     def health(self, path: str = "/readyz") -> dict[str, Any]:
         return self._run(specs.health(path))
@@ -112,6 +169,17 @@ class Haas:
         )
 
     def _send(self, call: Call, *, stream: bool = False) -> httpx.Response:
+        if self._verify_server and not self._compat_checked:
+            self.require_compat()
+        if self.options.api_key is None:
+            # SDK-CFG-04: one-time dev-mode warning.
+            warnings.warn(
+                "X-Tenant-ID is a selector, not authentication.",
+                UserWarning,
+                stacklevel=3,
+            )
+            self.options.api_key = None  # keep None; the flag below prevents repeats
+            self._warned_no_credential = True
         attempt = 0
         while True:
             try:
@@ -121,6 +189,11 @@ class Haas:
                 if delay is None:
                     raise HaasConnectionError(str(exc) or type(exc).__name__) from exc
             else:
+                if response.status_code == 401:
+                    # §6.6: clear the credential, flag expiry, never retry.
+                    self.options.api_key = None
+                    self.auth_expired = True
+                    raise api_error(response)
                 if response.status_code < 400:
                     return response
                 if stream:
@@ -144,29 +217,93 @@ class _Resource:
         return self._client._run(op)
 
 
-def _paginate(fetch: Callable[[str | None], Page[T]]) -> Iterator[T]:
-    cursor: str | None = None
-    while True:
-        page = fetch(cursor)
-        yield from page.items
-        if not page.next_cursor or page.next_cursor == cursor:
-            return
-        cursor = page.next_cursor
-
-
 class Runs(_Resource):
+    """`/v1/runs` operations."""
+
+    def start(self, prompt: str, **kwargs: Any) -> RunHandle:
+        """Submit a run and return a `RunHandle` (the ergonomic path)."""
+        receipt = self.create(prompt, **kwargs)
+        return RunHandle(
+            self._client,
+            receipt.run_id,
+            thread_id=receipt.thread_id or None,
+            receipt=receipt,
+        )
+
     def create(
         self,
         prompt: str,
         *,
         thread_id: str | None = None,
         agent_revision_id: str | None = None,
+        expected_history_version: int | None = None,
+        preload_skills: Iterable[str] | None = None,
+        skills: Iterable[str] | None = None,
+        primary_model: str | None = None,
+        planner_model: str | None = None,
+        max_steps: int | None = None,
+        max_cost_usd: MONEY | None = None,
+        deadline_sec: int | None = None,
+        max_tool_invocations: int | None = None,
+        webhook_url: str | None = None,
+        secrets: Mapping[str, str] | None = None,
         idempotency_key: str | None = None,
-        **params: Any,
-    ) -> dict[str, Any]:
-        """Submit a run. A fresh ``Idempotency-Key`` is generated (and reused on retry)."""
-        extra = {"thread_id": thread_id, "agent_revision_id": agent_revision_id, **params}
-        return self._run(specs.run_create(prompt, idempotency_key=idempotency_key, extra=extra))
+    ) -> RunReceipt:
+        """Low-level submit; returns the 202 receipt without a handle."""
+        if agent_revision_id is not None and any(
+            v is not None
+            for v in (
+                primary_model,
+                planner_model,
+                skills,
+                preload_skills,
+                max_steps,
+                max_cost_usd,
+            )
+        ):
+            raise ValueError(
+                "agent_revision_id pins the configuration; passing primary_model, "
+                "planner_model, skills, preload_skills, max_steps or max_cost_usd "
+                "is not allowed (SDK-RUN-03)"
+            )
+        specs.validate_run_limits(
+            max_steps=max_steps,
+            max_cost_usd=max_cost_usd,
+            deadline_sec=deadline_sec,
+            max_tool_invocations=max_tool_invocations,
+        )
+        from haas_sdk.secrets import Secret
+
+        secrets_body = (
+            {
+                k: (v.reveal() if isinstance(v, Secret) else v)
+                for k, v in secrets.items()
+            }
+            if secrets
+            else None
+        )
+        extra = {
+            "thread_id": thread_id,
+            "agent_revision_id": agent_revision_id,
+            "expected_history_version": expected_history_version,
+            "preload_skills": list(preload_skills) if preload_skills else None,
+            "skills": list(skills) if skills else None,
+            "primary_model": primary_model,
+            "planner_model": planner_model,
+            "max_steps": max_steps,
+            "max_cost_usd": float(max_cost_usd) if max_cost_usd is not None else None,
+            "deadline_sec": deadline_sec,
+            "max_tool_invocations": max_tool_invocations,
+            "webhook_url": webhook_url,
+            "secrets": secrets_body,
+        }
+        return self._run(
+            specs.run_create(prompt, idempotency_key=idempotency_key, extra=extra)
+        )
+
+    def attach(self, run_id: str) -> RunHandle:
+        """A handle without network I/O; the first call hits the server."""
+        return RunHandle(self._client, run_id)
 
     def get(self, run_id: str) -> Run:
         return self._run(specs.run_get(run_id))
@@ -193,45 +330,16 @@ class Runs(_Resource):
         )
 
     def iter(self, *, page_size: int | None = None, **filters: Any) -> Iterator[Run]:
-        return _paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
+        return paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
 
     def cancel(self, run_id: str) -> dict[str, Any]:
+        """Cancel a run; terminal runs raise `ConflictError` (SDK-RUN-07)."""
         return self._run(specs.run_cancel(run_id))
 
-    def resume(
-        self,
-        run_id: str,
-        *,
-        approved: bool,
-        batch_id: str | None = None,
-        batch_digest: str | None = None,
-        rejection_reason: str | None = None,
-        secrets: Mapping[str, str] | None = None,
-        idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        return self._run(
-            specs.run_resume(
-                run_id,
-                approved=approved,
-                batch_id=batch_id,
-                batch_digest=batch_digest,
-                rejection_reason=rejection_reason,
-                secrets=secrets,
-                idempotency_key=idempotency_key,
-            )
-        )
-
-    def events(self, run_id: str, *, after: int = 0, limit: int | None = None) -> list[RunEvent]:
+    def events(
+        self, run_id: str, *, after: int = 0, limit: int | None = None
+    ) -> EventPage:
         return self._run(specs.run_events(run_id, after=after, limit=limit))
-
-    def steps(self, run_id: str) -> dict[str, Any]:
-        return self._run(specs.run_subresource(run_id, "steps"))
-
-    def usage(self, run_id: str) -> dict[str, Any]:
-        return self._run(specs.run_subresource(run_id, "usage"))
-
-    def tree(self, run_id: str) -> dict[str, Any]:
-        return self._run(specs.run_subresource(run_id, "tree"))
 
     def stream(
         self,
@@ -240,14 +348,16 @@ class Runs(_Resource):
         last_event_id: str | int | None = None,
         output_deltas: bool = False,
     ) -> Iterator[RunEvent]:
-        """Yield run events until a terminal event or ``input_required``.
+        """Yield run events until a terminal event or `input_required`.
 
-        Dropped connections are resumed with ``Last-Event-ID``; replayed frames are
-        de-duplicated by sequence so every durable event is yielded exactly once.
+        Dropped connections resume with `Last-Event-ID`; replayed frames are
+        de-duplicated by sequence so every durable event is yielded exactly once
+        (SDK-HDL-01). Deltas are only emitted when `output_deltas=True`
+        (SDK-HDL-02) and never advance the cursor.
         """
         client = self._client
         options = client.options
-        last_id = None if last_event_id is None else str(last_event_id)
+        last_id = None if last_event_id is None else stream_cursor(last_event_id)
         last_seq = int(last_id) if last_id is not None and last_id.isdigit() else None
         failures = 0
         while True:
@@ -265,13 +375,29 @@ class Runs(_Resource):
                             continue
                         if event.type == "stream_closed":
                             raise StreamClosedError(
-                                str(event.data.get("reason") or "stream closed by server")
+                                str(
+                                    event.data.get("reason")
+                                    or "stream closed by server"
+                                )
                             )
+                        if event.is_delta:
+                            # SDK-HDL-02: deltas never advance the cursor and are
+                            # only emitted when output_deltas=True.
+                            if output_deltas:
+                                yield event
+                            continue
+                        if event.type == "stream_gap":
+                            # SDK-HDL-03: jump the cursor to the server's latest.
+                            latest = event.data.get("latest")
+                            if isinstance(latest, int):
+                                last_seq, last_id, failures = latest, str(latest), 0
+                            yield event
+                            continue
                         seq = event.sequence
                         if seq is not None:
                             if last_seq is not None and seq <= last_seq:
                                 continue
-                            last_seq, last_id, failures = seq, event.id, 0
+                            last_seq, last_id, failures = seq, event.event_id, 0
                         yield event
                         if event.is_terminal or event.type == "input_required":
                             return
@@ -290,26 +416,48 @@ class Runs(_Resource):
             failures += 1
             client._sleep(options.stream_reconnect_delay * failures)
 
-    def wait(
+    def steps(self, run_id: str) -> RunSteps:
+        return self._run(specs.run_steps(run_id))
+
+    def usage(self, run_id: str) -> RunUsage:
+        return self._run(specs.run_usage(run_id))
+
+    def inspect(self, run_id: str) -> dict[str, Any]:
+        """`get` + `steps` + `usage` composed (SDK-RUN-05: no `/inspect` route)."""
+        return {
+            "run": self.get(run_id),
+            "steps": self.steps(run_id),
+            "usage": self.usage(run_id),
+        }
+
+    def resume(
         self,
         run_id: str,
         *,
-        timeout: float = 300.0,
-        poll_interval: float = 1.0,
-        until_input_required: bool = True,
-    ) -> Run:
-        """Poll until the run is terminal (or waiting for approval)."""
-        deadline = time.monotonic() + timeout
-        while True:
-            run = self.get(run_id)
-            if run.is_terminal or (until_input_required and run.waiting_for_approval):
-                return run
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"run {run_id} still {run.status} after {timeout}s")
-            self._client._sleep(poll_interval)
+        approved: bool,
+        batch_id: str | None = None,
+        batch_digest: str | None = None,
+        rejection_reason: str | None = None,
+        secrets: Mapping[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> DecisionReceipt:
+        """Low-level resume; prefer `approvals.decide` (SDK-APR-06)."""
+        return self._run(
+            specs.run_resume(
+                run_id,
+                approved=approved,
+                batch_id=batch_id,
+                batch_digest=batch_digest,
+                rejection_reason=rejection_reason,
+                secrets=secrets,
+                idempotency_key=idempotency_key,
+            )
+        )
 
 
 class Approvals(_Resource):
+    """`/v1/approvals` operations (P2: decisions bind to a reviewed digest)."""
+
     def list(
         self,
         *,
@@ -317,56 +465,75 @@ class Approvals(_Resource):
         run_id: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
-    ) -> Page[ApprovalBatch]:
+    ) -> Page[ApprovalReview]:
         return self._run(
-            specs.approval_list(status=status, run_id=run_id, limit=limit, cursor=cursor)
+            specs.approval_list(
+                status=status, run_id=run_id, limit=limit, cursor=cursor
+            )
         )
 
-    def iter(self, *, page_size: int | None = None, **filters: Any) -> Iterator[ApprovalBatch]:
-        return _paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
+    def iter(
+        self, *, page_size: int | None = None, **filters: Any
+    ) -> Iterator[ApprovalReview]:
+        return paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
 
-    def get(self, batch_id: str) -> ApprovalBatch:
+    def review(self, batch_id: str) -> ApprovalReview:
+        """Fetch and freeze the batch (P2). Decisions are built from this object."""
         return self._run(specs.approval_get(batch_id))
 
     def decide(
         self,
-        batch_id: str,
-        decision: str,
+        review: ApprovalReview,
+        decision: str | Decision,
         *,
-        batch_digest: str | None = None,
         reason: str | None = None,
         secrets: Mapping[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Decide a batch. Without ``batch_digest`` the current digest is fetched first;
-        pass the digest you reviewed to guarantee you approve exactly what you saw."""
-        digest = batch_digest or self.get(batch_id).batch_digest
+    ) -> DecisionReceipt:
+        """Submit a decision bound to the reviewed digest (SDK-APR-01..06)."""
+        if isinstance(decision, Decision):
+            if decision.review.batch_id != review.batch_id:
+                raise ValueError("Decision was built from a different ApprovalReview")
+            reason = decision.reason if decision.reason is not None else reason
+            secrets = decision.secrets if decision.secrets is not None else secrets
+            wire = "approve" if decision.approve else "reject"
+        else:
+            wire = decision
+        # SDK-APR-03: refuse locally when the review is stale or already decided.
+        if review.expired or review.status != "pending":
+            from haas_sdk.errors import ApprovalStaleError
+
+            raise ApprovalStaleError(
+                f"approval batch {review.batch_id} is {review.status!r}"
+                + (" and expired" if review.expired else ""),
+                status=409,
+            )
         return self._run(
             specs.approval_decide(
-                batch_id,
-                decision=decision,
-                batch_digest=digest,
+                review.batch_id,
+                decision=wire,
+                batch_digest=review.batch_digest,
                 reason=reason,
                 secrets=secrets,
                 idempotency_key=idempotency_key,
             )
         )
 
-    def approve(self, batch_id: str, **kwargs: Any) -> dict[str, Any]:
-        return self.decide(batch_id, "approve", **kwargs)
-
-    def deny(self, batch_id: str, **kwargs: Any) -> dict[str, Any]:
-        return self.decide(batch_id, "reject", **kwargs)
-
 
 class Threads(_Resource):
+    """`/v1/threads` operations."""
+
     def list(
-        self, *, search: str | None = None, limit: int | None = None, cursor: str | None = None
+        self,
+        *,
+        search: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> Page[Thread]:
         return self._run(specs.thread_list(search=search, limit=limit, cursor=cursor))
 
     def iter(self, *, page_size: int | None = None, **filters: Any) -> Iterator[Thread]:
-        return _paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
+        return paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
 
     def get(
         self,
@@ -375,74 +542,177 @@ class Threads(_Resource):
         offset: int | None = None,
         limit: int | None = None,
         history_version: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> ThreadHistory:
+        """Fetch history; `history_version=N` raises `HistoryChangedError` on change."""
         return self._run(
             specs.thread_get(
                 thread_id, offset=offset, limit=limit, history_version=history_version
             )
         )
 
-    def branch(self, thread_id: str, *, expected_history_version: int) -> dict[str, Any]:
+    def branch(self, thread_id: str, *, expected_history_version: int) -> Thread:
+        """Branch a busy thread; not auto-retried (no server idempotency key)."""
         return self._run(
-            specs.thread_branch(thread_id, expected_history_version=expected_history_version)
+            specs.thread_branch(
+                thread_id, expected_history_version=expected_history_version
+            )
         )
 
 
 class Agents(_Resource):
+    """`/v1/agents/revisions` operations (`draft -> validated -> published`)."""
+
     def list(
         self,
         *,
         agent_name: str | None = None,
-        state: str | None = None,
+        state: str | Iterable[str] | None = None,
         limit: int | None = None,
         cursor: str | None = None,
     ) -> Page[AgentRevision]:
         return self._run(
-            specs.agent_list(agent_name=agent_name, state=state, limit=limit, cursor=cursor)
+            specs.agent_list(
+                agent_name=agent_name, state=state, limit=limit, cursor=cursor
+            )
         )
 
-    def iter(self, *, page_size: int | None = None, **filters: Any) -> Iterator[AgentRevision]:
-        return _paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
+    def iter(
+        self, *, page_size: int | None = None, **filters: Any
+    ) -> Iterator[AgentRevision]:
+        return paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
 
     def get(self, revision_id: str) -> AgentRevision:
         return self._run(specs.agent_get(revision_id))
 
-    def create(self, spec: Mapping[str, Any]) -> AgentRevision:
-        return self._run(specs.agent_create(spec))
+    def create(
+        self, agent_name: str, configuration: Mapping[str, Any]
+    ) -> AgentRevision:
+        """Create a draft revision (`POST` body `{agent_name, configuration}`)."""
+        return self._run(specs.agent_create(agent_name, configuration))
 
-    def validate(self, revision_id: str) -> dict[str, Any]:
+    def validate(self, revision_id: str) -> AgentRevision:
         return self._run(specs.agent_action(revision_id, "validate"))
 
-    def publish(self, revision_id: str) -> dict[str, Any]:
+    def publish(self, revision_id: str) -> AgentRevision:
         return self._run(specs.agent_action(revision_id, "publish"))
 
+    def diff(self, left_id: str, right_id: str) -> str:
+        """Client-side unified diff of configuration + policy + registry fingerprint."""
+        import difflib
+        import json
 
-class Artifacts(_Resource):
-    def list(self, run_id: str) -> list[Artifact]:
-        return self._run(specs.artifact_list(run_id))
+        left = self.get(left_id)
+        right = self.get(right_id)
 
-    def upload(
-        self,
-        run_id: str,
-        content: bytes | BinaryIO,
-        *,
-        filename: str,
-        content_type: str = "application/octet-stream",
-    ) -> Artifact:
-        return self._run(
-            specs.artifact_upload(
-                run_id, filename=filename, content=content, content_type=content_type
+        def render(revision: AgentRevision) -> list[str]:
+            return json.dumps(
+                {
+                    "configuration": revision.configuration,
+                    "policy_rules": revision.policy_rules,
+                    "registry_fingerprint": revision.registry_fingerprint,
+                },
+                indent=2,
+                sort_keys=True,
+            ).splitlines()
+
+        return "\n".join(
+            difflib.unified_diff(
+                render(left),
+                render(right),
+                fromfile=left_id,
+                tofile=right_id,
+                lineterm="",
             )
         )
 
-    def get(self, artifact_id: str) -> Artifact:
-        return self._run(specs.artifact_get(artifact_id))
 
-    def content(
-        self, artifact_id: str, *, start: int | None = None, end: int | None = None
-    ) -> bytes:
-        """Download bytes; ``start``/``end`` (inclusive) send an HTTP ``Range`` request."""
-        return self._run(specs.artifact_content(artifact_id, start=start, end=end))
+class Plugins(_Resource):
+    """`/v1/plugins`: the tenant-scoped catalog."""
 
-    def delete(self, artifact_id: str) -> None:
-        self._run(specs.artifact_delete(artifact_id))
+    def catalog(self) -> PluginCatalog:
+        return self._run(specs.plugin_catalog())
+
+
+class Admin(_Resource):
+    """`/v1/admin/*` and `/v1/audit-events` (RBAC enforced server-side; P1)."""
+
+    def __init__(self, client: Haas) -> None:
+        super().__init__(client)
+        self.memberships = Memberships(client)
+        self.api_keys = ApiKeys(client)
+        self.policy = Policy(client)
+        self.audit = Audit(client)
+
+
+class Memberships(_Resource):
+    def list(self) -> list[Membership]:
+        return self._run(specs.admin_memberships_list())
+
+    def grant(self, *, subject: str, role: str, kind: str = "human") -> Membership:
+        return self._run(
+            specs.admin_memberships_grant(subject=subject, role=role, kind=kind)
+        )
+
+    def revoke(self, principal_id: str, role: str) -> None:
+        self._run(specs.admin_memberships_revoke(principal_id, role))
+
+
+class ApiKeys(_Resource):
+    def list(self) -> list[ApiKey]:
+        return self._run(specs.admin_api_keys_list())
+
+    def create(
+        self, *, principal_id: str, name: str, expires_in_days: int = 90
+    ) -> IssuedApiKey:
+        """Issue a key; `.credential` is shown exactly once and never logged."""
+        return self._run(
+            specs.admin_api_keys_create(
+                principal_id=principal_id, name=name, expires_in_days=expires_in_days
+            )
+        )
+
+    def revoke(self, key_id: str) -> None:
+        self._run(specs.admin_api_keys_revoke(key_id))
+
+
+class Policy(_Resource):
+    def get(self) -> PolicyRevision | None:
+        return self._run(specs.admin_policy_get())
+
+    def activate(self, rules: Mapping[str, Any]) -> PolicyRevision:
+        return self._run(specs.admin_policy_activate(rules))
+
+
+class Audit(_Resource):
+    def list(self, *, limit: int = 50, cursor: str | None = None) -> Page[AuditEvent]:
+        return self._run(specs.admin_audit_list(limit=limit, cursor=cursor))
+
+    def iter(self, *, page_size: int = 50, **filters: Any) -> Iterator[AuditEvent]:
+        return paginate(lambda c: self.list(limit=page_size, cursor=c, **filters))
+
+
+class Preview:
+    """Unstable namespaces (`haas.preview.*`, §3). May change in a minor release."""
+
+    def __init__(self, client: Haas) -> None:
+        from haas_sdk.preview.artifacts import Artifacts
+        from haas_sdk.preview.egress import Egress
+        from haas_sdk.preview.governance import Redaction, Retention
+        from haas_sdk.preview.marketplace import Marketplace
+        from haas_sdk.preview.mesh import Mesh
+        from haas_sdk.preview.ops import Isolation, Ops
+        from haas_sdk.preview.quotas import Quotas
+        from haas_sdk.preview.secrets import Secrets
+        from haas_sdk.preview.webhooks import WebhooksAdmin
+
+        self.artifacts = Artifacts(client)
+        self.webhooks = WebhooksAdmin(client)
+        self.secrets = Secrets(client)
+        self.egress = Egress(client)
+        self.redaction = Redaction(client)
+        self.retention = Retention(client)
+        self.quotas = Quotas(client)
+        self.marketplace = Marketplace(client)
+        self.mesh = Mesh(client)
+        self.ops = Ops(client)
+        self.isolation = Isolation(client)
