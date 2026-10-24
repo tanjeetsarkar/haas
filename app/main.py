@@ -30,6 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis.exceptions import RedisError
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings, validate_profile_settings
 from app.core.agents import AgentConfiguration
@@ -185,6 +186,14 @@ class RequestIdMiddleware:
 app = FastAPI(title=settings.app_name, version="3.0.0", lifespan=lifespan)
 configure_observability(app)
 app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins_list,
+    allow_methods=settings.cors_allowed_methods_list,
+    allow_headers=settings.cors_allowed_headers_list,
+    allow_credentials=settings.cors_allow_credentials,
+    max_age=settings.cors_max_age,
+)
+app.add_middleware(
     RequestSizeLimitMiddleware, max_bytes=settings.max_request_body_bytes
 )
 app.add_middleware(
@@ -272,6 +281,9 @@ class BranchThreadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_history_version: int = Field(ge=0)
 
+class CreateThreadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    metadata: dict[str, Any] | None = None
 
 @app.get("/v1/threads", dependencies=[_require_action(Action.RUN_READ)])
 async def list_threads(
@@ -295,6 +307,35 @@ async def list_threads(
             else None
         ),
     }
+
+
+@app.post(
+    "/v1/threads",
+    status_code=201,
+    dependencies=[_require_action(Action.RUN_SUBMIT)],
+)
+async def create_thread(
+    req: CreateThreadRequest,
+    request: Request,
+    response: Response,
+    x_tenant_id: str = Header(default="default-tenant"),
+) -> dict[str, Any]:
+    request_id = str(uuid.uuid4())
+    response.headers["X-Request-ID"] = request_id
+    identity = get_authenticated_identity(request)
+    thread_id = f"thd_{uuid.uuid4().hex[:12]}"
+    metadata = req.metadata or {}
+    try:
+        await store.create_thread(
+            thread_id=thread_id,
+            tenant_id=x_tenant_id,
+            metadata=metadata,
+            actor_principal_id=identity.principal_id if identity else None,
+            request_id=request_id,
+        )
+    except StoreConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"thread_id": thread_id, "metadata": metadata}
 
 
 @app.get("/v1/threads/{thread_id}", dependencies=[_require_action(Action.RUN_READ)])
@@ -374,8 +415,10 @@ async def list_agent_revisions(
         key=lambda row: (float(row["created_at"]), row["revision_id"]),
         keep=(
             (
-                lambda row: (agent_name is None or row["agent_name"] == agent_name)
-                and (states is None or row["state"] in states)
+                lambda row: (
+                    (agent_name is None or row["agent_name"] == agent_name)
+                    and (states is None or row["state"] in states)
+                )
             )
             if agent_name is not None or states is not None
             else None
@@ -674,8 +717,10 @@ async def list_runs(
         key=lambda row: (float(row["created_at"]), row["run_id"]),
         keep=(
             (
-                lambda row: (statuses is None or row["status"] in statuses)
-                and (thread_id is None or row["thread_id"] == thread_id)
+                lambda row: (
+                    (statuses is None or row["status"] in statuses)
+                    and (thread_id is None or row["thread_id"] == thread_id)
+                )
             )
             if statuses is not None or thread_id is not None
             else None

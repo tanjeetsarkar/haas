@@ -172,4 +172,14 @@ export type {
   ClientOptions,
   StreamOptions,
   SSEEvent,
+  
+  // Atlas
+  DrilldownRequest,
+  AtlasLayerNode,
+  AtlasLayerEnvelope,
+  AtlasRunEvent,
+  AtlasEventHandler,
 } from './types';
+
+// Re-export Atlas client
+export { AtlasSessionManager, createAtlasSessionManager } from './lib/atlasClient';

@@ -1081,6 +1081,36 @@ class DistributedStore(
         result["messages"] = _loads(result.pop("messages_json"))
         return result
 
+    async def create_thread(
+        self,
+        thread_id: str,
+        tenant_id: str,
+        metadata: dict[str, Any],
+        actor_principal_id: str | None,
+        request_id: str,
+    ) -> None:
+        async with self.connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO threads (thread_id, tenant_id, messages_json, updated_at, metadata) "
+                    "VALUES ($1, $2, '[]'::jsonb, $3, $4)",
+                    thread_id,
+                    tenant_id,
+                    time.time(),
+                    json.dumps(metadata),
+                )
+                if actor_principal_id is not None:
+                    await self._insert_audit_event(
+                        conn,
+                        tenant_id=tenant_id,
+                        actor_principal_id=UUID(actor_principal_id),
+                        action="thread.created",
+                        target_type="thread",
+                        target_id=thread_id,
+                        request_id=UUID(request_id),
+                        details={"metadata": metadata},
+                    )
+
     async def branch_thread(
         self,
         thread_id: str,

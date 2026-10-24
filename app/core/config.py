@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # Comma-separated hostnames exempt from the SSRF private-address check
     # (local development / integration tests only).
     ssrf_allowed_hosts: str = ""
+    # CORS settings for frontend integration
+    cors_allowed_origins: str = "http://localhost:3000,http://localhost:8000,http://127.0.0.1:3000,http://[::1]:3000,http://localhost:5173,http://127.0.0.1:5173,http://[::1]:5173"
+    cors_allowed_methods: str = "*"
+    cors_allowed_headers: str = "*"
+    cors_allow_credentials: bool = True
+    cors_max_age: int = 86400
 
     # Self-hosted SearXNG base URL used by the web-research plugin's `web_search` tool.
     # Default is the Docker Compose service address; override for non-Compose deployments.
@@ -274,6 +280,18 @@ class Settings(BaseSettings):
         return {
             h.strip().lower() for h in self.ssrf_allowed_hosts.split(",") if h.strip()
         }
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+    
+    @property
+    def cors_allowed_methods_list(self) -> list[str]:
+        return [m.strip() for m in self.cors_allowed_methods.split(",") if m.strip()]
+    
+    @property
+    def cors_allowed_headers_list(self) -> list[str]:
+        return [h.strip() for h in self.cors_allowed_headers.split(",") if h.strip()]
 
 
 settings = Settings()
