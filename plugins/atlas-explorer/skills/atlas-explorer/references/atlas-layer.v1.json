@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haas.local/contracts/atlas-layer.v1.json",
+  "title": "AtlasLayerEnvelopeV1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "layer_depth",
+    "parent_node_id",
+    "domain_category",
+    "nodes",
+    "available_drilldowns",
+    "available_actions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "atlas-layer.v1"
+    },
+    "layer_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10
+    },
+    "parent_node_id": {
+      "type": ["string", "null"]
+    },
+    "domain_category": {
+      "type": "string",
+      "enum": ["healthcare", "education", "government", "commerce", "general"]
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_id", "canonical_key", "title", "component_type", "attributes", "provenance"],
+        "properties": {
+          "node_id": { "type": "string", "minLength": 3, "maxLength": 64 },
+          "canonical_key": { "type": "string", "pattern": "^[a-z0-9_:-]{3,128}$" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "subtitle": { "type": ["string", "null"], "maxLength": 240 },
+          "component_type": {
+            "type": "string",
+            "enum": [
+              "entity_card",
+              "comparison_row",
+              "pricing_tier_card",
+              "specialist_profile",
+              "checklist_card"
+            ]
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          },
+          "provenance": {
+            "type": "object",
+            "required": ["trust_tier", "source_urls", "observed_at"],
+            "properties": {
+              "trust_tier": {
+                "type": "string",
+                "enum": [
+                  "verified_official",
+                  "extracted_document",
+                  "aggregated_directory",
+                  "estimated_range",
+                  "unverified"
+                ]
+              },
+              "source_urls": {
+                "type": "array",
+                "items": { "type": "string", "format": "uri" },
+                "minItems": 1,
+                "maxItems": 10
+              },
+              "observed_at": { "type": "string", "format": "date-time" },
+              "citation_snippet": { "type": ["string", "null"], "maxLength": 500 }
+            }
+          }
+        }
+      },
+      "minItems": 1,
+      "maxItems": 25
+    },
+    "available_drilldowns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["dimension_key", "label", "prompt_template", "recommended_skills"],
+        "properties": {
+          "dimension_key": { "type": "string", "pattern": "^[a-z0-9_]{2,48}$" },
+          "label": { "type": "string", "minLength": 2, "maxLength": 64 },
+          "prompt_template": { "type": "string", "minLength": 5, "maxLength": 500 },
+          "recommended_skills": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "maxItems": 8
+    },
+    "available_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action_id", "label", "tool_name", "requires_approval"],
+        "properties": {
+          "action_id": { "type": "string", "pattern": "^[a-z0-9_]{2,48}$" },
+          "label": { "type": "string", "minLength": 2, "maxLength": 64 },
+          "tool_name": { "type": "string" },
+          "requires_approval": { "type": "boolean" }
+        }
+      },
+      "maxItems": 6
+    }
+  }
+}

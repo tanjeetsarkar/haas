@@ -17,6 +17,12 @@ x-app-env: &app-env
   BILLING_MCP_URL: ${BILLING_MCP_URL:-https://mcp.billing.example.com/mcp}
   BILLING_WEBHOOK_URL: ${BILLING_WEBHOOK_URL:-https://billing.example.com/hooks/refund-batches}
   OUTPUT_DELTA_ENABLED: ${OUTPUT_DELTA_ENABLED:-false}
+  # CORS settings for frontend integration
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://[::1]:3000,http://localhost:5173,http://127.0.0.1:5173,http://[::1]:5173}
+  CORS_ALLOWED_METHODS: ${CORS_ALLOWED_METHODS:-*}
+  CORS_ALLOWED_HEADERS: ${CORS_ALLOWED_HEADERS:-*}
+  CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-true}
+  CORS_MAX_AGE: ${CORS_MAX_AGE:-86400}
 
 services:
   redis:
@@ -71,6 +77,7 @@ services:
     volumes:
       - ./plugins:/app/plugins:ro
       - scratchpad_vol:/tmp/haas_scratchpad
+      - ./app:/app/app
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 10s

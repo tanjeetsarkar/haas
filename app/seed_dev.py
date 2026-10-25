@@ -143,7 +143,6 @@ async def seed_dev(*, rotate_key: bool = False) -> dict[str, str]:
                     ],
                 )
                 for plugin in plugin_registry.plugins.values()
-                if plugin.id == "revenue-ops" and plugin.status == "loaded"
             ]
             rules = TenantPolicyRules(
                 model_providers=["openrouter"],

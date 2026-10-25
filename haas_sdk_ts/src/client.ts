@@ -492,7 +492,7 @@ export class HaaSClient {
       rejectionReason?: string;
       secrets?: Record<string, string>;
       batchId?: string;
-      batchDigest?: string;
+      batch_digest?: string;
     } = {}
   ): Promise<RunResponse> {
     return this.request('POST', `/v1/runs/${encodeURIComponent(runId)}/resume`, {
@@ -536,6 +536,10 @@ export class HaaSClient {
   // =========================================================================
   // Threads
   // =========================================================================
+
+  async createThread(request: { metadata?: Record<string, unknown> }): Promise<Thread> {
+    return this.request('POST', '/v1/threads', { body: request });
+  }
 
   async listThreads(params: { cursor?: string; search?: string } = {}): Promise<{ items: Thread[]; next_cursor?: string }> {
     return this.request('GET', '/v1/threads', { params, idempotent: true });
@@ -1149,6 +1153,12 @@ export function createClientFromEnv(env?: Record<string, string | undefined>): H
   // Use globalThis.process to avoid TypeScript errors when @types/node is not installed
   const envVars = env || (typeof globalThis !== 'undefined' && 'process' in globalThis && (globalThis as any).process?.env ? (globalThis as any).process.env : {});
   
+  console.log({
+    baseUrl: envVars.HAAS_API_URL || 'http://localhost:8000',
+    apiKey: envVars.HAAS_API_KEY,
+    tenant: envVars.HAAS_TENANT_ID,
+  })
+
   return new HaaSClient({
     baseUrl: envVars.HAAS_API_URL || 'http://localhost:8000',
     apiKey: envVars.HAAS_API_KEY,

@@ -1,0 +1,16 @@
+{
+  "id": "atlas-explorer",
+  "version": "1.0.0",
+  "name": "HaaS Atlas Layered Intelligence Pack",
+  "description": "Structured entity graph caching, provenance verification, and SDUI layer emission for progressive disclosure exploration.",
+  "category": "intelligence",
+  "provides": {
+    "skills": ["atlas-explorer"],
+    "tools": [
+      "atlas_cache_lookup",
+      "atlas_cache_upsert",
+      "atlas_emit_layer",
+      "atlas_dispatch_inquiry"
+    ]
+  }
+}

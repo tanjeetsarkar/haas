@@ -293,7 +293,7 @@ def register(registry) -> None:
             "Pure computation, read-only."
         ),
         args_schema=AnalyzeLogArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def analyze_log_text(args: AnalyzeLogArgs) -> str:
         result = analyze(args.log_text, args.top_n, args.bucket_minutes)
@@ -310,7 +310,7 @@ def register(registry) -> None:
             "using the deterministic severity matrix. Only call with facts the user provided or tools confirmed."
         ),
         args_schema=SeverityArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def classify_incident_severity(args: SeverityArgs) -> str:
         sev, reasons = classify(args)
