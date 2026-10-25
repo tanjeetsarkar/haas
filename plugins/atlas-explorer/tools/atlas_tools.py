@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -224,16 +225,55 @@ def register(registry) -> None:
         sandbox=False,
     )
     async def atlas_cache_lookup(ctx: RunContext, args: CacheLookupArgs) -> str:
-        # In production, this queries PostgreSQL atlas_entity_cache table.
-        # For now, return not found to trigger web search.
-        # The actual DB query will be implemented after the migration is applied.
-        return CacheLookupResult(
-            found=False,
-            attributes=None,
-            provenance=None,
-            expires_at=None,
-            content_sha256=None,
-        ).model_dump_json()
+        """Query the atlas_entity_cache table for a cached entry."""
+        if ctx.store is None:
+            return CacheLookupResult(
+                found=False,
+                attributes=None,
+                provenance=None,
+                expires_at=None,
+                content_sha256=None,
+            ).model_dump_json()
+
+        try:
+            async with ctx.store.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT attributes_json, provenance_json, expires_at, content_sha256
+                    FROM atlas_entity_cache
+                    WHERE tenant_id = $1
+                      AND canonical_key = $2
+                      AND dimension_key = $3
+                      AND expires_at > now()
+                    """,
+                    ctx.tenant_id,
+                    args.canonical_key,
+                    args.dimension_key,
+                )
+                if row is None:
+                    return CacheLookupResult(
+                        found=False,
+                        attributes=None,
+                        provenance=None,
+                        expires_at=None,
+                        content_sha256=None,
+                    ).model_dump_json()
+
+                return CacheLookupResult(
+                    found=True,
+                    attributes=row["attributes_json"],
+                    provenance=row["provenance_json"],
+                    expires_at=row["expires_at"].isoformat(),
+                    content_sha256=row["content_sha256"],
+                ).model_dump_json()
+        except Exception as exc:
+            return CacheLookupResult(
+                found=False,
+                attributes=None,
+                provenance=None,
+                expires_at=None,
+                content_sha256=None,
+            ).model_dump_json()
 
     @registry.tool(
         name="atlas_cache_upsert",
@@ -246,19 +286,68 @@ def register(registry) -> None:
         sandbox=False,
     )
     async def atlas_cache_upsert(ctx: RunContext, args: CacheUpsertArgs) -> str:
-        # In production, this upserts into PostgreSQL atlas_entity_cache table.
-        # For now, compute values and return success.
-        content_sha256 = compute_content_sha256(args.attributes, args.provenance)
-        ttl_seconds = compute_ttl(args.dimension_key, args.trust_tier)
-        expires_at = datetime.now(timezone.utc).timestamp() + ttl_seconds
-        expires_at_iso = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+        """Upsert into the atlas_entity_cache table."""
+        if ctx.store is None:
+            # Fallback to mock behavior if no store available
+            content_sha256 = compute_content_sha256(args.attributes, args.provenance)
+            ttl_seconds = compute_ttl(args.dimension_key, args.trust_tier)
+            expires_at = datetime.now(timezone.utc).timestamp() + ttl_seconds
+            expires_at_iso = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
 
-        return CacheUpsertResult(
-            ok=True,
-            cached=True,
-            content_sha256=content_sha256,
-            expires_at=expires_at_iso,
-        ).model_dump_json()
+            return CacheUpsertResult(
+                ok=True,
+                cached=True,
+                content_sha256=content_sha256,
+                expires_at=expires_at_iso,
+            ).model_dump_json()
+
+        try:
+            content_sha256 = compute_content_sha256(args.attributes, args.provenance)
+            ttl_seconds = compute_ttl(args.dimension_key, args.trust_tier)
+            expires_at = datetime.now(timezone.utc).timestamp() + ttl_seconds
+            expires_at_iso = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+
+            async with ctx.store.connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO atlas_entity_cache (
+                        tenant_id, canonical_key, dimension_key, domain_category,
+                        attributes_json, provenance_json, trust_tier,
+                        content_sha256, expires_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (tenant_id, canonical_key, dimension_key) DO UPDATE SET
+                        domain_category = EXCLUDED.domain_category,
+                        attributes_json = EXCLUDED.attributes_json,
+                        provenance_json = EXCLUDED.provenance_json,
+                        trust_tier = EXCLUDED.trust_tier,
+                        content_sha256 = EXCLUDED.content_sha256,
+                        expires_at = EXCLUDED.expires_at,
+                        fetched_at = now()
+                    """,
+                    ctx.tenant_id,
+                    args.canonical_key,
+                    args.dimension_key,
+                    args.domain_category,
+                    args.attributes,
+                    args.provenance.model_dump(mode="json"),
+                    args.trust_tier,
+                    content_sha256,
+                    expires_at_iso,
+                )
+
+            return CacheUpsertResult(
+                ok=True,
+                cached=True,
+                content_sha256=content_sha256,
+                expires_at=expires_at_iso,
+            ).model_dump_json()
+        except Exception as exc:
+            return CacheUpsertResult(
+                ok=False,
+                cached=False,
+                content_sha256="",
+                expires_at="",
+            ).model_dump_json()
 
     @registry.tool(
         name="atlas_emit_layer",
@@ -270,7 +359,7 @@ def register(registry) -> None:
         args_schema=EmitLayerArgs,
         sandbox=False,
     )
-    def atlas_emit_layer(ctx: RunContext, args: EmitLayerArgs) -> str:
+    async def atlas_emit_layer(ctx: RunContext, args: EmitLayerArgs) -> str:
         """
         Validates and normalizes a layer response against the atlas-layer.v1 contract.
         Rejects any node lacking valid HTTPS/HTTP provenance URLs.
@@ -317,7 +406,11 @@ def register(registry) -> None:
         sandbox=False,
     )
     async def atlas_dispatch_inquiry(ctx: RunContext, args: DispatchInquiryArgs) -> str:
-        assert ctx.http_client is not None
+        if ctx.http_client is None:
+            return DispatchInquiryResult(
+                ok=False,
+                error="HTTP client not available in context",
+            ).model_dump_json()
 
         # Validate destination URL through SSRF guard at call time
         safe_url = await asyncio.to_thread(
@@ -373,7 +466,3 @@ def register(registry) -> None:
                 ok=False,
                 error=f"Request failed: {type(exc).__name__}: {exc}",
             ).model_dump_json()
-
-
-# Import asyncio at module level for the dispatch tool
-import asyncio

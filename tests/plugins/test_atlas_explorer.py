@@ -85,7 +85,7 @@ class TestAtlasCacheUpsert:
 class TestAtlasEmitLayer:
     """Tests for atlas_emit_layer tool."""
 
-    def test_emit_layer_valid_envelope(self, atlas_registry, mock_ctx):
+    async def test_emit_layer_valid_envelope(self, atlas_registry, mock_ctx):
         """Valid atlas-layer.v1 envelope should pass validation and return digest."""
         tool = atlas_registry.tools["atlas_emit_layer"]
         valid_payload = {
@@ -115,7 +115,7 @@ class TestAtlasEmitLayer:
             }],
             "available_actions": []
         }
-        result = tool.handler(mock_ctx, tool.args_schema(payload=valid_payload))
+        result = await tool.handler(mock_ctx, tool.args_schema(payload=valid_payload))
         data = json.loads(result)
         assert data["ok"] is True
         assert data["layer_digest"] is not None
@@ -123,7 +123,7 @@ class TestAtlasEmitLayer:
         assert data["envelope"] is not None
         assert data["envelope"]["schema_version"] == "atlas-layer.v1"
 
-    def test_emit_layer_rejects_invalid_schema(self, atlas_registry, mock_ctx):
+    async def test_emit_layer_rejects_invalid_schema(self, atlas_registry, mock_ctx):
         """Invalid envelope (missing required fields) should fail validation."""
         tool = atlas_registry.tools["atlas_emit_layer"]
         invalid_payload = {
@@ -131,14 +131,14 @@ class TestAtlasEmitLayer:
             "layer_depth": 1,
             # Missing required fields: parent_node_id, domain_category, nodes, etc.
         }
-        result = tool.handler(mock_ctx, tool.args_schema(payload=invalid_payload))
+        result = await tool.handler(mock_ctx, tool.args_schema(payload=invalid_payload))
         data = json.loads(result)
         assert data["ok"] is False
         assert data["error"] == "schema_validation_failed"
         assert data["details"] is not None
         assert len(data["details"]) > 0
 
-    def test_emit_layer_rejects_javascript_uri(self, atlas_registry, mock_ctx):
+    async def test_emit_layer_rejects_javascript_uri(self, atlas_registry, mock_ctx):
         """Envelope with javascript: URI in provenance should be rejected."""
         tool = atlas_registry.tools["atlas_emit_layer"]
         payload = {
@@ -161,12 +161,12 @@ class TestAtlasEmitLayer:
             "available_drilldowns": [],
             "available_actions": []
         }
-        result = tool.handler(mock_ctx, tool.args_schema(payload=payload))
+        result = await tool.handler(mock_ctx, tool.args_schema(payload=payload))
         data = json.loads(result)
         assert data["ok"] is False
         assert "Disallowed URI scheme" in data["error"]
 
-    def test_emit_layer_rejects_data_uri(self, atlas_registry, mock_ctx):
+    async def test_emit_layer_rejects_data_uri(self, atlas_registry, mock_ctx):
         """Envelope with data: URI in provenance should be rejected."""
         tool = atlas_registry.tools["atlas_emit_layer"]
         payload = {
@@ -189,12 +189,12 @@ class TestAtlasEmitLayer:
             "available_drilldowns": [],
             "available_actions": []
         }
-        result = tool.handler(mock_ctx, tool.args_schema(payload=payload))
+        result = await tool.handler(mock_ctx, tool.args_schema(payload=payload))
         data = json.loads(result)
         assert data["ok"] is False
         assert "Disallowed URI scheme" in data["error"]
 
-    def test_emit_layer_accepts_http_https(self, atlas_registry, mock_ctx):
+    async def test_emit_layer_accepts_http_https(self, atlas_registry, mock_ctx):
         """Envelope with http/https URLs should be accepted."""
         tool = atlas_registry.tools["atlas_emit_layer"]
         for url in ["https://tmc.gov.in", "http://example.com/page"]:
@@ -218,7 +218,7 @@ class TestAtlasEmitLayer:
                 "available_drilldowns": [],
                 "available_actions": []
             }
-            result = tool.handler(mock_ctx, tool.args_schema(payload=payload))
+            result = await tool.handler(mock_ctx, tool.args_schema(payload=payload))
             data = json.loads(result)
             assert data["ok"] is True, f"URL {url} should be accepted"
 

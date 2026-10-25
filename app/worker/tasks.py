@@ -813,6 +813,10 @@ async def _async_execute_tool(
             True,
         )
 
+    # Open a store connection for tools that need database access
+    store = DistributedStore()
+    await store.init(pool_max=TASK_POOL_MAX, service=True)
+    
     async with httpx.AsyncClient() as http_client:
         # Create an egress meter for this tool invocation
         meter = InMemoryEgressMeter()
@@ -826,6 +830,7 @@ async def _async_execute_tool(
             allowed_secrets=allowed_secrets,
             _scoped_secrets=scoped_secrets,
             http_client=http_client,
+            store=store,
             effect_key=effect_key,
         )
         # Bind the egress policy and meter to context vars for egress_request
@@ -920,6 +925,8 @@ async def _async_execute_tool(
                 f"Runtime Error in '{fn_name}' ({type(exc).__name__}): {exc}",
                 True,
             )
+        finally:
+            await store.close()
 
 
 @celery_app.task(

@@ -34,6 +34,8 @@ class RunContext:
     allowed_secrets: set[str] = field(default_factory=set)
     _scoped_secrets: dict[str, str] = field(default_factory=dict, repr=False)
     http_client: httpx.AsyncClient | None = field(default=None, repr=False)
+    # Optional database store for tools that need direct DB access
+    store: Any = field(default=None, repr=False)
     # Stable per-invocation key; remote side effects should pass it as their idempotency key.
     effect_key: str = ""
 

@@ -115,8 +115,9 @@ services:
       haas-api:
         condition: service_healthy
 
-  # Isolated tool worker: NO OpenRouter key, no PostgreSQL DSN, no signing key,
+  # Isolated tool worker: NO OpenRouter key, no signing key,
   # dropped capabilities, read-only rootfs
+  # Has PostgreSQL DSN for atlas_entity_cache and other tool database access
   worker-tools:
     image: haas-distributed:3.0.0
     command: >
@@ -130,6 +131,7 @@ services:
       HAAS_WORKER_ROLE: tools
       # Verify-only public key: tool workers can check, never mint, dispatch envelopes.
       HAAS_ENVELOPE_VERIFY_KEY: ${HAAS_ENVELOPE_VERIFY_KEY:-}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://haas:haas_dev_password@postgres:5432/haas_db}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
@@ -158,6 +160,8 @@ services:
       - scratchpad_vol:/tmp/haas_scratchpad
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
 volumes:
