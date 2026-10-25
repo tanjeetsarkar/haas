@@ -474,6 +474,7 @@ class WorkflowMixin:
                 try:
                     await publisher(message)
                 except Exception as exc:
+                    log.warning("outbox publish failed for %s", row["message_id"], exc_info=True)
                     attempts = int(row["attempts"]) + 1
                     await conn.execute(
                         "UPDATE outbox_messages SET attempts = $2::int, last_error = $3, "

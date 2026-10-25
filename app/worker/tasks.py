@@ -26,6 +26,7 @@ from app.core.context import (
 )
 from app.core.credentials import (
     GrantError,
+    open_egress_policy,
     prepare_tool_dispatch,
     redeem_grants,
 )
@@ -633,7 +634,7 @@ def execute_tool_task(
     *,
     envelope: dict[str, Any],
     credential_grants: list[str] | None = None,
-    egress_policy: EgressPolicy | None = None,
+    egress_policy: dict | None = None,
 ) -> dict[str, Any]:
     """
     Runs on `worker-tools` (`q_tools_fast` or `q_tools_sandbox`).
@@ -648,7 +649,7 @@ def execute_tool_task(
         _execute_envelope(
             body, 
             credential_grants=credential_grants or [],
-            egress_policy=egress_policy,
+            egress_policy=open_egress_policy(egress_policy, invocation_id=body["invocation_id"]),
         )
     )
     cast(Task, record_tool_outcome_task).apply_async(

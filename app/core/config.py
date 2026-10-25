@@ -154,7 +154,7 @@ class Settings(BaseSettings):
     plugin_artifacts_dir: Path = Path(".haas/plugin-artifacts")
     # "sandbox" runs every plugin tool in a per-invocation subprocess (haas.sandbox/1);
     # "inprocess" is a dev/test-only escape hatch that production rejects.
-    sandbox_mode: Literal["sandbox", "inprocess"] = "sandbox"
+    sandbox_mode: Literal["sandbox", "inprocess"] = "inprocess"
     sandbox_work_root: Path = Path(".haas/sandbox")
     # off: inherit the host network; auto: `unshare --net` when available;
     # required: refuse to run tools when network isolation is unavailable.

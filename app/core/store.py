@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -917,12 +918,10 @@ class DistributedStore(
             for name in names:
                 row = await conn.fetchrow(
                     """
-                    SELECT encrypted_value, provider, provider_reference,
-                           allowed_plugins, allowed_tools, version
+                    SELECT binding_id, encrypted_value, provider, provider_reference,
+                    allowed_plugins, allowed_tools, version
                     FROM secret_bindings
-                    WHERE tenant_id = $1
-                      AND name = $2
-                      AND deleted_at IS NULL
+                    WHERE tenant_id = resolve_haas_tenant_uuid($1) AND name = $2 AND deleted_at IS NULL
                     """,
                     tenant_id,
                     name,
@@ -976,7 +975,7 @@ class DistributedStore(
                          source, binding_id, binding_version, audience,
                          plugin_digest, created_at, expires_at)
                     VALUES
-                        ($1::uuid, $2::text, $3::text, $4::text, $5::text,
+                        ($1::uuid, resolve_haas_tenant_uuid($2), $3::text, $4::text, $5::text,
                          $6::text, $7::uuid, $8::integer, $9::text,
                          $10::text, now(), $11::timestamptz)
                     ON CONFLICT (grant_id) DO NOTHING
@@ -991,7 +990,7 @@ class DistributedStore(
                     row.get("binding_version"),
                     row.get("audience", ""),
                     row.get("plugin_digest", ""),
-                    row["expires_at"],
+                    datetime.fromtimestamp(row["expires_at"], tz=timezone.utc),
                 )
 
     async def egress_policy_for_run(
@@ -1007,7 +1006,7 @@ class DistributedStore(
         async with self.connection() as conn:
             row = await conn.fetchrow(
                 "SELECT allow_hosts, allow_cidrs, max_bytes_per_run, version "
-                "FROM egress_policies WHERE tenant_id = $1",
+                "FROM egress_policies WHERE tenant_id = resolve_haas_tenant_uuid($1)",
                 tenant_id,
             )
             if row is None:
