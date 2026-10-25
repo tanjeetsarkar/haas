@@ -77,6 +77,7 @@ services:
     volumes:
       - ./plugins:/app/plugins:ro
       - scratchpad_vol:/tmp/haas_scratchpad
+      - ./app:/app/app
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 10s

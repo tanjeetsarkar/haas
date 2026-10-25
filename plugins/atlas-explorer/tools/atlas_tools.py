@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
-from app.core.config import settings
 from app.core.context import (
     RunContext,
-    ToolRemediationError,
     validate_safe_outbound_url,
 )
 
@@ -225,7 +221,7 @@ def register(registry) -> None:
             "Returns cached data if found and not expired. Read-only."
         ),
         args_schema=CacheLookupArgs,
-        sandbox=True,
+        sandbox=False,
     )
     async def atlas_cache_lookup(ctx: RunContext, args: CacheLookupArgs) -> str:
         # In production, this queries PostgreSQL atlas_entity_cache table.
@@ -247,7 +243,7 @@ def register(registry) -> None:
             "Does not require approval."
         ),
         args_schema=CacheUpsertArgs,
-        sandbox=True,
+        sandbox=False,
     )
     async def atlas_cache_upsert(ctx: RunContext, args: CacheUpsertArgs) -> str:
         # In production, this upserts into PostgreSQL atlas_entity_cache table.
@@ -272,7 +268,7 @@ def register(registry) -> None:
             "Returns validated envelope with SHA256 digest for HITL binding. Does not require approval."
         ),
         args_schema=EmitLayerArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def atlas_emit_layer(ctx: RunContext, args: EmitLayerArgs) -> str:
         """

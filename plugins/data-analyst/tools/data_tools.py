@@ -354,7 +354,7 @@ def register(registry) -> None:
             "column types. Creates scratch data only; does not modify any external system."
         ),
         args_schema=LoadArgs,
-        sandbox=True,
+        sandbox=False,
     )
     async def dataset_load(ctx: RunContext, args: LoadArgs) -> str:
         name = _check_name(args.name)
@@ -372,7 +372,7 @@ def register(registry) -> None:
         name="dataset_list",
         description="Lists the datasets loaded in this conversation with row counts. Read-only.",
         args_schema=ListArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def dataset_list(ctx: RunContext, args: ListArgs) -> str:
         conn = _open_ro(_db_path(ctx))
@@ -406,7 +406,7 @@ def register(registry) -> None:
             "min/max, mean/median (numeric) or top values (text), plus 5 sample rows. Read-only."
         ),
         args_schema=NameArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def dataset_profile(ctx: RunContext, args: NameArgs) -> str:
         return json.dumps(_profile(_db_path(ctx), _check_name(args.name)))
@@ -418,7 +418,7 @@ def register(registry) -> None:
             "and returns columns and rows (limited). Writes, PRAGMA and ATTACH are rejected."
         ),
         args_schema=QueryArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def dataset_query(ctx: RunContext, args: QueryArgs) -> str:
         return json.dumps(_query(_db_path(ctx), args.sql, args.max_rows), default=str)

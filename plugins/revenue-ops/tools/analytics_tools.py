@@ -87,7 +87,7 @@ def register(registry) -> None:
         name="query_revenue_metrics",
         description="Returns monthly revenue per segment for a quarter, MoM change, and flagged anomalies/duplicate invoices.",
         args_schema=QueryRevenueArgs,
-        sandbox=True,
+        sandbox=False,
     )
     def query_revenue_metrics(ctx: RunContext, args: QueryRevenueArgs) -> str:
         months = _months_for(args.quarter)
@@ -151,7 +151,7 @@ def register(registry) -> None:
         description="Creates a refund batch for confirmed duplicate/erroneous invoices. Requires human approval.",
         args_schema=RefundBatchArgs,
         requires_approval=True,
-        sandbox=True,
+        sandbox=False,
     )
     def prepare_refund_batch(ctx: RunContext, args: RefundBatchArgs) -> str:
         conn = _open_db(ctx)

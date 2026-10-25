@@ -1456,8 +1456,10 @@ async def get_plugins(
     x_tenant_id: str = Header(default="default-tenant"),
 ) -> dict[str, Any]:
     identity = get_authenticated_identity(request)
+    log.info(f"check identity {identity}")
     if identity is not None:
         policy = await _get_tenant_policy(x_tenant_id)
+        log.info(f"check policy {policy}")
         plugin_access = policy.resolve_plugin_access(registry)
         tenant_list: Collection[str] | None = plugin_access.skill_names
         plugin_ids: set[str] | frozenset[str] = plugin_access.plugin_ids
