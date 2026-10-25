@@ -89,6 +89,100 @@ export const MillerColumn: React.FC<MillerColumnProps> = ({
     );
   }
 
+  if (isLoading && envelope.nodes.length > 0) {
+    // Show loading state even with nodes - skeleton placeholders
+    return (
+      <div className={`miller-column ${isLast ? 'last' : ''}`} style={columnStyle} role="region" aria-label={`Layer ${layerDepth}: ${envelope.domain_category}`}>
+        <div className="miller-column-header">
+          <h2>
+            Layer {layerDepth}
+            <span className="layer-domain">({envelope.domain_category})</span>
+          </h2>
+          {column.parentNodeId && (
+            <span className="miller-column-breadcrumb">
+              ← {column.parentNodeId}
+            </span>
+          )}
+          {envelope.nodes.length > 0 && (
+            <span className="miller-column-count">
+              {envelope.nodes.length} result{envelope.nodes.length !== 1 ? 's' : ''}
+            </span>
+          )}
+        </div>
+
+        <div className="miller-column-content">
+          {envelope.nodes.map((node: AtlasLayerNode) => (
+            <NodeComponent
+              key={node.node_id}
+              node={node}
+              onDrillDown={(dimensionKey, prompt) => 
+                onDrillDown(column, node, dimensionKey, prompt)
+              }
+              availableDrilldowns={availableDrilldowns}
+              availableActions={availableActions}
+            />
+          ))}
+
+          {envelope.nodes.length === 0 && !isLoading && (
+            <div className="miller-column-empty">
+              <p>No results found for this layer</p>
+            </div>
+          )}
+
+          {/* Drill-down chips at bottom of column */}
+          {availableDrilldowns.length > 0 && (
+            <div className="miller-column-drilldowns">
+              <h3>Drill down further</h3>
+              <div className="drilldown-chips">
+                {availableDrilldowns.map((drilldown: { dimension_key: string; label: string; prompt_template: string }) => (
+                  <button
+                    key={drilldown.dimension_key}
+                    className="drilldown-chip"
+                    onClick={() => {
+                      const prompt = drilldown.prompt_template
+                        .replace('{entity}', envelope.nodes[0]?.title || '');
+                      onDrillDown(column, envelope.nodes[0], drilldown.dimension_key, prompt);
+                    }}
+                    disabled={envelope.nodes.length === 0}
+                  >
+                    {drilldown.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Action chips */}
+          {availableActions.length > 0 && (
+            <div className="miller-column-actions">
+              <h3>Available actions</h3>
+              <div className="action-chips">
+                {availableActions.map((action: { action_id: string; label: string; tool_name: string; requires_approval: boolean }) => (
+                  <button
+                    key={action.action_id}
+                    className={`action-chip ${action.requires_approval ? 'requires-approval' : ''}`}
+                    disabled={envelope.nodes.length === 0}
+                  >
+                    {action.label}
+                    {action.requires_approval && (
+                      <span className="approval-badge" title="Requires human approval">🔒</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Resize handle for non-last columns */}
+        {!isLast && (
+          <div className="miller-column-resizer" aria-label="Resize column" />
+        )}
+      </div>
+    );
+  }
+
+  // Normal rendering when not loading
   return (
     <div 
       className={`miller-column ${isLast ? 'last' : ''}`}
@@ -146,7 +240,7 @@ export const MillerColumn: React.FC<MillerColumnProps> = ({
                       .replace('{entity}', envelope.nodes[0]?.title || '');
                     onDrillDown(column, envelope.nodes[0], drilldown.dimension_key, prompt);
                   }}
-                  disabled={envelope.nodes.length === 0}
+                  disabled={envelope.nodes.length === 0 || isLoading}
                 >
                   {drilldown.label}
                 </button>

@@ -25,6 +25,10 @@ interface ColumnState {
   isLoading: boolean;
 }
 
+interface AtlasExplorerState {
+  isGlobalLoading: boolean;
+}
+
 export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
   sessionManager,
   initialQuery,
@@ -38,6 +42,7 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
     runId: string;
   } | null>(null);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [isGlobalLoading, setIsGlobalLoading] = useState(false);
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
 
@@ -69,7 +74,7 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
               threadId: '', // Will be set from run context
               branchVersion: 0, // Will be set from run context
               runId: currentRunIdRef.current || '',
-              isLoading: false,
+              isLoading: false, // Loading complete when we receive output
             };
 
             if (existingIndex >= 0) {
@@ -81,6 +86,12 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
               return [...prev, newColumn];
             }
           });
+          // Hide global loading when we receive output delta
+          setIsGlobalLoading(false);
+        }
+        // If no envelope but nodes are loading, maintain current loading state
+        else if (event.data.output_delta?.nodes !== undefined) {
+          // Partial update - maintain current loading state
         }
         break;
       }
@@ -100,6 +111,7 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
         setGlobalError(errorMsg);
         onError?.(new Error(errorMsg));
         setColumns(prev => prev.map(c => ({ ...c, isLoading: false })));
+        setIsGlobalLoading(false);
         break;
       }
 
@@ -128,6 +140,13 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
   }, [onError]);
 
   const startExploration = useCallback(async (query: string) => {
+    // Validate query is not empty
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      setGlobalError('Please enter a valid query');
+      return;
+    }
+    
     setGlobalError(null);
     setColumns([]);
     
@@ -167,6 +186,21 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
     prompt: string
   ) => {
     setGlobalError(null);
+    
+    // Validate dimension key
+    const validDimensionKeys: DimensionKey[] = ['root', 'facilities', 'pricing', 'specialists', 'credentials', 'action'];
+    if (!validDimensionKeys.includes(dimensionKey as DimensionKey)) {
+      setGlobalError(`Invalid dimension key: ${dimensionKey}`);
+      onError?.(new Error(`Invalid dimension key: ${dimensionKey}`));
+      return;
+    }
+    
+    // Validate node exists
+    if (!node || !node.node_id) {
+      setGlobalError('Cannot drill down: no node selected');
+      onError?.(new Error('Cannot drill down: no node selected'));
+      return;
+    }
     
     try {
       const { branchedThreadId, runId, unsubscribe } = await sessionManager.drillDownLayer({
@@ -235,13 +269,20 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
 
   // Start initial exploration if query provided
   useEffect(() => {
-    if (initialQuery) {
-      startExploration(initialQuery);
-    }
-  }, [initialQuery, startExploration]);
+    // No longer auto-start exploration on mount
+    // User must explicitly click "Explore" to start
+    return undefined;
+  }, []);
 
   return (
     <div className="atlas-explorer">
+      {isGlobalLoading && (
+        <div className="atlas-global-loading" role="status">
+          <div className="spinner" aria-label="Loading exploration"></div>
+          <span>Loading exploration...</span>
+        </div>
+      )}
+
       {globalError && (
         <div className="atlas-error-banner" role="alert">
           <span>{globalError}</span>
@@ -271,7 +312,7 @@ export const AtlasExplorer: React.FC<AtlasExplorerProps> = ({
                 input.value = '';
               }
             }}
-            disabled={columns.some(c => c.isLoading)}
+            disabled={false}
           >
             Explore
           </button>
