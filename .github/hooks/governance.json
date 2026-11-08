@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .github/hooks/scripts/guard_paths.py",
+        "timeout": 10
+      }
+    ]
+  }
+}

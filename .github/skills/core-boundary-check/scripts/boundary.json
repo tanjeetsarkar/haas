@@ -1,0 +1,66 @@
+{
+  "$comment": "Config for check_boundaries.py. Core paths must never reference a specific plugin. Extra tokens catch names that differ from the plugin id. Allow entries need a reason and should be temporary.",
+  "core_paths": [
+    "app",
+    "migrations",
+    "haas_plugin_sdk",
+    "haas_sdk",
+    "haas_sdk_ts/src",
+    "haas_cli",
+    "web",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.dev.yml",
+    "docker-compose.prod.yml",
+    "deploy"
+  ],
+  "skip_dirs": [
+    "node_modules",
+    "dist",
+    "__pycache__",
+    ".venv",
+    "build"
+  ],
+  "extensions": [
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".css",
+    ".html",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".tf",
+    ".tpl",
+    ""
+  ],
+  "plugin_tokens": {
+    "atlas-explorer": [
+      "atlas"
+    ],
+    "web-research": [
+      "searxng"
+    ],
+    "revenue-ops": [
+      "billing_mcp",
+      "billing_webhook"
+    ]
+  },
+  "generic_ids": [
+    "weather"
+  ],
+  "allow": [
+    {
+      "path": "haas_plugin_sdk/__init__.py",
+      "token": "weather",
+      "reason": "Docstring example of the @tool decorator, not a dependency."
+    },
+    {
+      "path": "haas_cli/plugin.py",
+      "token": "github_list_issues",
+      "reason": "Example tool name in a validation error message."
+    }
+  ]
+}
