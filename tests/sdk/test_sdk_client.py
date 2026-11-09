@@ -16,6 +16,7 @@ from haas_sdk import (
     Haas,
     HaasConnectionError,
     NotFoundError,
+    PhaseConfig,
     RateLimitError,
     StreamClosedError,
     ValidationError,
@@ -149,6 +150,51 @@ def test_headers_and_run_create_with_idempotency_key() -> None:
     assert request.headers["idempotency-key"] == "k-1"
     assert request.headers["user-agent"].startswith("haas-sdk-python/")
     assert json.loads(request.content) == {"prompt": "hello", "max_steps": 3}
+
+
+def test_sync_run_create_serializes_explicit_phase_config_only() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            202,
+            json={
+                "run_id": "r1",
+                "status": "queued",
+                "stream_url": "/v1/runs/r1/stream",
+                "events_url": "/v1/runs/r1/events",
+            },
+        )
+
+    config = PhaseConfig(
+        version=1,
+        mode="bounded_acquisition_finalization",
+        reserve_basis_points=2000,
+    )
+    with _client(handler) as haas:
+        haas.runs.create("bounded", phase_config=config)
+        haas.runs.create("legacy", phase_config=None)
+    assert json.loads(seen[0].content) == {
+        "prompt": "bounded",
+        "phase_config": {
+            "version": 1,
+            "mode": "bounded_acquisition_finalization",
+            "reserve_basis_points": 2000,
+        },
+    }
+    assert json.loads(seen[1].content) == {"prompt": "legacy"}
+
+
+def test_phase_config_rejects_non_v1_values_and_extra_fields() -> None:
+    with pytest.raises(ValueError, match="version must be 1"):
+        PhaseConfig(version=2)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="mode must be"):
+        PhaseConfig(mode="other")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="reserve_basis_points must be 2000"):
+        PhaseConfig(reserve_basis_points=1000)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        PhaseConfig(extra="no")  # type: ignore[call-arg]
 
 
 def test_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1125,3 +1171,34 @@ async def test_async_client_mirrors_sync_behaviour() -> None:
     assert stream_requests[1].headers["last-event-id"] == "1"
     assert [b.batch_id for b in batches] == ["b1"]
     assert run.is_terminal
+
+
+async def test_async_run_create_serializes_explicit_phase_config_only() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            202,
+            json={
+                "run_id": "r1",
+                "status": "queued",
+                "stream_url": "/v1/runs/r1/stream",
+                "events_url": "/v1/runs/r1/events",
+            },
+        )
+
+    async with AsyncHaas(
+        base_url="http://haas.test",
+        api_key="hk_test_abc",
+        transport=httpx.MockTransport(handler),
+    ) as haas:
+        await haas.runs.create("bounded", phase_config=PhaseConfig())
+    assert json.loads(requests[0].content) == {
+        "prompt": "bounded",
+        "phase_config": {
+            "version": 1,
+            "mode": "bounded_acquisition_finalization",
+            "reserve_basis_points": 2000,
+        },
+    }

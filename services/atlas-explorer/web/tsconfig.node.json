@@ -4,8 +4,11 @@
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "target": "ES2022",
+    "types": ["node"],
+    "typeRoots": ["./node_modules/@types", "./node_modules/@haas/sdk/node_modules/@types"],
     "allowSyntheticDefaultImports": true,
     "strict": true
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts", "dev/**/*.ts"]
 }

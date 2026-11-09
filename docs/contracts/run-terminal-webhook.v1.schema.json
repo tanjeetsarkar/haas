@@ -38,7 +38,10 @@
         "approval.expired",
         "recovery.exhausted",
         "execution.failed",
-        "run.failed"
+        "run.failed",
+        "phase.finalizer_tool_calls",
+        "phase.finalizer_failed",
+        "phase.finalizer_outcome_unknown"
       ]
     }
   },

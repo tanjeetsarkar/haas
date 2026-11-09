@@ -371,6 +371,7 @@ def test_root_exports_and_supported_import_paths() -> None:
     from haas_sdk.errors import NotFoundError as NotFoundErrorModule
     from haas_sdk.handles import AsyncRunHandle, RunHandle
     from haas_sdk.models import Run as RunModule
+    from haas_sdk.phase_config import PhaseConfig as PhaseConfigModule
 
     assert set(haas_sdk.__all__) == {
         "APIError",
@@ -406,6 +407,7 @@ def test_root_exports_and_supported_import_paths() -> None:
         "Membership",
         "NotFoundError",
         "Page",
+        "PhaseConfig",
         "PendingCall",
         "PermissionDeniedError",
         "PluginCatalog",
@@ -440,6 +442,7 @@ def test_root_exports_and_supported_import_paths() -> None:
     assert haas_sdk.Haas is HaasModule
     assert haas_sdk.AsyncHaas is AsyncHaasModule
     assert haas_sdk.Run is RunModule
+    assert haas_sdk.PhaseConfig is PhaseConfigModule
     assert haas_sdk.NotFoundError is NotFoundErrorModule
     assert haas_sdk.RunHandle is RunHandle
     assert haas_sdk.AsyncRunHandle is AsyncRunHandle

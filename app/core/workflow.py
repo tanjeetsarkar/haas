@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -20,6 +21,14 @@ from uuid import UUID, uuid4
 
 from app.core.config import settings
 from app.core.envelope import sha256_hex
+from app.core.plugins import CORE_TOOL_NAMES
+from app.core.run_phases import (
+    PhaseBudget, PhaseConfig, PhaseState, advance_after_acquisition, calculate_quota,
+    mark_finalizer_outcome_unknown, settle_finalizer, validate_phase_transition,
+)
+from app.core.run_restrictions import (
+    RestrictionError, check_dispatch_authority, decode_authority,
+)
 
 log = logging.getLogger("haas.workflow")
 
@@ -37,7 +46,10 @@ _ERROR_CODES = (
     ("Run exceeded its recovery attempts", "recovery.exhausted"),
     ("Orchestrator step failed", "execution.failed"),
 )
-RUN_ERROR_CODES = frozenset(code for _, code in _ERROR_CODES) | {"run.failed"}
+RUN_ERROR_CODES = frozenset(code for _, code in _ERROR_CODES) | {
+    "run.failed", "phase.finalizer_tool_calls", "phase.finalizer_failed",
+    "phase.finalizer_outcome_unknown",
+}
 WEBHOOK_SCHEMA = "run-terminal-webhook.v1"
 
 
@@ -119,6 +131,7 @@ def loads(value: Any) -> Any:
 
 def decode_run(row: Any) -> dict[str, Any]:
     d = dict(row)
+    d["authority"] = decode_authority(d.get("authority_json"))
     d["active_skills"] = loads(d["active_skills_json"])
     d["messages"] = loads(d["messages_checkpoint_json"])
     d["fingerprints"] = loads(d["fingerprints_json"])
@@ -339,6 +352,7 @@ class WorkflowMixin:
         cost_delta: Decimal = Decimal(0),
         batch_status: str = "cancelled",
         step_count: int | None = None,
+        failure_code: str | None = None,
     ) -> None:
         run_id, tenant_id = row["run_id"], row["tenant_id"]
         final_messages = (
@@ -432,7 +446,7 @@ class WorkflowMixin:
             else:
                 body["error"] = result_text or f"Run {status}."
                 if status == "failed":
-                    body["code"] = run_error_code(body["error"])
+                    body["code"] = failure_code or run_error_code(body["error"])
             await self._enqueue(
                 conn,
                 fx,
@@ -535,6 +549,9 @@ class WorkflowMixin:
         async with self.connection() as conn:
             row = await self._lock_run(conn, run_id)
             if row is None:
+                return None
+            # Temporary fail-closed storage hold, independent of broker contents.
+            if row.get("authority_json") is not None:
                 return None
             fresh = await conn.fetchval(
                 "INSERT INTO consumer_inbox (consumer, tenant_id, message_id, run_id) "
@@ -673,6 +690,8 @@ class WorkflowMixin:
         ticket: StepTicket | None = None
         async with self.connection() as conn:
             row = await self._fenced(conn, lease)
+            if row["phase_config_json"] is not None or row["phase_state_json"] is not None:
+                raise ValueError("phase.requires_bounded_ledger")
             stale = await conn.fetchval(
                 "WITH s AS (UPDATE usage_ledger SET settlement_status = 'uncertain', "
                 "settled_at = now() WHERE tenant_id = $1 AND run_id = $2 "
@@ -757,6 +776,338 @@ class WorkflowMixin:
                 ticket = StepTicket(step, attempt, model, estimate_usd, key)
         await self._after_commit(fx)
         return ticket
+
+    async def begin_bounded_phase_step(
+        self, lease: Lease, *, step: int, model: str, estimate_usd: Decimal,
+        finalization: bool, no_tool_response: bool = False,
+        acquisition_quota_exhausted: bool = False,
+    ) -> StepTicket | None:
+        """Atomically authorize one acquisition or finalization model dispatch.
+
+        For either phase, the run-locked transaction commits the step ticket and
+        usage reservation as the logical point of no return, serialized with
+        cancellation. Cancellation before commit prevents dispatch; after commit
+        it cannot undo a possibly in-flight call. Never dispatch a claimed ticket
+        twice, including after cancellation or recovery. A lost acquisition result
+        leaves uncertain usage and fails closed rather than authorizing a retry.
+        For finalization the caller establishes the trigger from durable state.
+        """
+        if not isinstance(estimate_usd, Decimal) or not estimate_usd.is_finite() or estimate_usd < 0:
+            raise ValueError("phase.invalid_estimate")
+        if any(type(value) is not bool for value in (
+            finalization, no_tool_response, acquisition_quota_exhausted,
+        )):
+            raise ValueError("phase.invalid_trigger")
+        fx = Effects()
+        ticket: StepTicket | None = None
+        async with self.connection() as conn:
+            row = await self._lock_run(conn, lease.run_id, lease.tenant_id)
+            if (
+                row is None or row["status"] != "running"
+                or row["lease_epoch"] != lease.epoch or row["state_version"] != lease.version
+            ):
+                raise LeaseLostError(lease.run_id)
+            if row["phase_config_json"] is None or row["phase_state_json"] is None:
+                raise ValueError("phase.not_enabled")
+            config_data = loads(row["phase_config_json"])
+            state_data = loads(row["phase_state_json"])
+            if (
+                not isinstance(config_data, dict)
+                or set(config_data) != set(PhaseConfig.model_fields)
+                or not isinstance(state_data, dict)
+                or set(state_data) != set(PhaseState.model_fields)
+                or type(config_data["version"]) is not int
+                or type(config_data["reserve_basis_points"]) is not int
+                or type(state_data["version"]) is not int
+            ):
+                raise ValueError("phase.invalid_storage")
+            config = PhaseConfig.model_validate(config_data)
+            state = PhaseState.model_validate(state_data)
+            if state.finalizer_attempted:
+                if state.phase == "finalization":
+                    unknown = validate_phase_transition(state, mark_finalizer_outcome_unknown(state))
+                    await conn.execute(
+                        "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+                        row["run_id"], unknown.model_dump_json(),
+                    )
+                    await conn.execute(
+                        "UPDATE usage_ledger SET settlement_status='uncertain', "
+                        "settled_at=now() WHERE tenant_id=$1 AND run_id=$2 "
+                        "AND source_attempt_key=$3 AND unit='model_usd' "
+                        "AND settlement_status='reserved'",
+                        row["tenant_id"], row["run_id"], state.finalizer_attempt_key,
+                    )
+                    await conn.execute(
+                        "UPDATE run_steps SET status='abandoned', completed_at=now() "
+                        "WHERE tenant_id=$1 AND run_id=$2 AND status='model_running'",
+                        row["tenant_id"], row["run_id"],
+                    )
+                    message = "Orchestrator step failed: finalizer outcome unknown."
+                    await self._finalize(
+                        conn, fx, row, "failed", message,
+                        failure_code="phase.finalizer_outcome_unknown",
+                        events=[("run_error", {"error": message, "code": "phase.finalizer_outcome_unknown"})],
+                    )
+                else:
+                    raise ValueError("phase.finalizer_already_attempted")
+            else:
+                if state.phase != "acquisition":
+                    raise ValueError("phase.not_acquiring")
+                if step != int(row["step_count"]) + 1:
+                    raise ValueError("phase.invalid_step")
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM run_steps WHERE tenant_id=$1 "
+                    "AND run_id=$2 AND status='model_running')",
+                    row["tenant_id"], row["run_id"],
+                ):
+                    raise ValueError("phase.model_attempt_inflight")
+                quota = calculate_quota(
+                    config,
+                    PhaseBudget(
+                        max_steps=int(row["max_steps"]),
+                        max_cost_usd=dec(row["max_cost_usd"]),
+                        max_tool_invocations=int(row["max_tool_invocations"]),
+                    ),
+                    estimated_finalizer_cost_usd=Decimal(0),
+                )
+                if finalization and state.successful_tool_outcomes < 1:
+                    raise ValueError("phase.success_required")
+                if finalization and not (no_tool_response or acquisition_quota_exhausted):
+                    raise ValueError("phase.trigger_required")
+                if not finalization and (no_tool_response or acquisition_quota_exhausted):
+                    raise ValueError("phase.unexpected_trigger")
+                ceiling = (
+                    dec(row["max_cost_usd"]) if finalization
+                    else quota.acquisition_max_cost_usd
+                )
+                # NUMERIC addition in PostgreSQL is exact and independent of the
+                # worker's ambient Decimal context, including for tiny overruns.
+                cost_check = await conn.fetchrow(
+                    "SELECT $1::numeric + $2::numeric + $3::numeric + $4::numeric "
+                    "<= $5::numeric AS fits, "
+                    "$1::numeric + $2::numeric + $3::numeric < $5::numeric AS remaining",
+                    dec(row["total_cost_usd"]), await self._uncertain_cost(conn, row),
+                    row["budget_reserved_usd"], estimate_usd, ceiling,
+                )
+                allowed_step = (
+                    int(row["max_steps"]) if finalization else quota.acquisition_max_steps
+                )
+                if (
+                    step > allowed_step or not cost_check["fits"]
+                    or (not finalization and not cost_check["remaining"])
+                    or (finalization and estimate_usd > quota.finalization_reserved_cost_usd)
+                    or (row["deadline_at"] is not None and row["deadline_at"] <= _utc())
+                ):
+                    if finalization:
+                        failed = advance_after_acquisition(
+                            state, successful_non_control_tool_outcome=False,
+                            no_tool_response=no_tool_response,
+                            acquisition_quota_exhausted=acquisition_quota_exhausted,
+                            finalizer_capacity_available=False,
+                        )
+                        validate_phase_transition(state, failed)
+                        await conn.execute(
+                            "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+                            row["run_id"], failed.model_dump_json(),
+                        )
+                        message = "Orchestrator step failed: insufficient phase budget or deadline."
+                        await self._finalize(
+                            conn, fx, row, "failed", message,
+                            events=[("run_error", {"error": message})],
+                        )
+                else:
+                    attempt = int(await conn.fetchval(
+                        "SELECT COALESCE(max(attempt), 0) + 1 FROM run_steps "
+                        "WHERE tenant_id=$1 AND run_id=$2 AND step_number=$3",
+                        row["tenant_id"], row["run_id"], step,
+                    ))
+                    key = f"{row['run_id']}:step:{step}:attempt:{attempt}"
+                    if finalization:
+                        claimed = advance_after_acquisition(
+                            state, successful_non_control_tool_outcome=False,
+                            no_tool_response=no_tool_response,
+                            acquisition_quota_exhausted=acquisition_quota_exhausted,
+                            finalizer_capacity_available=True, finalizer_attempt_key=key,
+                        )
+                        validate_phase_transition(state, claimed)
+                        await conn.execute(
+                            "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+                            row["run_id"], claimed.model_dump_json(),
+                        )
+                    await conn.execute(
+                        "INSERT INTO run_steps (tenant_id,run_id,step_number,attempt,"
+                        "lease_epoch,model,status,reserved_usd) "
+                        "VALUES ($1,$2,$3,$4,$5,$6,'model_running',$7)",
+                        row["tenant_id"], row["run_id"], step, attempt,
+                        lease.epoch, model, estimate_usd,
+                    )
+                    await conn.execute(
+                        "INSERT INTO usage_ledger (entry_id,tenant_id,run_id,"
+                        "source_attempt_key,unit,quantity,cost_usd,settlement_status,"
+                        "pricing_revision) VALUES ($1,$2,$3,$4,'model_usd',$5,$5,"
+                        "'reserved',$6)",
+                        uuid4(), row["tenant_id"], row["run_id"], key,
+                        estimate_usd, settings.pricing_revision,
+                    )
+                    await self._bump(
+                        conn, lease, "budget_reserved_usd = budget_reserved_usd + $2::numeric",
+                        estimate_usd,
+                    )
+                    ticket = StepTicket(step, attempt, model, estimate_usd, key)
+        await self._after_commit(fx)
+        return ticket
+
+    async def settle_bounded_finalizer(
+        self, lease: Lease, ticket: StepTicket, *, completion: Any | None,
+        rejected: bool = False,
+    ) -> str:
+        """Settle a claimed finalizer; cancelled late results never revive a run."""
+        fx = Effects()
+        async with self.connection() as conn:
+            row = await self._lock_run(conn, lease.run_id, lease.tenant_id)
+            if row is None or row["phase_state_json"] is None:
+                raise LeaseLostError(lease.run_id)
+            state = PhaseState.model_validate(loads(row["phase_state_json"]))
+            if (
+                state.finalizer_attempt_key != ticket.attempt_key
+                or ticket.attempt_key != f"{lease.run_id}:step:{ticket.step}:attempt:{ticket.attempt}"
+                or not (
+                    state.phase == "finalization"
+                    or (state.phase == "failed" and state.failure_code == "finalizer_outcome_unknown")
+                )
+            ):
+                raise LeaseLostError(lease.run_id)
+            live = (
+                row["status"] == "running" and row["lease_epoch"] == lease.epoch
+                and row["state_version"] == lease.version
+            )
+            terminal = row["status"] in ("cancelled", "failed")
+            if not live and not terminal:
+                raise LeaseLostError(lease.run_id)
+            ledger = await conn.fetchrow(
+                "SELECT l.settlement_status FROM usage_ledger l JOIN run_steps s "
+                "ON s.tenant_id=l.tenant_id AND s.run_id=l.run_id "
+                "WHERE l.tenant_id=$1 AND l.run_id=$2 AND l.source_attempt_key=$3 "
+                "AND l.unit='model_usd' AND s.step_number=$4 AND s.attempt=$5 "
+                "AND l.source_attempt_key=(s.run_id || ':step:' || s.step_number::text "
+                "|| ':attempt:' || s.attempt::text) "
+                "AND s.lease_epoch=$6 AND s.reserved_usd=$7 FOR UPDATE OF l",
+                row["tenant_id"], row["run_id"], ticket.attempt_key, ticket.step,
+                ticket.attempt, lease.epoch, ticket.reserved_usd,
+            )
+            if ledger is None or ledger["settlement_status"] != (
+                "reserved" if live else "uncertain"
+            ):
+                raise LeaseLostError(lease.run_id)
+            if terminal:
+                # Cancellation or unknown-outcome recovery moved it to uncertain.
+                # A late response can resolve it once without reviving the run.
+                if completion is None:
+                    return str(row["status"])
+                if completion.cost_reported:
+                    cost = dec(completion.cost_usd)
+                    if not cost.is_finite() or cost < 0:
+                        raise ValueError("phase.invalid_actual_cost")
+                    await conn.execute(
+                        "UPDATE usage_ledger SET settlement_status='settled',cost_usd=$4,"
+                        "quantity=$4,settled_at=now() WHERE tenant_id=$1 AND run_id=$2 "
+                        "AND source_attempt_key=$3 AND unit='model_usd'",
+                        row["tenant_id"], row["run_id"], ticket.attempt_key, cost,
+                    )
+                    await conn.execute(
+                        "UPDATE runs SET total_cost_usd=total_cost_usd+$2::numeric WHERE run_id=$1",
+                        row["run_id"], cost,
+                    )
+                    await conn.execute(
+                        "UPDATE run_steps SET cost_usd=$5,cost_reported=true,prompt_tokens=$6,"
+                        "cached_tokens=$7,completion_tokens=$8 WHERE tenant_id=$1 AND run_id=$2 "
+                        "AND step_number=$3 AND attempt=$4",
+                        row["tenant_id"], row["run_id"], ticket.step, ticket.attempt, cost,
+                        completion.prompt_tokens, completion.cached_tokens,
+                        completion.completion_tokens,
+                    )
+                    for unit, quantity in (
+                        ("prompt_tokens", completion.prompt_tokens),
+                        ("completion_tokens", completion.completion_tokens),
+                    ):
+                        if quantity:
+                            await conn.execute(
+                                "INSERT INTO usage_ledger (entry_id,tenant_id,run_id,"
+                                "source_attempt_key,unit,quantity,settlement_status,"
+                                "pricing_revision,settled_at) "
+                                "VALUES ($1,$2,$3,$4,$5,$6,'settled',$7,now()) "
+                                "ON CONFLICT DO NOTHING",
+                                uuid4(), row["tenant_id"], row["run_id"], ticket.attempt_key,
+                                unit, quantity, settings.pricing_revision,
+                            )
+                return str(row["status"])
+
+            if completion is not None and completion.cost_reported:
+                cost = dec(completion.cost_usd)
+                if not cost.is_finite() or cost < 0:
+                    raise ValueError("phase.invalid_actual_cost")
+            else:
+                cost = ticket.reserved_usd
+            within_budget = await conn.fetchval(
+                "SELECT $1::numeric + $2::numeric + $3::numeric <= $4::numeric",
+                dec(row["total_cost_usd"]), await self._uncertain_cost(conn, row),
+                cost, dec(row["max_cost_usd"]),
+            )
+            content = completion.assistant_message.get("content") if completion is not None else None
+            succeeded = (
+                completion is not None and not rejected and within_budget
+                and isinstance(content, str) and bool(content.strip())
+                and not completion.assistant_message.get("tool_calls")
+            )
+            next_state = (
+                settle_finalizer(state, succeeded=succeeded)
+                if completion is not None else mark_finalizer_outcome_unknown(state)
+            )
+            validate_phase_transition(state, next_state)
+            from app.core.phase_failures import FINALIZER_TOOL_CALLS, phase_failure_code
+            marker = (FINALIZER_TOOL_CALLS if completion is not None
+                      and completion.assistant_message.get("tool_calls")
+                      else "phase.finalizer_failed")
+            failure_code = phase_failure_code(
+                next_state, finalizer_step_error=marker if not succeeded else None,
+            )
+            await conn.execute(
+                "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+                row["run_id"], next_state.model_dump_json(),
+            )
+            delta, _ = await self._settle(
+                conn, row, ticket,
+                cost_usd=completion.cost_usd if completion else 0,
+                cost_reported=completion.cost_reported if completion else False,
+                prompt_tokens=completion.prompt_tokens if completion else 0,
+                cached_tokens=completion.cached_tokens if completion else 0,
+                completion_tokens=completion.completion_tokens if completion else 0,
+                step_status="completed" if succeeded else "failed",
+                error=None if succeeded else marker,
+            )
+            text = content if succeeded and isinstance(content, str) else (
+                "Orchestrator step failed: finalizer rejected or outcome unknown."
+            )
+            messages = loads(row["messages_checkpoint_json"])
+            if succeeded and completion is not None:
+                messages = [*messages, completion.assistant_message]
+            kind = "completed" if succeeded else "failed"
+            total_cost = await conn.fetchval(
+                "SELECT $1::numeric + $2::numeric", dec(row["total_cost_usd"]), delta,
+            )
+            await self._finalize(
+                conn, fx, row, kind, text, messages=messages, cost_delta=delta,
+                failure_code=failure_code,
+                step_count=ticket.step,
+                events=[("run_completed", {
+                    "output": text, "steps_used": ticket.step,
+                    "total_cost_usd": round(float(total_cost), 6),
+                    "cached_tokens": completion.cached_tokens if completion else 0,
+                })
+                        if succeeded else ("run_error", {"error": text, "code": failure_code})],
+            )
+        await self._after_commit(fx)
+        return kind
 
     async def emit_step_started(self, lease: Lease, payload: dict[str, Any]) -> None:
         fx = Effects()
@@ -1042,6 +1393,15 @@ class WorkflowMixin:
         row: Any,
         invocations: list[dict[str, Any]],
     ) -> None:
+        authority = decode_authority(row.get("authority_json"))
+        if authority is not None:
+            for inv in invocations:
+                # All restricted work remains held. No invocation status/outbox
+                # writes, even for an otherwise permitted tool or approved batch.
+                check_dispatch_authority(
+                    authority, inv["tool_name"], policy_tools=(), unlocked_tools=(),
+                )
+            raise RestrictionError("restriction.unavailable")
         events: list[tuple[str, dict[str, Any]]] = []
         for inv in invocations:
             await conn.execute(
@@ -1089,7 +1449,25 @@ class WorkflowMixin:
     ) -> None:
         batch_id = uuid4()
         digest = batch_digest(row["run_id"], step, calls)
+        intent_calls = any("intent_proof" in call for call in calls)
+        if intent_calls:
+            from app.core.deterministic_intent import intent_batch_digest
+            digest = intent_batch_digest(row["run_id"], step, calls)
         expires = _utc(time.time() + settings.approval_ttl_sec)
+        if intent_calls:
+            # This locally produced signed proof can only shorten the batch TTL;
+            # it is not used as authorization or a substitute for verification.
+            proof_expiry = calls[0]["intent_proof"]["envelope"]["body"]["expires_at"]
+            if (
+                type(proof_expiry) not in (int, float)
+                or not math.isfinite(proof_expiry) or proof_expiry <= 0
+            ):
+                raise ValueError("restriction.approval_expiry")
+            # PostgreSQL timestamps are microsecond-resolution; round strictly
+            # downward so conversion cannot extend the signed float expiry.
+            expires = min(expires, _utc(proof_expiry) - timedelta(microseconds=1))
+            if row["deadline_at"] is not None:
+                expires = min(expires, row["deadline_at"])
         pending = [
             {
                 "id": tc["id"],
@@ -1101,6 +1479,8 @@ class WorkflowMixin:
             }
             for tc, inv in zip(calls, invocations, strict=True)
         ]
+        if intent_calls:
+            pending[0]["intent_proof"] = calls[0]["intent_proof"]
         await conn.execute(
             "INSERT INTO approval_batches (batch_id, tenant_id, run_id, step_number, "
             "batch_digest, run_state_version, tool_calls, expires_at) "
@@ -1184,6 +1564,10 @@ class WorkflowMixin:
         return bool(updated)
 
     async def _after_outcome(self, conn: Any, fx: Effects, row: Any) -> None:
+        if row.get("authority_json") is not None:
+            from app.core.intent_release import finalize_intent_outcome
+            await finalize_intent_outcome(self, conn, fx, row)
+            return
         outstanding = await conn.fetchval(
             "SELECT count(*) FROM tool_invocations WHERE tenant_id = $1 AND run_id = $2 "
             "AND status = 'dispatched'",
@@ -1242,7 +1626,48 @@ class WorkflowMixin:
     ) -> None:
         fx = Effects()
         async with self.connection() as conn:
-            await self._fenced(conn, lease)
+            row = await self._fenced(conn, lease)
+            if row["phase_config_json"] is not None:
+                if row["next_action"] not in ("aggregate", "decision"):
+                    raise ValueError("phase.aggregate_not_pending")
+                state = PhaseState.model_validate(loads(row["phase_state_json"]))
+                if state.phase != "acquisition":
+                    raise ValueError("phase.not_acquiring")
+                # Count the durable set, not caller-provided events or checkpoint
+                # messages. Replaying aggregation therefore cannot double-count.
+                outcomes = await conn.fetch(
+                    "SELECT tool_name,status,outcome FROM tool_invocations "
+                    "WHERE tenant_id=$1 AND run_id=$2 AND step_number <= $3",
+                    row["tenant_id"], row["run_id"], row["step_count"],
+                )
+                successes = 0
+                for outcome in outcomes:
+                    if outcome["status"] in ("awaiting_approval", "approved", "dispatched"):
+                        raise ValueError("phase.outcome_incomplete")
+                    if outcome["status"] != "succeeded":
+                        continue
+                    result = loads(outcome["outcome"])
+                    if (
+                        not isinstance(result, dict)
+                        or type(result.get("is_error")) is not bool
+                        or not isinstance(result.get("content"), str)
+                    ):
+                        raise ValueError("phase.invalid_outcome")
+                    if not result["is_error"] and outcome["tool_name"] not in CORE_TOOL_NAMES:
+                        successes += 1
+                if successes < state.successful_tool_outcomes:
+                    raise ValueError("phase.evidence_regression")
+                if successes > state.successful_tool_outcomes:
+                    following = PhaseState(**{
+                        **state.model_dump(),
+                        "successful_tool_outcomes": successes,
+                        "state_version": state.state_version + 1,
+                    })
+                    validate_phase_transition(state, following)
+                    await conn.execute(
+                        "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+                        row["run_id"], following.model_dump_json(),
+                    )
             await self._append_events(conn, fx, lease.tenant_id, lease.run_id, events)
             await self._bump(
                 conn,
@@ -1367,6 +1792,8 @@ class WorkflowMixin:
             row = await self._lock_run(conn, run_id, tenant_id)
             if row is None:
                 raise StoreNotFoundError("Run not found.")
+            if row.get("authority_json") is not None:
+                raise StoreConflictError("restriction.resume_unavailable")
             if idempotency_key is not None:
                 prior = await conn.fetchrow(
                     "SELECT batch_id, decision FROM approval_decisions "

@@ -1,0 +1,63 @@
+{
+  "valid": [
+    {
+      "schema_version": "atlas-exploration.v2", "exploration_id": "ambiguous", "revision": 0,
+      "root_query": "Synthetic ambiguous name",
+      "interpretation": { "kind": "ambiguous", "candidate_entity_ids": ["candidate"] },
+      "entities": [{
+        "entity_id": "candidate", "kind": "person", "title": "Synthetic candidate", "summary": "",
+        "identity_status": "candidate", "external_references": [], "facets": []
+      }],
+      "sources": [], "claims": [], "relationships": [], "occurrences": [], "paths": [],
+      "active_path_id": null, "requests": [], "actions": []
+    },
+    {
+      "schema_version": "atlas-exploration.v2", "exploration_id": "resolved", "revision": 1,
+      "root_query": "Synthetic concept", "interpretation": { "kind": "resolved", "subject_entity_id": "subject" },
+      "entities": [{
+        "entity_id": "subject", "kind": "concept", "title": "Synthetic concept", "summary": "",
+        "identity_status": "resolved", "external_references": [],
+        "facets": [{ "key": "history", "label": "History", "scope": "", "status": "known" }]
+      }],
+      "sources": [{
+        "source_id": "source", "url": "https://example.test/never-fetched", "title": "Synthetic",
+        "publisher": "Fixture", "retrieved_at": "2026-01-01T00:00:00Z", "excerpt": "", "trust": "unverified"
+      }],
+      "claims": [{
+        "claim_id": "claim", "subject_entity_id": "subject", "facet_key": "history", "text": "Synthetic only",
+        "observed_at": "2026-01-01T00:00:00Z", "evidence": { "status": "sourced", "source_ids": ["source"] }
+      }],
+      "relationships": [], "occurrences": [], "paths": [], "active_path_id": null, "requests": [], "actions": []
+    }
+  ],
+  "invalidPatches": [
+    { "schema_version": "atlas-exploration.v1" },
+    { "revision": -1 },
+    { "revision": 1.5 },
+    { "revision": 9007199254740992 },
+    { "exploration_id": "  " },
+    { "unexpected": true },
+    { "active_path_id": 1 },
+    { "interpretation": { "kind": "ambiguous", "candidate_entity_ids": [] } },
+    { "sources": [{
+      "source_id": "s", "url": "javascript:alert(1)", "title": "", "publisher": "",
+      "retrieved_at": "2026-01-01T00:00:00Z", "excerpt": "", "trust": "unverified"
+    }] },
+    { "sources": [{
+      "source_id": "s", "url": "https://example.test", "title": "", "publisher": "",
+      "retrieved_at": "2026-02-30T00:00:00Z", "excerpt": "", "trust": "unverified"
+    }] },
+    { "claims": [{
+      "claim_id": "c", "subject_entity_id": "candidate", "text": "", "observed_at": "2026-01-01T00:00:00Z",
+      "evidence": { "status": "sourced", "source_ids": [] }
+    }] },
+    { "claims": [{
+      "claim_id": "c", "subject_entity_id": "candidate", "text": "", "observed_at": "2026-01-01T00:00:00Z",
+      "evidence": { "status": "conflicting", "supporting_source_ids": ["s"], "opposing_source_ids": [] }
+    }] },
+    { "requests": [{
+      "request_id": "r", "exploration_id": "ambiguous", "path_id": "p", "parent_occurrence_id": null,
+      "run_id": "run", "thread_id": "thread", "committed_history_version": -1, "last_sequence": 0, "status": "loading"
+    }] }
+  ]
+}

@@ -4,6 +4,28 @@ User-visible contract changes, newest first. Policy: [api-deprecation-policy.md]
 
 ## Unreleased
 
+### Fixed
+
+- Held bounded-phase finalizer failures persist their exact claimed-step marker
+  atomically with settlement. Terminal events and webhooks retain the structured
+  `phase.finalizer_tool_calls`, `phase.finalizer_failed`, or
+  `phase.finalizer_outcome_unknown` code. Public phase admission remains disabled.
+
+- Artifact CRUD uses the current tenant/retention schema, resolves slug and UUID
+  tenant selectors consistently, validates run visibility before storing content,
+  and preserves canonical audit attribution and quota accounting. Metadata
+  retrieval/listing decodes stored JSON correctly; pagination accepts its emitted
+  timestamp cursors and returns 422 for malformed cursors.
+- `POST /v1/artifacts` accepts the public SDKs' JSON `request` multipart file
+  part and JSON form strings alongside the `file` upload. File parts require
+  strict UTF-8; form strings use Starlette's multipart charset decoding (UTF-8
+  by default, with Latin-1 fallback). Metadata is limited to 64 KiB (UTF-8
+  encoded size after decoding for form strings) and still validates against
+  the existing artifact fields (unknown fields are rejected). Invalid metadata
+  returns 422.
+- Request tenant context is restored on success, error and cancellation without
+  crossing threadpool contexts; authorization and database RLS remain unchanged.
+
 ### Added
 
 - Successful `POST /v1/runs` responses include numeric epoch-seconds `created_at`
@@ -30,6 +52,11 @@ User-visible contract changes, newest first. Policy: [api-deprecation-policy.md]
 
 ### Changed (security tightening, allowlisted)
 
+- `POST /v1/runs`, `POST /v1/chat/completions`, and `POST /v1/responses`
+  reject a present `phase_config` field, including `null`, before run admission;
+  the facade also rejects it in `haas` options. Requests omitting it retain
+  their existing behavior. This temporary guard does not activate phase mode
+  or establish the final public opt-in field name.
 - `POST /v1/runs/{run_id}/resume`: `rejection_reason` is limited to 2000 characters,
   because the reason is fed back to the model (threat model: prompt-injection
   surface and cost amplification).

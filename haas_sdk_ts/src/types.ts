@@ -39,6 +39,15 @@ export interface CapabilitiesResponse {
 
 // --- Runs ---
 
+/**
+ * Explicit opt-in; this configuration does not imply server capability activation.
+ */
+export interface PhaseConfig {
+  version: 1;
+  mode: 'bounded_acquisition_finalization';
+  reserve_basis_points: 2000;
+}
+
 export interface RunCreateRequest {
   prompt: string;
   thread_id?: string;
@@ -51,6 +60,7 @@ export interface RunCreateRequest {
   agent_revision_id?: string;
   expected_history_version?: number;
   max_tool_invocations?: number;
+  phase_config?: PhaseConfig;
 }
 
 export interface RunResponse {

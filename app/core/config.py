@@ -48,6 +48,25 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("HAAS_OIDC_JWKS_URL", "oidc_jwks_url"),
     )
+    internal_authorization_url: str | None = Field(
+        default=None, validation_alias=AliasChoices(
+            "HAAS_INTERNAL_AUTHORIZATION_URL", "internal_authorization_url"),
+    )
+    worker_auth_private_key_file: Path | None = Field(
+        default=None, repr=False, validation_alias=AliasChoices(
+            "HAAS_WORKER_AUTH_PRIVATE_KEY_FILE", "worker_auth_private_key_file"),
+    )
+    worker_auth_key_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("HAAS_WORKER_AUTH_KEY_ID", "worker_auth_key_id"),
+    )
+    worker_auth_trust_keys_file: Path | None = Field(
+        default=None, repr=False, validation_alias=AliasChoices(
+            "HAAS_WORKER_AUTH_TRUST_KEYS_FILE", "worker_auth_trust_keys_file"),
+    )
+    internal_authorization_ca_file: Path | None = Field(
+        default=None, repr=False, validation_alias=AliasChoices(
+            "HAAS_INTERNAL_AUTHORIZATION_CA_FILE", "internal_authorization_ca_file"),
+    )
     bootstrap_tenant_slug: str | None = Field(
         default=None,
         validation_alias=AliasChoices(

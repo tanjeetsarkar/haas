@@ -508,69 +508,6 @@
         "title": "ApprovalDecisionRequest",
         "type": "object"
       },
-      "ArtifactCreateRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "content_type": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Content Type",
-            "type": "string"
-          },
-          "created_by": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created By"
-          },
-          "expires_at": {
-            "anyOf": [
-              {
-                "format": "date-time",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expires At"
-          },
-          "metadata": {
-            "additionalProperties": true,
-            "title": "Metadata",
-            "type": "object"
-          },
-          "name": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Name",
-            "type": "string"
-          },
-          "run_id": {
-            "title": "Run Id",
-            "type": "string"
-          },
-          "source": {
-            "pattern": "^(api|tool)$",
-            "title": "Source",
-            "type": "string"
-          }
-        },
-        "required": [
-          "run_id",
-          "name",
-          "content_type",
-          "source"
-        ],
-        "title": "ArtifactCreateRequest",
-        "type": "object"
-      },
       "ArtifactCreateResponse": {
         "additionalProperties": false,
         "properties": {
@@ -770,12 +707,86 @@
             "type": "string"
           },
           "request": {
-            "$ref": "#/components/schemas/ArtifactCreateRequest"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              }
+            ],
+            "contentMediaType": "application/json",
+            "contentSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "content_type": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "title": "Content Type",
+                  "type": "string"
+                },
+                "created_by": {
+                  "anyOf": [
+                    {
+                      "maxLength": 256,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Created By"
+                },
+                "expires_at": {
+                  "anyOf": [
+                    {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Expires At"
+                },
+                "metadata": {
+                  "additionalProperties": true,
+                  "title": "Metadata",
+                  "type": "object"
+                },
+                "name": {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "title": "Name",
+                  "type": "string"
+                },
+                "run_id": {
+                  "title": "Run Id",
+                  "type": "string"
+                },
+                "source": {
+                  "pattern": "^(api|tool)$",
+                  "title": "Source",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "run_id",
+                "name",
+                "content_type",
+                "source"
+              ],
+              "title": "ArtifactCreateRequest",
+              "type": "object"
+            },
+            "description": "Artifact metadata as a JSON form string or application/json file part. File parts require strict UTF-8. Form strings use Starlette's multipart charset decoding (UTF-8 by default, with Latin-1 fallback). Maximum 64 KiB, measured as UTF-8 after decoding for form strings.",
+            "title": "Request"
           }
         },
         "required": [
-          "request",
-          "file"
+          "file",
+          "request"
         ],
         "title": "Body_create_artifact_v1_artifacts_post",
         "type": "object"

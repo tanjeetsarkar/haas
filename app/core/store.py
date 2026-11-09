@@ -18,6 +18,16 @@ from app.core.config import settings
 from app.core.database_context import tenant_context
 from app.core.egress import EgressPolicy
 from app.core.object_store import build_object_store
+from app.core.intent_preflight import IntentPreflight
+from app.core.held_intent import (
+    bind_held_intent, destination_binding, held_request_digest,
+    validate_held_creation, validate_held_key,
+)
+from app.core.tenant_policy import TenantPolicy
+from app.core.run_phases import PhaseConfig, PhaseState, validate_phase_transition
+from app.core.run_restrictions import (
+    RunAuthority, authority_request_digest, validate_intent_provenance,
+)
 from app.core.secret_vault import decrypt_secrets, encrypt_secrets
 from app.core.areas import (
     access as _access,
@@ -82,6 +92,30 @@ def validate_tenant_transition(
 def _loads(value: Any) -> Any:
     # asyncpg returns JSONB as `str` unless a codec is registered.
     return json.loads(value) if isinstance(value, str) else value
+
+
+def decode_run_phases(row: Any) -> tuple[PhaseConfig | None, PhaseState | None]:
+    """Decode only server-owned run columns, never checkpoint messages."""
+    data = dict(row)
+    config = data.get("phase_config_json")
+    state = data.get("phase_state_json")
+    if config is None and state is None:
+        return None, None
+    if config is None or state is None:
+        raise ValueError("phase.incomplete_storage")
+    config_data = _loads(config)
+    state_data = _loads(state)
+    if not isinstance(config_data, dict) or set(config_data) != set(PhaseConfig.model_fields):
+        raise ValueError("phase.invalid_config_storage")
+    if not isinstance(state_data, dict) or set(state_data) != set(PhaseState.model_fields):
+        raise ValueError("phase.invalid_state_storage")
+    if (
+        type(config_data["version"]) is not int
+        or type(config_data["reserve_basis_points"]) is not int
+        or type(state_data["version"]) is not int
+    ):
+        raise ValueError("phase.invalid_storage_version")
+    return PhaseConfig.model_validate(config_data), PhaseState.model_validate(state_data)
 
 
 RLS_TABLES = (
@@ -738,7 +772,7 @@ class DistributedStore(
     async def _insert_audit_event(
         conn: Any,
         *,
-        tenant_id: UUID,
+        tenant_id: UUID | str | None,
         actor_principal_id: UUID,
         action: str,
         target_type: str,
@@ -746,6 +780,23 @@ class DistributedStore(
         request_id: UUID,
         details: dict[str, Any],
     ) -> None:
+        """Append one audit event inside the caller's transaction.
+
+        ``audit_events.tenant_id`` is the canonical tenant UUID. Callers holding a
+        request-level tenant selector (slug, UUID text or mapped legacy id) are
+        resolved with the same ``resolve_haas_tenant_uuid`` function the RLS
+        policies use; an unresolvable selector fails closed and aborts the
+        transaction instead of writing an unattributed or mis-attributed row.
+        """
+        tenant_uuid: UUID | None
+        if isinstance(tenant_id, UUID) or tenant_id is None:
+            tenant_uuid = tenant_id
+        else:
+            tenant_uuid = await conn.fetchval(
+                "SELECT resolve_haas_tenant_uuid($1)", tenant_id
+            )
+        if tenant_uuid is None:
+            raise StoreConflictError("Audit tenant could not be resolved.")
         await conn.execute(
             """
             INSERT INTO audit_events (
@@ -755,7 +806,7 @@ class DistributedStore(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
             """,
             uuid4(),
-            tenant_id,
+            tenant_uuid,
             actor_principal_id,
             action,
             target_type,
@@ -1122,16 +1173,18 @@ class DistributedStore(
         branch_id = f"thd_{uuid4().hex[:12]}"
         async with self.connection() as conn:
             async with conn.transaction():
+                await self._lock_derivation_threads(conn, thread_id, tenant_id)
                 source = await conn.fetchrow(
                     "SELECT * FROM threads WHERE thread_id = $1 "
                     "AND COALESCE(tenant_uuid::text, tenant_id) "
                     "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) "
-                    "FOR SHARE",
+                    "FOR UPDATE",
                     thread_id,
                     tenant_id,
                 )
                 if source is None:
                     raise StoreNotFoundError("Thread not found.")
+                await self._check_thread_derivation(conn, thread_id, tenant_id)
                 if source["history_version"] != expected_history_version:
                     raise StoreConflictError(
                         "Thread history changed; refresh before branching."
@@ -1167,6 +1220,81 @@ class DistributedStore(
             "parent_thread_id": thread_id,
             "parent_history_version": expected_history_version,
         }
+
+    async def _check_thread_derivation(
+        self, conn: Any, thread_id: str, tenant_id: str, *, delegation: bool = False,
+    ) -> None:
+        """Caller holds the source thread lock, also used by run admission."""
+        guards = await conn.fetchrow(
+            "WITH RECURSIVE lineage AS ("
+            "SELECT thread_id, parent_thread_id FROM threads WHERE thread_id=$1 "
+            "AND COALESCE(tenant_uuid::text,tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2) UNION "
+            "SELECT t.thread_id,t.parent_thread_id FROM threads t JOIN lineage l "
+            "ON t.thread_id=l.parent_thread_id WHERE COALESCE(t.tenant_uuid::text,t.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)) "
+            "SELECT EXISTS(SELECT 1 FROM runs r JOIN lineage l USING(thread_id) "
+            "WHERE r.authority_json IS NOT NULL AND COALESCE(r.tenant_uuid::text,r.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)) AS restricted, "
+            "EXISTS(SELECT 1 FROM runs r JOIN lineage l USING(thread_id) "
+            "WHERE (r.phase_config_json IS NOT NULL OR r.phase_state_json IS NOT NULL) "
+            "AND COALESCE(r.tenant_uuid::text,r.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)) AS phased",
+            thread_id, tenant_id,
+        )
+        if guards["restricted"]:
+            raise StoreConflictError("restriction.derivation_unavailable")
+        if delegation and guards["phased"]:
+            raise StoreConflictError("phase.delegation_unavailable")
+
+    async def _lock_derivation_threads(
+        self, conn: Any, thread_id: str | None, tenant_id: str, parent_id: str | None = None,
+    ) -> None:
+        """Lock all source ancestry plus target in stable order through caller's writes."""
+        await conn.fetch(
+            "WITH RECURSIVE parents AS ("
+            "SELECT run_id,parent_run_id,thread_id FROM runs WHERE run_id=$3 "
+            "AND COALESCE(tenant_uuid::text,tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2) UNION "
+            "SELECT r.run_id,r.parent_run_id,r.thread_id FROM runs r JOIN parents p "
+            "ON r.run_id=p.parent_run_id WHERE COALESCE(r.tenant_uuid::text,r.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)), lineage AS ("
+            "SELECT thread_id,parent_thread_id FROM threads WHERE "
+            "(thread_id=$1 OR thread_id IN (SELECT thread_id FROM parents)) "
+            "AND COALESCE(tenant_uuid::text,tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2) UNION "
+            "SELECT t.thread_id,t.parent_thread_id FROM threads t JOIN lineage l "
+            "ON t.thread_id=l.parent_thread_id WHERE COALESCE(t.tenant_uuid::text,t.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)) "
+            "SELECT t.thread_id FROM threads t WHERE t.thread_id IN "
+            "(SELECT thread_id FROM lineage) ORDER BY t.thread_id FOR UPDATE OF t",
+            thread_id, tenant_id, parent_id,
+        )
+
+    async def _check_parent_authority(self, conn: Any, parent_id: str, tenant_id: str) -> None:
+        """Immutable authority is checked on every ancestor, never child config."""
+        await self._lock_derivation_threads(conn, None, tenant_id, parent_id)
+        rows = await conn.fetch(
+            "WITH RECURSIVE lineage AS ("
+            "SELECT run_id,parent_run_id,thread_id,authority_json,phase_config_json,phase_state_json "
+            "FROM runs WHERE run_id=$1 "
+            "AND COALESCE(tenant_uuid::text,tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2) UNION "
+            "SELECT r.run_id,r.parent_run_id,r.thread_id,r.authority_json,"
+            "r.phase_config_json,r.phase_state_json FROM runs r JOIN lineage l "
+            "ON r.run_id=l.parent_run_id WHERE COALESCE(r.tenant_uuid::text,r.tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)) "
+            "SELECT thread_id,authority_json,phase_config_json,phase_state_json FROM lineage",
+            parent_id, tenant_id,
+        )
+        if not rows:
+            raise StoreNotFoundError("Parent run not found.")
+        if any(row["authority_json"] is not None for row in rows):
+            raise StoreConflictError("restriction.derivation_unavailable")
+        if any(row["phase_config_json"] is not None or row["phase_state_json"] is not None for row in rows):
+            raise StoreConflictError("phase.delegation_unavailable")
+        for thread_id in {row["thread_id"] for row in rows}:
+            await self._check_thread_derivation(conn, thread_id, tenant_id, delegation=True)
 
     async def list_agent_revisions(
         self,
@@ -1405,6 +1533,45 @@ class DistributedStore(
             response["created_at"] = float(row["created_at"])
         return {"request_digest": row["request_digest"], "response": response}
 
+    async def create_held_intent_run(
+        self, snapshot: IntentPreflight, *, idempotency_key: str | None = None, **run_fields: Any,
+    ) -> float:
+        """Internal only; creation rechecks pins transactionally and retains every hold."""
+        if {"admission", "authority", "intent_preflight"}.intersection(run_fields):
+            raise ValueError("restriction.server_owned_admission")
+        if idempotency_key is not None:
+            validate_held_key(idempotency_key)
+        policy_record = await self.get_active_tenant_policy(snapshot.tenant_id)
+        if policy_record is None:
+            raise ValueError("restriction.policy_unavailable")
+        policy = TenantPolicy.from_record(policy_record)
+        destination = destination_binding(snapshot, policy)
+        authority = bind_held_intent(
+            snapshot, run_id=run_fields["run_id"],
+            destination=destination,
+            idempotency_key=idempotency_key,
+        )
+        admission = None if idempotency_key is None else {
+            "principal_key": snapshot.submitter_id, "idempotency_key": idempotency_key,
+            "request_digest": held_request_digest(snapshot, run_fields, destination),
+            "response": {"run_id": run_fields["run_id"], "status": "queued"},
+        }
+        return await self.create_run(
+            **run_fields, authority=authority, intent_preflight=snapshot, admission=admission,
+        )
+
+    async def prepare_intent_approval(self, lease: Any) -> dict[str, Any]:
+        from app.core.deterministic_intent import prepare_intent_approval
+        return await prepare_intent_approval(self, lease)
+
+    async def record_held_intent_decision(self, **decision: Any) -> dict[str, Any]:
+        from app.core.held_intent_decision import record_held_intent_decision
+        return await record_held_intent_decision(self, **decision)
+
+    async def release_approved_intent(self, *, tenant_id: str, run_id: str) -> dict[str, Any]:
+        from app.core.intent_release import release_approved_intent
+        return await release_approved_intent(self, tenant_id=tenant_id, run_id=run_id)
+
     async def create_run(
         self,
         *,
@@ -1430,14 +1597,65 @@ class DistributedStore(
         deadline_sec: int | None = None,
         max_tool_invocations: int | None = None,
         parent_run_id: str | None = None,
+        authority: RunAuthority | None = None,
+        phase_config: PhaseConfig | None = None,
+        intent_preflight: IntentPreflight | None = None,
     ) -> float:
         now = time.time()
         fx = Effects()
+        if intent_preflight is not None and (
+            authority is None or authority.intent is None
+            or parent_run_id is not None or phase_config is not None
+            or initial_skills != list(intent_preflight.preload_skills)
+        ):
+            raise ValueError("restriction.held_creation_only")
+        if phase_config is not None:
+            phase_config, _ = decode_run_phases({
+                "phase_config_json": phase_config.model_dump_json(),
+                "phase_state_json": PhaseState().model_dump_json(),
+            })
+            if admission is not None or parent_run_id is not None:
+                raise ValueError("phase.runtime_not_enabled")
         if agent_revision_id is not None and policy_revision_id is None:
             raise ValueError("Agent revisions require a pinned tenant policy.")
+        if authority is not None:
+            authority = RunAuthority.model_validate_json(authority.model_dump_json())
+            if not (policy_revision_id and submitted_by_principal_id and registry_fingerprint):
+                raise ValueError("restriction.authenticated_provenance_required")
+            if admission is not None and admission["principal_key"] != submitted_by_principal_id:
+                raise ValueError("restriction.admission_principal_mismatch")
+        if admission is not None:
+            admission = {
+                **admission,
+                "request_digest": authority_request_digest(admission["request_digest"], authority),
+            }
         try:
             async with self.connection() as conn:
                 async with conn.transaction():
+                    held_replay = None
+                    if intent_preflight is not None and admission is not None:
+                        canonical_tenant = await conn.fetchval(
+                            "SELECT resolve_haas_tenant_uuid($1)", tenant_id,
+                        )
+                        if str(canonical_tenant) != intent_preflight.tenant_id:
+                            raise ValueError("restriction.provenance_mismatch")
+                        # Same held request serializes before thread checks, so
+                        # concurrent replay never becomes a second action.
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                            json.dumps([str(canonical_tenant), admission["principal_key"],
+                                        "run.create", admission["idempotency_key"]]),
+                        )
+                        prior = await conn.fetchrow(
+                            "SELECT request_digest,response FROM admission_requests "
+                            "WHERE tenant_uuid=$1 AND principal_key=$2 AND operation='run.create' "
+                            "AND idempotency_key=$3 AND expires_at>now()",
+                            canonical_tenant, admission["principal_key"], admission["idempotency_key"],
+                        )
+                        if prior is not None:
+                            if prior["request_digest"] != admission["request_digest"]:
+                                raise IdempotencyConflictError(admission["idempotency_key"])
+                            held_replay = _loads(prior["response"])
                     if policy_revision_id is not None:
                         tenant = await conn.fetchrow(
                             "SELECT tenant_id, active_policy_revision_id FROM tenants "
@@ -1468,6 +1686,25 @@ class DistributedStore(
                                 raise StoreConflictError(
                                     "Agent revision is not eligible for admission."
                                 )
+                    if held_replay is not None:
+                        assert intent_preflight is not None and authority is not None
+                        validate_intent_provenance(
+                            authority, tenant_id=intent_preflight.tenant_id, run_id=run_id,
+                            submitter_id=str(submitted_by_principal_id),
+                            policy_revision=str(policy_revision_id),
+                            registry_fingerprint=str(registry_fingerprint),
+                            idempotency_key=admission["idempotency_key"] if admission else None,
+                        )
+                        await validate_held_creation(
+                            conn, intent_preflight, authority, skill_ceiling=skill_allowlist,
+                            agent_revision_id=agent_revision_id,
+                            agent_fields={
+                                "primary_model": primary_model, "planner_model": planner_model,
+                                "max_steps": max_steps, "max_cost_usd": max_cost_usd,
+                            },
+                        )
+                        raise IdempotentReplay(held_replay)
+                    await self._lock_derivation_threads(conn, thread_id, tenant_id, parent_run_id)
                     thread = await conn.fetchrow(
                         "SELECT tenant_id, messages_json, history_version, active_run_id "
                         "FROM threads WHERE thread_id = $1 "
@@ -1478,6 +1715,35 @@ class DistributedStore(
                     )
                     if thread is None:
                         raise ThreadOwnershipError(thread_id)
+                    await self._check_thread_derivation(conn, thread_id, tenant_id)
+                    if parent_run_id is not None:
+                        try:
+                            await self._check_parent_authority(conn, parent_run_id, tenant_id)
+                        except StoreNotFoundError:
+                            # Preserve the existing lineage trigger's public failure shape.
+                            raise asyncpg.ForeignKeyViolationError("Parent run is not visible.") from None
+                    if authority is not None:
+                        canonical_tenant = await conn.fetchval(
+                            "SELECT resolve_haas_tenant_uuid($1)", thread["tenant_id"]
+                        )
+                        if canonical_tenant is None:
+                            raise ValueError("restriction.tenant_required")
+                        validate_intent_provenance(
+                            authority, tenant_id=str(canonical_tenant), run_id=run_id,
+                            submitter_id=str(submitted_by_principal_id),
+                            policy_revision=str(policy_revision_id),
+                            registry_fingerprint=str(registry_fingerprint),
+                            idempotency_key=admission["idempotency_key"] if admission else None,
+                        )
+                        if intent_preflight is not None:
+                            await validate_held_creation(
+                                conn, intent_preflight, authority, skill_ceiling=skill_allowlist,
+                                agent_revision_id=agent_revision_id,
+                                agent_fields={
+                                    "primary_model": primary_model, "planner_model": planner_model,
+                                    "max_steps": max_steps, "max_cost_usd": max_cost_usd,
+                                },
+                            )
                     if thread["active_run_id"] is not None:
                         raise StoreConflictError(
                             "Thread has an active run. Wait, cancel it, or explicitly branch."
@@ -1504,14 +1770,15 @@ class DistributedStore(
                         skill_allowlist_json, registry_fingerprint,
                         submitted_by_principal_id, policy_revision_id,
                         agent_revision_id, thread_history_version,
-                        next_action, deadline_at, max_tool_invocations, parent_run_id
+                        next_action, deadline_at, max_tool_invocations, parent_run_id,
+                        authority_json, phase_config_json, phase_state_json
                     ) VALUES (
                         $1, $2, $3, $4, 'queued',
                         $5, $6, $7::jsonb,
                         $8::jsonb, $9, $10,
                         $11, $12, $13,
                         $14::jsonb, $15, $16, $17, $18, $19,
-                        'step', $20, $21, $22
+                        $23, $20, $21, $22, $24::jsonb, $25::jsonb, $26::jsonb
                     ) RETURNING *
                     """,
                         run_id,
@@ -1546,6 +1813,10 @@ class DistributedStore(
                         ),
                         max_tool_invocations or settings.default_max_tool_invocations,
                         parent_run_id,
+                        "none" if authority is not None or phase_config is not None else "step",
+                        authority.model_dump_json() if authority is not None else None,
+                        phase_config.model_dump_json() if phase_config is not None else None,
+                        PhaseState().model_dump_json() if phase_config is not None else None,
                     )
                     created_at = float(run_row["created_at"])
                     await self._append_events(
@@ -1555,7 +1826,10 @@ class DistributedStore(
                         run_id,
                         [("run_queued", {"run_id": run_id, "thread_id": thread_id})],
                     )
-                    await self._enqueue_orchestrate(conn, fx, run_row, "step", 0)
+                    # Internal storage staging only: no restricted work until all
+                    # dispatch paths enforce authority and this hold is reviewed.
+                    if authority is None and phase_config is None:
+                        await self._enqueue_orchestrate(conn, fx, run_row, "step", 0)
                     if admission is not None:
                         admission_response = dict(admission["response"])
                         if include_created_at:
@@ -1605,7 +1879,61 @@ class DistributedStore(
                 "LEFT JOIN tenants t ON t.tenant_id = r.tenant_uuid WHERE r.run_id = $1",
                 run_id,
             )
-        return decode_run(row) if row else None
+        if row is None:
+            return None
+        run = decode_run(row)
+        run["phase_config"], run["phase_state"] = decode_run_phases(row)
+        return run
+
+    async def acquire_lease(
+        self, *, message_id: str, run_id: str, action: str,
+        expected_state_version: int, owner: str,
+    ) -> Any:
+        # "none" is a storage hold, never an executable orchestration action.
+        # Other actions still pass the base class's locked next_action fence.
+        if action == "none":
+            return None
+        return await super().acquire_lease(
+            message_id=message_id, run_id=run_id, action=action,
+            expected_state_version=expected_state_version, owner=owner,
+        )
+
+    async def transition_held_run_phase(
+        self, *, tenant_id: str, run_id: str, expected_state_version: int,
+        following: PhaseState,
+    ) -> PhaseState:
+        """CAS phase state only for a held run; never enqueue or lease it."""
+        async with self.connection() as conn:
+            async with conn.transaction():
+                row = await self._lock_run(conn, run_id, tenant_id)
+                if row is None:
+                    raise StoreNotFoundError("phase.run_not_found")
+                config, current = decode_run_phases(row)
+                if config is None or current is None:
+                    raise StoreConflictError("phase.not_enabled")
+                if (
+                    row["status"] != "queued" or row["next_action"] != "none"
+                    or row["lease_owner"] is not None
+                ):
+                    raise StoreConflictError("phase.run_not_held")
+                if current.state_version != expected_state_version:
+                    raise StoreConflictError("phase.state_version_conflict")
+                _, validated = decode_run_phases({
+                    "phase_config_json": config.model_dump_json(),
+                    "phase_state_json": following.model_dump_json(),
+                })
+                assert validated is not None
+                validate_phase_transition(current, validated)
+                if validated == current:
+                    return current
+                updated = await conn.fetchval(
+                    "UPDATE runs SET phase_state_json=$3::jsonb WHERE run_id=$1 "
+                    "AND (phase_state_json->>'state_version')::bigint=$2 RETURNING 1",
+                    run_id, expected_state_version, validated.model_dump_json(),
+                )
+                if not updated:
+                    raise StoreConflictError("phase.state_version_conflict")
+                return validated
 
     async def list_runs(
         self,

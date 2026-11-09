@@ -51,6 +51,7 @@ from haas_sdk.models import (
     Thread,
     ThreadHistory,
 )
+from haas_sdk.phase_config import PhaseConfig
 from haas_sdk.pagination import paginate
 
 T = TypeVar("T")
@@ -245,6 +246,7 @@ class Runs(_Resource):
         max_cost_usd: MONEY | None = None,
         deadline_sec: int | None = None,
         max_tool_invocations: int | None = None,
+        phase_config: PhaseConfig | None = None,
         webhook_url: str | None = None,
         secrets: Mapping[str, str] | None = None,
         idempotency_key: str | None = None,
@@ -297,6 +299,8 @@ class Runs(_Resource):
             "webhook_url": webhook_url,
             "secrets": secrets_body,
         }
+        if phase_config is not None:
+            extra["phase_config"] = phase_config.to_dict()
         return self._run(
             specs.run_create(prompt, idempotency_key=idempotency_key, extra=extra)
         )

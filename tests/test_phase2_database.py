@@ -625,3 +625,137 @@ async def test_production_login_rejects_owner_and_service_api_identity(db, monke
         await service.close()
     finally:
         await owner.execute(f"REVOKE haas_execution_service FROM {role}")
+
+
+async def test_create_thread_audit_resolves_tenant_selector_fail_closed(db):
+    """Audit rows store the tenant UUID whether callers pass a slug or UUID text."""
+    owner, store, slug, _, tenant, _, principal, _ = db
+    for selector in (slug, str(tenant)):
+        thread, request = f"t_{uuid4().hex}", uuid4()
+        await store.create_thread(
+            thread_id=thread,
+            tenant_id=selector,
+            metadata={"source": "qa"},
+            actor_principal_id=str(principal),
+            request_id=str(request),
+        )
+        row = await owner.fetchrow(
+            "SELECT tenant_id, actor_principal_id, action, request_id, details "
+            "FROM audit_events WHERE target_type = 'thread' AND target_id = $1",
+            thread,
+        )
+        assert row is not None
+        assert row["tenant_id"] == tenant
+        assert row["actor_principal_id"] == principal
+        assert row["action"] == "thread.created"
+        assert row["request_id"] == request
+        assert json.loads(row["details"]) == {"metadata": {"source": "qa"}}
+    # Visible to the owning tenant through forced RLS.
+    events = await store.list_audit_events(slug, limit=20)
+    assert sum(event["action"] == "thread.created" for event in events) >= 2
+
+    unknown, thread = f"qa-missing-{uuid4().hex[:12]}", f"t_{uuid4().hex}"
+    async with store.connection() as conn:
+        with pytest.raises(StoreConflictError, match="Audit tenant"):
+            async with conn.transaction():
+                await store._insert_audit_event(
+                    conn,
+                    tenant_id=unknown,
+                    actor_principal_id=principal,
+                    action="thread.created",
+                    target_type="thread",
+                    target_id=thread,
+                    request_id=uuid4(),
+                    details={},
+                )
+    token = tenant_context.set(unknown)
+    try:
+        with pytest.raises((StoreConflictError, asyncpg.PostgresError)):
+            await store.create_thread(
+                thread_id=thread,
+                tenant_id=unknown,
+                metadata={},
+                actor_principal_id=str(principal),
+                request_id=str(uuid4()),
+            )
+    finally:
+        tenant_context.reset(token)
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM threads WHERE thread_id = $1", thread
+        )
+        == 0
+    )
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM audit_events WHERE target_id = $1", thread
+        )
+        == 0
+    )
+
+
+async def test_oidc_post_thread_audits_canonical_tenant_and_rejects_mismatch(
+    db, monkeypatch
+):
+    """Authenticated POST /v1/threads with a tenant slug writes a UUID audit row.
+
+    Only JWT signature verification is stubbed; membership resolution, RBAC,
+    tenant context, RLS and the audit write all run against the real database.
+    """
+    import time
+
+    import app.main as main
+
+    owner, store, slug, other_slug, tenant, _, principal, _ = db
+
+    class Verifier:
+        async def verify(self, _token: str) -> dict[str, object]:
+            return {
+                "iss": "https://qa.invalid",
+                "sub": str(principal),
+                "iat": int(time.time()),
+            }
+
+    monkeypatch.setattr(main, "store", store)
+    monkeypatch.setattr(main.identity_authenticator, "store", store)
+    monkeypatch.setattr(main.identity_authenticator, "verifier", Verifier())
+    headers = {"Authorization": "Bearer qa.oidc.token", "X-Tenant-ID": slug}
+
+    async def thread_audits() -> int:
+        return await owner.fetchval(
+            "SELECT count(*) FROM audit_events WHERE action = 'thread.created'"
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(main.app), base_url="http://qa"
+    ) as client:
+        assert (await client.get("/v1/me", headers=headers)).status_code == 200
+        created = await client.post(
+            "/v1/threads", headers=headers, json={"metadata": {"source": "qa"}}
+        )
+        assert created.status_code == 201, created.text
+        thread = created.json()["thread_id"]
+        audit = await owner.fetchrow(
+            "SELECT tenant_id, actor_principal_id, request_id::text AS request_id "
+            "FROM audit_events WHERE action = 'thread.created' AND target_id = $1",
+            thread,
+        )
+        assert audit is not None
+        assert audit["tenant_id"] == tenant
+        assert audit["actor_principal_id"] == principal
+        assert audit["request_id"] == created.headers["X-Request-ID"]
+        assert (
+            await owner.fetchval(
+                "SELECT tenant_uuid FROM threads WHERE thread_id = $1", thread
+            )
+            == tenant
+        )
+
+        before = await thread_audits()
+        denied = await client.post(
+            "/v1/threads",
+            headers={**headers, "X-Tenant-ID": other_slug},
+            json={"metadata": {"source": "foreign"}},
+        )
+        assert denied.status_code == 403, denied.text
+        assert await thread_audits() == before

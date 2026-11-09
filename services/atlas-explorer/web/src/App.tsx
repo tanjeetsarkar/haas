@@ -1,54 +1,28 @@
-/**
- * Atlas Demo App - Example usage of HaaS Atlas components
- */
-
-import { useEffect, useState } from 'react';
-import { createClientFromEnv } from '@haas/sdk';
-import { createAtlasSessionManager } from '@haas/atlas-explorer-client';
-import { AtlasExplorer } from './components/atlas';
+import { useState } from 'react';
+import { AtlasPreview } from './components/AtlasPreview';
+import { AtlasWorkspace } from './components/AtlasWorkspace';
+import { createBrowserAtlasAdapter } from './liveAdapter';
+import { createBrowserApproverAdapter } from './approverAdapter';
+import { AtlasApproverPage } from './components/AtlasApproverPage';
 import './App.css';
 
 function App() {
-  const [sessionManager, setSessionManager] = useState<ReturnType<typeof createAtlasSessionManager> | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    // Initialize HaaS client from environment
-    const client = createClientFromEnv();
-    const manager = createAtlasSessionManager(client);
-    setSessionManager(manager);
-  }, []);
-
-  if (!sessionManager) {
-    return (
-      <div className="app-loading">
-        <div className="spinner" />
-        <p>Initializing HaaS Atlas...</p>
-      </div>
-    );
+  if (new URLSearchParams(window.location.search).get('atlasApprover') === '1') return <OperatorApproverApp />;
+  if (new URLSearchParams(window.location.search).get('atlasPreview') === '1') {
+    return <AtlasPreview onExit={() => window.location.assign(window.location.pathname)} />;
   }
+  return <LiveAtlasApp />;
+}
 
-  return (
-    <div className="app">
-      <header className="app-header">
-        <h1>HaaS Atlas Demo</h1>
-        <p className="app-subtitle">Progressive disclosure exploration with provenance-verified entities</p>
-      </header>
-      <main className="app-main">
-        <AtlasExplorer
-          sessionManager={sessionManager}
-          initialQuery="Cancer hospitals in Mumbai"
-          onError={(err) => setError(err.message)}
-        />
-      </main>
-      {error && (
-        <div className="app-error" role="alert">
-          <strong>Error:</strong> {error}
-          <button onClick={() => setError(null)}>Dismiss</button>
-        </div>
-      )}
-    </div>
-  );
+function OperatorApproverApp() {
+  const [adapter] = useState(createBrowserApproverAdapter);
+  return <AtlasApproverPage adapter={adapter} />;
+}
+
+function LiveAtlasApp() {
+  const [adapter] = useState(createBrowserAtlasAdapter);
+  const approverOrigin = document.querySelector<HTMLMetaElement>('meta[name="atlas-approver-origin"]')?.content;
+  return <AtlasWorkspace adapter={adapter} approverOrigin={approverOrigin} />;
 }
 
 export default App;

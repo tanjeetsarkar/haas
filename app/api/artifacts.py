@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.api.deps import PrincipalInfo, requires, tenant_scope
 from app.core.authorization import Action
@@ -153,9 +155,66 @@ def _compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_MAX_ARTIFACT_METADATA_BYTES = 64 * 1024
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("JSON number is not finite")
+    return parsed
+
+
+async def _artifact_create_request(
+    request: str | UploadFile = Form(
+        ...,
+        description=(
+            "Artifact metadata as a JSON form string or application/json file part. "
+            "File parts require strict UTF-8. Form strings use Starlette's multipart "
+            "charset decoding (UTF-8 by default, with Latin-1 fallback). Maximum "
+            "64 KiB, measured as UTF-8 after decoding for form strings."
+        ),
+        json_schema_extra={
+            "contentMediaType": "application/json",
+            "contentSchema": ArtifactCreateRequest.model_json_schema(),
+        },
+    ),
+) -> ArtifactCreateRequest:
+    """Decode both SDK blob parts and ordinary multipart form fields."""
+    if isinstance(request, str):
+        # Starlette has already decoded form fields; original bytes are unavailable.
+        raw = request.encode("utf-8")
+    else:
+        raw = await request.read(_MAX_ARTIFACT_METADATA_BYTES + 1)
+    if len(raw) > _MAX_ARTIFACT_METADATA_BYTES:
+        raise HTTPException(422, "Artifact metadata exceeds 64 KiB")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
+    except (ValueError, RecursionError) as exc:
+        # Do not echo raw multipart bytes into the JSON validation response.
+        raise HTTPException(
+            422, "Artifact metadata must be valid JSON; file parts require UTF-8"
+        ) from exc
+    try:
+        return ArtifactCreateRequest.model_validate(payload)
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_context=False, include_input=False)
+        for error in errors:
+            error["loc"] = ("body", "request", *error["loc"])
+        raise RequestValidationError(errors) from exc
+
+
 @router.post("/v1/artifacts", response_model=ArtifactCreateResponse)
 async def create_artifact(
-    request: ArtifactCreateRequest,
+    request: ArtifactCreateRequest = Depends(_artifact_create_request),
     file: UploadFile = File(...),
     principal: PrincipalInfo = Depends(tenant_scope),
     _auth: None = requires(Action.ARTIFACT_WRITE)
@@ -171,21 +230,31 @@ async def create_artifact(
     artifact_id = str(uuid.uuid4())
     tenant_id = principal.tenant_id
 
-    # Get tenant_uuid and check retention policy/quota in a single transaction
+    # Resolve canonical identity while preserving the run's stored text tenant key.
     async with store.connection() as conn:
-        # Get tenant info
         tenant_row = await conn.fetchrow(
-            "SELECT tenant_id::text, tenant_uuid::text, retention_class, retention_overrides "
-            "FROM tenants WHERE tenant_id = $1",
+            "SELECT tenant_id, retention_class "
+            "FROM tenants WHERE tenant_id = resolve_haas_tenant_uuid($1)",
             tenant_id
         )
         if not tenant_row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         
-        tenant_uuid = tenant_row["tenant_uuid"]
+        tenant_uuid = tenant_row["tenant_id"]
+        run = await conn.fetchrow(
+            "SELECT tenant_id, thread_id FROM runs WHERE run_id = $1 AND tenant_uuid = $2",
+            request.run_id, tenant_uuid,
+        )
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        tenant_id = run["tenant_id"]
         
         # Check artifact quota
-        retention_overrides = tenant_row["retention_overrides"] or {}
+        retention_row = await conn.fetchrow(
+            "SELECT artifact_quota_bytes FROM retention_policies WHERE tenant_uuid = $1",
+            tenant_uuid,
+        )
+        retention_overrides = dict(retention_row) if retention_row else {}
         policy = effective_policy(tenant_row["retention_class"], retention_overrides)
         quota_bytes = policy.get("artifact_quota_bytes", 0)
         
@@ -193,8 +262,8 @@ async def create_artifact(
             # Check current artifact usage
             current_usage = await conn.fetchval(
                 "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts "
-                "WHERE tenant_id = $1 AND deleted_at IS NULL",
-                tenant_id
+                "WHERE tenant_uuid = $1 AND deleted_at IS NULL",
+                tenant_uuid
             )
             if current_usage + size_bytes > quota_bytes:
                 raise HTTPException(
@@ -205,8 +274,9 @@ async def create_artifact(
         # Check legal holds
         legal_hold = await conn.fetchrow(
             "SELECT 1 FROM legal_holds WHERE tenant_uuid = $1 AND released_at IS NULL "
-            "AND (scope = 'tenant' OR (scope = 'run' AND subject_id = $2) OR (scope = 'thread' AND subject_id = (SELECT thread_id FROM runs WHERE run_id = $2)))",
-            tenant_uuid, request.run_id
+            "AND (scope = 'tenant' OR (scope = 'run' AND subject_id = $2) "
+            "OR (scope = 'thread' AND subject_id = $3))",
+            tenant_uuid, request.run_id, run["thread_id"],
         )
         if legal_hold:
             raise HTTPException(status_code=409, detail="Artifact creation blocked by legal hold")
@@ -244,7 +314,7 @@ async def create_artifact(
         # Insert audit event
         await store._insert_audit_event(
             conn,
-            tenant_id=uuid.UUID(tenant_id),
+            tenant_id=tenant_uuid,
             actor_principal_id=uuid.UUID(principal.principal_id),
             action="artifact.created",
             target_type="artifact",
@@ -274,7 +344,7 @@ async def get_artifact(artifact_id: str, principal: PrincipalInfo = Depends(tena
     async with store.connection() as conn:
         row = await conn.fetchrow(
             """
-            SELECT artifact_id::text, tenant_id, tenant_uuid::text, run_id, name,
+            SELECT artifact_id::text, tenant_id, run_id, name,
                    content_type, size_bytes, sha256, object_key, source, created_by,
                    metadata, created_at, expires_at, deleted_at
             FROM artifacts
@@ -286,7 +356,14 @@ async def get_artifact(artifact_id: str, principal: PrincipalInfo = Depends(tena
     if not row:
         raise HTTPException(status_code=404, detail="Artifact not found")
     
-    return ArtifactResponse(**dict(row))
+    return _artifact_response(row)
+
+
+def _artifact_response(row: Any) -> ArtifactResponse:
+    record = dict(row)
+    if isinstance(record["metadata"], str):
+        record["metadata"] = json.loads(record["metadata"])
+    return ArtifactResponse(**record)
 
 
 @router.get("/v1/artifacts", response_model=ArtifactListResponse)
@@ -300,13 +377,18 @@ async def list_artifacts(
 ) -> ArtifactListResponse:
     """List artifacts for a run with cursor pagination."""
     async with store.connection() as conn:
-        if cursor:
-            cursor_parts = cursor.split(":")
-            cursor_created_at = cursor_parts[0]
-            cursor_artifact_id = cursor_parts[1] if len(cursor_parts) > 1 else None
+        if cursor is not None:
+            try:
+                timestamp, artifact_id = cursor.rsplit(":", 1)
+                cursor_created_at = datetime.fromisoformat(timestamp)
+                cursor_artifact_id = uuid.UUID(artifact_id)
+                if cursor_created_at.tzinfo is None:
+                    raise ValueError("Cursor timestamp requires a timezone")
+            except ValueError as exc:
+                raise HTTPException(422, "Invalid artifact cursor") from exc
             rows = await conn.fetch(
                 """
-                SELECT artifact_id::text, tenant_id, tenant_uuid::text, run_id, name,
+                SELECT artifact_id::text, tenant_id, run_id, name,
                        content_type, size_bytes, sha256, object_key, source, created_by,
                        metadata, created_at, expires_at, deleted_at
                 FROM artifacts
@@ -317,13 +399,13 @@ async def list_artifacts(
                 """,
                 run_id,
                 cursor_created_at,
-                uuid.UUID(cursor_artifact_id) if cursor_artifact_id else None,
+                cursor_artifact_id,
                 limit + 1,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT artifact_id::text, tenant_id, tenant_uuid::text, run_id, name,
+                SELECT artifact_id::text, tenant_id, run_id, name,
                        content_type, size_bytes, sha256, object_key, source, created_by,
                        metadata, created_at, expires_at, deleted_at
                 FROM artifacts
@@ -335,7 +417,7 @@ async def list_artifacts(
                 limit + 1,
             )
     
-    items = [ArtifactResponse(**dict(row)) for row in rows[:limit]]
+    items = [_artifact_response(row) for row in rows[:limit]]
     next_cursor = None
     if len(rows) > limit:
         last = rows[limit - 1]

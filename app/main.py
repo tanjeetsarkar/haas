@@ -60,6 +60,10 @@ from app.core.output_stream import (
     decode_delta,
     delta_key,
 )
+from app.core.phase_failure_projection import (
+    PhaseFailureProjectionError,
+    read_phase_failure_code,
+)
 from app.core.plugins import registry, resolve_run_allowlist
 from app.core.store import (
     DistributedStore,
@@ -103,6 +107,61 @@ def _require_any_action(actions: tuple[Action, ...]):
     return Depends(
         require_any_action(actions, allow_legacy_dev=settings.haas_profile == "dev")
     )
+
+
+async def _reject_unavailable_run_authority(request: Request) -> None:
+    """Temporary fail-closed gate: inspect presence before models can drop fields.
+
+    Remove only after durable authority and every dispatch path are enforced.
+    No client input or environment setting can enable this capability.
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        return  # Normal request validation handles non-object bodies.
+    facade = oai.is_facade_path(request.url.path)
+    containers = [("", body)]
+    if facade and isinstance(body.get("haas"), dict):
+        containers.append(("haas.", body["haas"]))
+    for prefix, values in containers:
+        for field in ("tools", "invocation_intent"):
+            if field not in values:
+                continue
+            # Preserve the existing facade error for OpenAI function definitions;
+            # these are not the native exact-name authority contract.
+            if (
+                facade and not prefix and field == "tools"
+                and isinstance(values[field], list) and values[field]
+                and all(isinstance(tool, dict) for tool in values[field])
+            ):
+                raise oai.facade_error(
+                    400, "Client-side tools are not supported.",
+                    code="unsupported_parameter", param="tools",
+                )
+            detail = "Run authority fields are unavailable until enforcement is complete."
+            if facade:
+                raise oai.facade_error(
+                    422, detail, code="restriction.unavailable", param=prefix + field,
+                )
+            raise HTTPException(422, detail)
+
+
+async def _reject_unavailable_run_phases(request: Request) -> None:
+    """Reject phase-shaped requests before models, replay, or facade lookups."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        return
+    facade = oai.is_facade_path(request.url.path)
+    containers = [("", body)]
+    if facade and isinstance(body.get("haas"), dict):
+        containers.append(("haas.", body["haas"]))
+    for prefix, values in containers:
+        if "phase_config" in values:
+            detail = "Run phases are unavailable until enforcement is complete."
+            if facade:
+                raise oai.facade_error(
+                    422, detail, code="phase.unavailable", param=prefix + "phase_config",
+                )
+            raise HTTPException(422, detail)
 
 
 def build_tier1_system_prompt(allowed_skills: list[str] | None = None) -> str:
@@ -546,6 +605,23 @@ async def _get_owned_run(run_id: str, tenant_id: str) -> dict[str, Any]:
     return run
 
 
+async def _phase_error_code(run: dict[str, Any]) -> str | None:
+    """Project only a failed phase run; legacy response shapes stay unchanged."""
+    if run["status"] != "failed" or (
+        run.get("phase_config_json") is None and run.get("phase_state_json") is None
+    ):
+        return None
+    try:
+        return await read_phase_failure_code(
+            store, tenant_id=run["tenant_id"], run_id=run["run_id"],
+        )
+    except PhaseFailureProjectionError:
+        raise HTTPException(
+            status_code=503, detail="Phase failure information is unavailable.",
+            headers={"x-should-retry": "false"},
+        ) from None
+
+
 async def _get_tenant_policy(tenant_id: str) -> TenantPolicy:
     record = await store.get_active_tenant_policy(tenant_id)
     if record is None:
@@ -753,7 +829,11 @@ async def list_runs(
     status_code=202,
     # Document the producer contract without narrowing the existing dict serializer.
     responses={202: {"model": CreateRunResponse}},
-    dependencies=[_require_action(Action.RUN_SUBMIT)],
+    dependencies=[
+        _require_action(Action.RUN_SUBMIT),
+        Depends(_reject_unavailable_run_authority),
+        Depends(_reject_unavailable_run_phases),
+    ],
 )
 async def create_run(
     req: CreateRunRequest,
@@ -1081,6 +1161,12 @@ async def _decide(
     ):
         raise HTTPException(422, "Idempotency-Key must be 1-255 URL-safe characters.")
     identity = get_authenticated_identity(request)
+    if run_id is None:
+        # All existing decision routes resolve a concrete run before this seam.
+        raise HTTPException(409, "Approval run binding is required.")
+    run = await _get_owned_run(run_id, tenant_id)
+    if run.get("authority_json") is not None or run.get("authority") is not None:
+        raise HTTPException(409, "restriction.resume_unavailable")
     request_id = str(uuid.uuid4())
     response.headers["X-Request-ID"] = request_id
     if secrets and run_id is not None:
@@ -1337,6 +1423,7 @@ async def get_run(
             "approval": approval,
         }
     deadline = run.get("deadline_at")
+    phase_error_code = await _phase_error_code(run)
     return {
         "run_id": run["run_id"],
         "thread_id": run["thread_id"],
@@ -1353,6 +1440,7 @@ async def get_run(
         "traceparent": run.get("traceparent"),
         "approval": approval,
         "budget": await store.run_budget(run),
+        **({"error_code": phase_error_code} if phase_error_code is not None else {}),
     }
 
 
@@ -1968,7 +2056,10 @@ async def _unsettled_error(run: dict[str, Any] | None, run_id: str) -> HTTPExcep
             409, "The run was cancelled.", code="run_cancelled", haas=meta, retry=False
         )
     if status == "failed":
-        code = run_error_code(run.get("result_text") or "")
+        try:
+            code = await _phase_error_code(run) or run_error_code(run.get("result_text") or "")
+        except HTTPException as exc:
+            return exc
         return oai.facade_error(
             422 if code.startswith(("budget.", "approval.")) else 502,
             run.get("result_text") or "The run failed.",
@@ -2012,7 +2103,11 @@ async def _settle_with_keepalive(
 
 @app.post(
     "/v1/chat/completions",
-    dependencies=[_require_action(Action.RUN_SUBMIT)],
+    dependencies=[
+        _require_action(Action.RUN_SUBMIT),
+        Depends(_reject_unavailable_run_authority),
+        Depends(_reject_unavailable_run_phases),
+    ],
     tags=["openai-compat"],
 )
 async def openai_chat_completions(
@@ -2092,7 +2187,7 @@ async def _response_view(
         await _usage(run["run_id"]),
         created=created,
         previous_response_id=previous_response_id,
-        error_code=run_error_code(run.get("result_text") or "")
+        error_code=(await _phase_error_code(run) or run_error_code(run.get("result_text") or ""))
         if run["status"] == "failed"
         else None,
         approval=await _approval_info(run)
@@ -2103,7 +2198,11 @@ async def _response_view(
 
 @app.post(
     "/v1/responses",
-    dependencies=[_require_action(Action.RUN_SUBMIT)],
+    dependencies=[
+        _require_action(Action.RUN_SUBMIT),
+        Depends(_reject_unavailable_run_authority),
+        Depends(_reject_unavailable_run_phases),
+    ],
     tags=["openai-compat"],
 )
 async def openai_create_response(
@@ -2151,7 +2250,11 @@ async def openai_create_response(
             seq = 0
             first = await store.get_run(run_id)
             if first is not None:
-                body = await _response_view(first, req.model, **view_args)
+                try:
+                    body = await _response_view(first, req.model, **view_args)
+                except HTTPException as exc:
+                    yield _sse_error(exc)
+                    return
                 yield oai.response_event("response.created", seq, response=body)
             run: dict[str, Any] | None = None
             async for run in _settle_with_keepalive(run_id):
@@ -2160,7 +2263,11 @@ async def openai_create_response(
             if run is None:
                 yield _sse_error(await _unsettled_error(None, run_id))
                 return
-            body = await _response_view(run, req.model, **view_args)
+            try:
+                body = await _response_view(run, req.model, **view_args)
+            except HTTPException as exc:
+                yield _sse_error(exc)
+                return
             if run["status"] == "completed":
                 item = f"msg_{run_id}"
                 for start in range(0, len(body["output_text"]), 4096):
@@ -2278,6 +2385,7 @@ from app.api import (  # noqa: E402
     access as _access_api,
     agent_mesh as _agent_mesh_api,
     artifacts as _artifacts_api,
+    internal_run_authorization as _internal_authorization_api,
     isolation as _isolation_api,
     marketplace as _marketplace_api,
     operations as _operations_api,
@@ -2290,5 +2398,6 @@ for _router_module in (
     _operations_api,
     _marketplace_api,
     _agent_mesh_api,
+    _internal_authorization_api,
 ):
     app.include_router(_router_module.router)

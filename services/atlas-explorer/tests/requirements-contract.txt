@@ -1,0 +1,2 @@
+# Optional development-only schema compatibility gate; not service runtime deps.
+jsonschema[format]>=4.26,<5

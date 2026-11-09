@@ -24,6 +24,10 @@ here named `NNNN-short-title.md` using the template below, and are added to the 
 | [ADR-16](0016-api-contract-toolchain.md) | API contract toolchain (OpenAPI 3.1, JSON Schema events, AsyncAPI, Spectral, oasdiff, deprecation headers); docs portal and SDK generator | Partially accepted — contract toolchain accepted; portal/SDK generator open (`d-docs-portal`, `d-sdk-*`) |
 | [ADR-17](0017-trusted-plugin-service-invocation.md) | Generic authenticated plugin-service invocation scope and safe dispatch | Proposed — selected directions and candidate profile recorded; claims, lifecycle, replay, catalog and IPC hypotheses unverified; separate implementation approval required |
 | [ADR-18](0018-domain-client-package-ownership.md) | Domain client packages belong to extensions; public generic SDK composition and coordinated export removal | Accepted — plan 010; package/version selected; no publication authorization |
+| [ADR-19](0019-artifact-multipart-validation-tenant-context.md) | Generic artifact API validation, tenant context, and canonical schema access | Accepted — plan 032 done on parent-reported tests/review; plan 034 in progress pending empty-cursor fix and independent review |
+| [ADR-20](0020-generic-audit-tenant-uuid-mapping.md) | Resolve tenant UUIDs for generic audit writes | Accepted — plan 033 done on parent-reported independent approval and Docker-backed authenticated API verification |
+| [ADR-21](0021-run-tool-restrictions-and-exact-intents.md) | Generic per-run tool restrictions, immutable exact invocation intents and separate approval connections | Proposed — plan 035; internal live authorization RPC selected for c2; exact-intent release gates remain |
+| [ADR-22](0022-bounded-acquisition-and-tool-free-finalization.md) | Generic bounded acquisition followed by a reserved tool-free finalization attempt | Accepted — plan 036 behavior/quotas and one reversible phase-state migration authorized; shared DB application not authorized |
 
 ## Template
 

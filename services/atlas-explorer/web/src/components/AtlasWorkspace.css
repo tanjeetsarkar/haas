@@ -1,0 +1,55 @@
+.atlas-live a { color: var(--atlas-accent); overflow-wrap: anywhere; }
+.atlas-live button { cursor: pointer; }
+.atlas-live button:disabled { cursor: not-allowed; opacity: .5; }
+.atlas-live input, .atlas-live textarea { min-width: 0; max-width: 100%; }
+.atlas-live pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.atlas-live .atlas-preview__brand { min-width: 0; overflow-wrap: anywhere; }
+.atlas-live .atlas-preview__inspector { min-width: 0; overflow-wrap: anywhere; }
+.atlas-live .atlas-preview__notice { overflow-wrap: anywhere; }
+.atlas-live small { display: block; color: var(--atlas-muted); }
+.atlas-live__persistence, .atlas-live__comparison, .atlas-live__approvals, .atlas-live__welcome {
+  max-width: 1540px; margin: 18px auto; padding: 16px; background: var(--atlas-panel);
+  border: 1px solid var(--atlas-line); border-radius: 12px; min-width: 0;
+}
+.atlas-live__toolbar, .atlas-live__toolbar form, .atlas-live__references {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+}
+.atlas-live__toolbar form { flex: 1; }
+.atlas-live__toolbar input { flex: 1; }
+.atlas-live__references { margin-top: 12px; }
+.atlas-live__references label { display: grid; gap: 4px; flex: 1 1 240px; color: var(--atlas-muted); }
+.atlas-live__persistence input, .atlas-live__approval textarea {
+  border: 1px solid var(--atlas-line); border-radius: 8px; padding: 8px;
+  background: #0b1220; color: var(--atlas-ink); font: inherit;
+}
+.atlas-live__persistence button, .atlas-live__approval button, .atlas-live__approvals button,
+.atlas-live__inspector button, .atlas-live .atlas-preview__facet-note button {
+  border: 1px solid var(--atlas-line); border-radius: 8px; padding: 8px 12px;
+  background: var(--atlas-panel-raised); color: var(--atlas-ink); font: inherit;
+}
+.atlas-live__persistence nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.atlas-live__attributes { margin: 0; }
+.atlas-live__attributes > div { margin-block: 10px; }
+.atlas-live__attributes dt { color: var(--atlas-muted); }
+.atlas-live__attributes dd { margin: 0; }
+.atlas-live__comparison summary { cursor: pointer; font-weight: 650; }
+.atlas-live__comparison fieldset { display: flex; flex-wrap: wrap; gap: 12px; border: 1px solid var(--atlas-line); margin-block: 12px; }
+.atlas-live__table-scroll { overflow-x: auto; max-width: 100%; }
+.atlas-live table { border-collapse: collapse; width: 100%; min-width: 420px; }
+.atlas-live th, .atlas-live td { border: 1px solid var(--atlas-line); padding: 12px; min-width: 150px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.atlas-live caption { text-align: left; color: var(--atlas-muted); padding: 10px 0; }
+.atlas-live__overlay { position: fixed; inset: 0; z-index: 20; background: #000a; display: flex; justify-content: flex-end; }
+.atlas-live__approval { width: min(660px, 100%); padding: 24px; background: var(--atlas-panel); overflow-y: auto; overflow-wrap: anywhere; }
+.atlas-live__approval header { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+.atlas-live__approval h2 { margin-top: 0; }
+.atlas-live__approval dd { margin-left: 0; }
+.atlas-live__approval dt { color: var(--atlas-accent); margin-top: 12px; }
+.atlas-live__approval pre { border: 1px solid var(--atlas-line); padding: 12px; border-radius: 8px; }
+.atlas-live__approval textarea { display: block; width: 100%; min-height: 80px; margin-block: 8px 16px; }
+.atlas-live__approval [role="alert"] { color: #ffc0b7; }
+@media (max-width: 600px) {
+  .atlas-live__toolbar { align-items: stretch; }
+  .atlas-live__toolbar form { flex-basis: 100%; }
+  .atlas-live__toolbar form label { flex-basis: 100%; }
+  .atlas-live__approval { padding: 16px; }
+}

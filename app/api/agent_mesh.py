@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import PrincipalInfo, requires, tenant_scope
 from app.core.authorization import Action
+from app.core.store import StoreConflictError, StoreNotFoundError
 from app.main import store
 
 router = APIRouter()
@@ -211,14 +212,25 @@ class MCPServerConfigResponse(BaseModel):
 @router.post("/v1/agent-mesh/delegations", response_model=DelegationResponse)
 async def create_delegation(request: DelegationCreateRequest, principal: PrincipalInfo = Depends(tenant_scope), _auth: None = requires(Action.AGENT_COLLABORATE)) -> DelegationResponse:
     """Create a delegation (spawn child agent)."""
-    async with store.connection() as conn:
+    async with store.connection() as conn, conn.transaction():
         # Verify parent run exists
         parent_run = await conn.fetchrow(
-            "SELECT * FROM runs WHERE run_id = $1",
+            "SELECT * FROM runs WHERE run_id = $1 AND "
+            "COALESCE(tenant_uuid::text,tenant_id)="
+            "COALESCE(resolve_haas_tenant_uuid($2)::text,$2)",
             request.parent_run_id,
+            principal.tenant_id,
         )
         if not parent_run:
             raise HTTPException(status_code=404, detail="Parent run not found")
+        try:
+            await store._check_parent_authority(conn, request.parent_run_id, principal.tenant_id)
+        except StoreNotFoundError:
+            raise HTTPException(status_code=404, detail="Parent run not found") from None
+        except StoreConflictError as exc:
+            code = ("phase.delegation_unavailable" if str(exc) == "phase.delegation_unavailable"
+                    else "restriction.derivation_unavailable")
+            raise HTTPException(status_code=409, detail=code) from None
         
         # Verify agent revision exists
         agent_rev = await conn.fetchrow(

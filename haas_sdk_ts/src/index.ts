@@ -18,6 +18,7 @@ export type {
   CapabilitiesResponse,
   
   // Runs
+  PhaseConfig,
   RunCreateRequest,
   RunResponse,
   RunStatus,

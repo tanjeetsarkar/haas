@@ -18,6 +18,7 @@ from celery import Task
 from pydantic import ValidationError
 
 from app.core.config import settings
+from app.core.acquisition_runtime import commit_acquisition_response, fail_acquisition_unavailable
 from app.core.context import (
     RunContext,
     SecurityViolationError,
@@ -41,10 +42,19 @@ from app.core.envelope import (
     sign_envelope,
     verify_envelope,
 )
-from app.core.llm import CompletionResult, OpenRouterGateway, repair_tool_json
+from app.core.llm import (
+    CompletionResult, FinalizerToolCallsError, OpenRouterGateway,
+    call_tool_free_finalizer_once, repair_tool_json,
+)
 from app.core.output_stream import DeltaPublisher
 from app.core.plugins import registry
-from app.core.store import DistributedStore
+from app.core.run_phases import (
+    PhaseBudget, advance_after_acquisition, calculate_quota, validate_phase_transition,
+)
+from app.core.run_restrictions import decode_authority
+from app.core.store import DistributedStore, decode_run_phases
+from app.core.worker_authorization import WorkerAuthorizationError
+from app.core.worker_restrictions import authorize_worker_intent
 from app.core.webhooks import (
     SIGNATURE_HEADER,
     WEBHOOK_ID_HEADER,
@@ -57,9 +67,11 @@ from app.core.webhooks import (
 )
 from app.core.workflow import (
     UNKNOWN_OUTCOME,
+    Effects,
     Lease,
     LeaseLostError,
     Publisher,
+    dec,
     effect_key,
 )
 from app.worker.celery_app import celery_app
@@ -164,6 +176,75 @@ async def _open_store() -> DistributedStore:
 
 
 # ---------------------------------------------------------------- orchestration
+
+
+async def _phase_exhaustion_route(
+    store: DistributedStore, lease: Lease, estimate_usd: Decimal,
+) -> str:
+    """Fenced exact preflight using durable counters and settled acquisition steps."""
+    if not isinstance(estimate_usd, Decimal) or not estimate_usd.is_finite() or estimate_usd < 0:
+        raise ValueError("phase.invalid_estimate")
+    fx = Effects()
+    async with store.connection() as conn:
+        row = await store._lock_run(conn, lease.run_id, lease.tenant_id)
+        if (
+            row is None or row["status"] != "running" or row["lease_epoch"] != lease.epoch
+            or row["state_version"] != lease.version
+        ):
+            raise LeaseLostError(lease.run_id)
+        config, state = decode_run_phases(row)
+        if config is None or state is None:
+            raise ValueError("phase.not_enabled")
+        if state.finalizer_attempted:
+            return "finalize"
+        if state.phase != "acquisition":
+            raise ValueError("phase.not_acquiring")
+        quota = calculate_quota(
+            config,
+            PhaseBudget(
+                max_steps=int(row["max_steps"]), max_cost_usd=dec(row["max_cost_usd"]),
+                max_tool_invocations=int(row["max_tool_invocations"]),
+            ),
+            estimated_finalizer_cost_usd=Decimal(0),
+        )
+        cost_check = await conn.fetchrow(
+            "SELECT $1::numeric + $2::numeric + $3::numeric + $4::numeric "
+            "<= $5::numeric AS fits, "
+            "$1::numeric + $2::numeric + $3::numeric < $5::numeric AS remaining",
+            dec(row["total_cost_usd"]), await store._uncertain_cost(conn, row),
+            row["budget_reserved_usd"], estimate_usd, quota.acquisition_max_cost_usd,
+        )
+        exhausted = (
+            int(row["step_count"]) >= quota.acquisition_max_steps
+            or int(row["tool_invocations_used"]) >= quota.acquisition_max_tool_invocations
+            or not cost_check["fits"] or not cost_check["remaining"]
+        )
+        finished_turn = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_steps WHERE tenant_id=$1 AND run_id=$2 "
+            "AND step_number=$3 AND status='completed')",
+            row["tenant_id"], row["run_id"], row["step_count"],
+        )
+        exhausted = exhausted or bool(finished_turn)
+        if not exhausted:
+            return "acquire"
+        if state.successful_tool_outcomes:
+            return "finalize"
+        failed = advance_after_acquisition(
+            state, successful_non_control_tool_outcome=False, no_tool_response=False,
+            acquisition_quota_exhausted=True, finalizer_capacity_available=True,
+        )
+        validate_phase_transition(state, failed)
+        await conn.execute(
+            "UPDATE runs SET phase_state_json=$2::jsonb WHERE run_id=$1",
+            row["run_id"], failed.model_dump_json(),
+        )
+        message = "Orchestrator step failed: no successful acquisition result."
+        await store._finalize(
+            conn, fx, row, "failed", message,
+            events=[("run_error", {"error": message})],
+        )
+    await store._after_commit(fx)
+    return "failed"
 
 
 def estimate_step_cost(
@@ -301,6 +382,9 @@ def build_invocation(
         "issued_at": now,
         "expires_at": now + settings.tool_outcome_timeout_sec,
     }
+    authority = decode_authority(run.get("authority_json"))
+    if authority is not None:
+        body["authority_json"] = authority.model_dump(mode="json")
     return {
         "invocation_id": invocation_id,
         "ordinal": ordinal,
@@ -374,6 +458,9 @@ async def _orchestrate(
 async def _step(
     store: DistributedStore, lease: Lease, run: dict[str, Any]
 ) -> dict[str, Any]:
+    authority = decode_authority(run.get("authority_json"))
+    if authority is not None and authority.intent is not None:
+        return await store.prepare_intent_approval(lease)
     run_id = lease.run_id
     step = int(run["step_count"]) + 1
     active_skills = set(run["active_skills"])
@@ -385,6 +472,82 @@ async def _step(
         primary_model=run["primary_model"],
         planner_model=run["planner_model"],
     )
+    if run.get("phase_config_json") is not None or run.get("phase_state_json") is not None:
+        tools_for_estimate = registry.resolve_sorted_tool_schemas(active_skills, skill_allowlist)
+        route = await _phase_exhaustion_route(
+            store, lease, estimate_step_cost(model, messages, tools_for_estimate),
+        )
+        if route == "acquire":
+            async with httpx.AsyncClient() as client:
+                # The ticket/reservation commit is acquisition's dispatch
+                # authorization, serialized with cancellation by the run lock.
+                # After it commits, cancellation cannot undo an in-flight call.
+                ticket = await store.begin_bounded_phase_step(
+                    lease, step=step, model=model,
+                    estimate_usd=estimate_step_cost(model, messages, tools_for_estimate),
+                    finalization=False,
+                )
+                if ticket is None:
+                    await fail_acquisition_unavailable(store, lease)
+                    return {"status": "failed", "reason": "phase_budget_or_deadline", "run_id": run_id}
+                try:
+                    completion = await gateway.chat_completion(
+                        client, model=model, messages=messages, tools=tools_for_estimate,
+                        traceparent=run["traceparent"],
+                    )
+                except Exception as exc:
+                    await store.fail_step(
+                        lease, ticket, f"Orchestrator step failed: {type(exc).__name__}: {exc}",
+                    )
+                    return {"status": "failed", "reason": "acquisition_model_error"}
+            kind = await commit_acquisition_response(
+                store, lease, ticket, completion,
+                lambda tc, ordinal: build_invocation(
+                    lease, run, step=step, ordinal=ordinal, tool_call_id=tc["id"],
+                    tool_name=tc["function"]["name"], arguments=_tool_call_arguments(tc),
+                ),
+            )
+            if kind == "finalize":
+                refreshed = await store.get_run(run_id)
+                if refreshed is None:
+                    raise LeaseLostError(run_id)
+                return await _step(store, lease, refreshed)
+            return {"status": kind, "run_id": run_id, "step": step}
+        if route == "failed":
+            return {"status": "failed", "reason": "no_successful_acquisition_result", "run_id": run_id}
+        ticket = None
+        try:
+            async with httpx.AsyncClient() as client:
+                # The claim commits under the same run lock as cancellation:
+                # it is the dispatch point of no return, not a read-only check.
+                ticket = await store.begin_bounded_phase_step(
+                    lease, step=step, model=model,
+                    estimate_usd=estimate_step_cost(model, messages, []),
+                    finalization=True, acquisition_quota_exhausted=True,
+                )
+                if ticket is None:
+                    return {
+                        "status": "failed", "reason": "phase_budget_or_unknown", "run_id": run_id
+                    }
+                completion = await call_tool_free_finalizer_once(
+                    gateway, client, model=model, messages=messages,
+                    traceparent=run["traceparent"],
+                )
+        except FinalizerToolCallsError as exc:
+            assert ticket is not None
+            kind = await store.settle_bounded_finalizer(
+                lease, ticket, completion=exc.completion, rejected=True,
+            )
+        except LeaseLostError:
+            raise
+        except Exception:
+            if ticket is None:
+                raise
+            kind = await store.settle_bounded_finalizer(lease, ticket, completion=None)
+        else:
+            assert ticket is not None
+            kind = await store.settle_bounded_finalizer(lease, ticket, completion=completion)
+        return {"status": kind, "run_id": run_id, "step": step}
     tools_payload = registry.resolve_sorted_tool_schemas(active_skills, skill_allowlist)
     ticket = await store.begin_step(
         lease,
@@ -711,6 +874,21 @@ async def _execute_envelope(
             )
         else:
             allowlist = body.get("skill_allowlist")
+            restricted = "authority_json" in body
+            if restricted:
+                try:
+                    await authorize_worker_intent(
+                        body, tool, registry, "pre_grant", name=name, raw=raw_args,
+                    )
+                except WorkerAuthorizationError:
+                    outcome = _outcome(
+                        call_id, name, fp, skills, "restriction.authorization_denied", True,
+                    )
+                    await redis.setex(
+                        f"haas:effect-result:{key}", EFFECT_TTL_SEC,
+                        json.dumps(["failed", outcome]),
+                    )
+                    return "failed", outcome
             # Redeem credential grants into scoped secrets (single-use GETDEL).
             granted_secrets: dict[str, str] = {}
             try:
@@ -724,6 +902,10 @@ async def _execute_envelope(
                     )
                     granted_secrets = redeemed
             except GrantError as exc:
+                if restricted:
+                    return "failed", _outcome(
+                        call_id, name, fp, skills, "restriction.authorization_denied", True,
+                    )
                 granted_secrets = {}
                 log.warning(
                     "credential grant redeemed failed for %s: %s",
@@ -745,6 +927,7 @@ async def _execute_envelope(
                 skill_allowlist=set(allowlist) if allowlist is not None else None,
                 effect_key=key,
                 egress_policy=egress_policy,
+                _authority_body=body if restricted else None,
             )
         status = "failed" if outcome["is_error"] else "succeeded"
         await redis.setex(
@@ -781,11 +964,16 @@ async def _async_execute_tool(
     skill_allowlist: set[str] | None = None,
     effect_key: str = "",
     egress_policy: EgressPolicy | None = None,
+    _authority_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tc_id = tool_call["id"]
     fn_name = tool_call["function"]["name"]
     raw_args = tool_call["function"].get("arguments", "{}")
     fp = _fingerprint(fn_name, raw_args)
+    if _authority_body is not None and (
+        run_id != _authority_body.get("run_id") or tenant_id != _authority_body.get("tenant_id")
+    ):
+        return _outcome(tc_id, fn_name, fp, active_skills, "restriction.authorization_denied", True)
 
     tool = registry.tools.get(fn_name)
     if not tool or fn_name not in registry.resolve_unlocked_tool_names(
@@ -802,8 +990,14 @@ async def _async_execute_tool(
         )
 
     try:
-        validated_args = tool.args_schema.model_validate(repair_tool_json(raw_args))
+        if _authority_body is not None:
+            # Parsing/strict validation also occurs before grant redemption.
+            validated_args = tool.args_schema.model_validate_json(raw_args, strict=True)
+        else:
+            validated_args = tool.args_schema.model_validate(repair_tool_json(raw_args))
     except (json.JSONDecodeError, ValidationError) as exc:
+        if _authority_body is not None:
+            return _outcome(tc_id, fn_name, fp, active_skills, "restriction.authorization_denied", True)
         return _outcome(
             tc_id,
             fn_name,
@@ -814,8 +1008,9 @@ async def _async_execute_tool(
         )
 
     # Open a store connection for tools that need database access
-    store = DistributedStore()
-    await store.init(pool_max=TASK_POOL_MAX, service=True)
+    store = DistributedStore() if _authority_body is None else None
+    if store is not None:
+        await store.init(pool_max=TASK_POOL_MAX, service=True)
     
     async with httpx.AsyncClient() as http_client:
         # Create an egress meter for this tool invocation
@@ -842,6 +1037,11 @@ async def _async_execute_tool(
         # Execute tool either in sandbox or in-process
         if settings.sandbox_mode == "sandbox":
             try:
+                if _authority_body is not None:
+                    await authorize_worker_intent(
+                        _authority_body, tool, registry, "final_entry",
+                        name=fn_name, raw=raw_args, validated=validated_args,
+                    )
                 ok, observation, error_msg = await execute_in_sandbox(
                     tool_name=fn_name,
                     validated_args=validated_args,
@@ -873,7 +1073,11 @@ async def _async_execute_tool(
                     f"Sandbox Error [{error_msg}]",
                     True,
                 )
+            except WorkerAuthorizationError:
+                return _outcome(tc_id, fn_name, fp, active_skills, "restriction.authorization_denied", True)
             except SandboxSetupError:
+                if _authority_body is not None:
+                    return _outcome(tc_id, fn_name, fp, active_skills, "restriction.authorization_denied", True)
                 # Fall through to in-process execution
                 pass
             except Exception as exc:
@@ -888,6 +1092,11 @@ async def _async_execute_tool(
 
         # In-process execution (fallback or when sandbox_mode != "sandbox")
         try:
+            if _authority_body is not None:
+                await authorize_worker_intent(
+                    _authority_body, tool, registry, "final_entry",
+                    name=fn_name, raw=raw_args, validated=validated_args,
+                )
             if inspect.iscoroutinefunction(tool.handler):
                 awaitable = tool.handler(*args)
             else:
@@ -903,6 +1112,8 @@ async def _async_execute_tool(
                 _bound_observation(fn_name, tc_id, str(raw_out)),
                 False,
             )
+        except WorkerAuthorizationError:
+            return _outcome(tc_id, fn_name, fp, active_skills, "restriction.authorization_denied", True)
         except asyncio.TimeoutError:
             return _outcome(
                 tc_id,
@@ -926,7 +1137,8 @@ async def _async_execute_tool(
                 True,
             )
         finally:
-            await store.close()
+            if store is not None:
+                await store.close()
 
 
 @celery_app.task(

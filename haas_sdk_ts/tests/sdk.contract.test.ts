@@ -171,6 +171,26 @@ describe('asynchronous calls and producer-backed JSON responses', () => {
       }));
   });
 
+  it('sends an explicit phase_config unchanged and does not add one by default', async () => {
+    const fetch = mockFetch().mockResolvedValue(json(admitted, 202));
+    const phase_config = {
+      version: 1,
+      mode: 'bounded_acquisition_finalization',
+      reserve_basis_points: 2000,
+    } as const;
+    const request: RunCreateRequest = { prompt: 'qa', phase_config };
+    await client().createRun(request);
+    expect(fetch).toHaveBeenCalledWith('https://harness.example/v1/runs',
+      expect.objectContaining({ body: JSON.stringify(request) }));
+    expect(JSON.parse((fetch.mock.calls[0][1] as RequestInit).body as string))
+      .toEqual({ prompt: 'qa', phase_config });
+
+    const legacyFetch = mockFetch().mockResolvedValue(json(admitted, 202));
+    await client().createRun({ prompt: 'legacy' });
+    expect(JSON.parse((legacyFetch.mock.calls[0][1] as RequestInit).body as string))
+      .toEqual({ prompt: 'legacy' });
+  });
+
   it('preserves list null cursor and the complete durable paged event envelope', async () => {
     // app/main.py list_runs/list_run_events; run-events.v1.schema.json.
     const page = { items: [queued], next_after: 1, latest_sequence: 1 };

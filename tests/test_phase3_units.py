@@ -169,6 +169,9 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
     class Store:
         rds = type("FakeRedis", (), {"set": _noop, "expire": _noop, "hset": _noop})()
 
+        async def get_run(self, run_id):
+            return {"run_id": run_id, "tenant_id": "tenant-1", "authority_json": None}
+
         async def get_scoped_secrets(self, run_id: str, keys: set[str]):
             return {k: f"{run_id}:{k}" for k in keys}
 
@@ -183,6 +186,11 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
             return EgressPolicy()
 
     publish = tasks.make_outbox_publisher(Store())  # type: ignore[arg-type]
+    call = {"id": "c1", "name": "bash", "arguments": "{}"}
+    envelope = sign_envelope(_body(
+        invocation_id="inv-1", tool_call=call, run_id="r1", tenant_id="tenant-1",
+        arguments_digest=arguments_digest("bash", "{}"),
+    ))
     await publish(
         {
             "message_id": "m1",
@@ -199,7 +207,7 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
             "tenant_id": "tenant-1",
             "destination": "tool",
             "payload": {
-                "envelope": {"body": {"invocation_id": "inv-1", "tool_call": {"name": "bash"}}},
+                "envelope": envelope,
                 "queue": "q_tools_sandbox",
                 "secret_keys": ["GH"],
             },
@@ -226,9 +234,7 @@ async def test_outbox_publisher_routes_each_destination(monkeypatch):
             "task_id": "m1",
         }
     ]
-    assert execute.calls[0]["kwargs"]["envelope"] == {
-        "body": {"invocation_id": "inv-1", "tool_call": {"name": "bash"}}
-    }
+    assert execute.calls[0]["kwargs"]["envelope"] == envelope
     assert isinstance(execute.calls[0]["kwargs"]["credential_grants"], list)
     assert execute.calls[0]["kwargs"]["egress_policy"] is not None
     assert execute.calls[0]["queue"] == "q_tools_sandbox"

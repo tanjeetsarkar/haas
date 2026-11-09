@@ -35,6 +35,9 @@ from app.core.config import settings
 from app.core.egress import EgressPolicy
 from app.core.envelope import EnvelopeError, arguments_digest, sign_envelope, verify_envelope
 from app.core.redaction import register_secret_values
+from app.core.run_restrictions import (
+    RestrictionError, check_dispatch_authority, decode_authority,
+)
 
 log = logging.getLogger("haas.credentials")
 
@@ -291,9 +294,41 @@ def open_egress_policy(doc: dict[str, Any] | None, *, invocation_id: str) -> Egr
 async def prepare_tool_dispatch(store: Any, message: dict[str, Any]) -> dict[str, Any]:
     """Extra ``execute_tool_task`` kwargs for one tool outbox message (no secret values)."""
     payload = message["payload"]
-    body = payload["envelope"]["body"]
+    body = verify_envelope(payload["envelope"])
     tenant_id = str(message["tenant_id"])
     run_id = str(message["run_id"])
+    run = await store.get_run(run_id)
+    if run is None:
+        raise RestrictionError("restriction.run_unavailable")
+    # Resolve aliases from the persisted joined row, never from broker assertions.
+    tenants = {str(run[key]) for key in ("tenant_id", "tenant_uuid", "tenant_slug")
+               if run.get(key) is not None}
+    if (
+        run.get("run_id") != run_id or body.get("run_id") != run_id
+        or tenant_id not in tenants or str(body.get("tenant_id")) not in tenants
+    ):
+        raise RestrictionError("restriction.provenance_mismatch")
+    authority = decode_authority(run.get("authority_json"))
+    claimed = decode_authority(body.get("authority"))
+    if claimed != authority:
+        raise RestrictionError("restriction.authority_mismatch")
+    if authority is not None:
+        from app.core.plugins import registry
+        from app.core.tenant_policy import TenantPolicy
+
+        record = await store.get_active_tenant_policy(str(run["tenant_uuid"]))
+        if record is None:
+            raise RestrictionError("restriction.policy_denied")
+        policy = TenantPolicy.from_record(record)
+        if policy.policy_revision_id != str(run.get("policy_revision_id")):
+            raise RestrictionError("restriction.policy_denied")
+        check_dispatch_authority(
+            authority, str(body["tool_call"]["name"]),
+            policy_tools=policy.resolve_plugin_access(registry).tool_names,
+            unlocked_tools=registry.resolve_unlocked_tool_names(
+                set(run["active_skills"]), run.get("skill_allowlist"),
+            ),
+        )
     invocation_id = str(body["invocation_id"])
     tool_name = str(body["tool_call"]["name"])
     plugin_id, _ = plugin_identity(tool_name)

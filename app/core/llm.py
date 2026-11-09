@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from app.core.phase_failures import FINALIZER_TOOL_CALLS
+
 
 def repair_tool_json(raw: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
@@ -54,6 +56,36 @@ class CompletionResult:
 
 
 DeltaSink = Callable[[str], Awaitable[None]]
+
+
+class FinalizerToolCallsError(ValueError):
+    """Rejected finalizer output, retaining usage for durable settlement."""
+
+    def __init__(self, completion: CompletionResult) -> None:
+        super().__init__(FINALIZER_TOOL_CALLS)
+        self.code = FINALIZER_TOOL_CALLS
+        self.completion = completion
+
+
+async def call_tool_free_finalizer_once(
+    gateway: OpenRouterGateway,
+    client: httpx.AsyncClient,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    traceparent: str,
+) -> CompletionResult:
+    """Make exactly one tool-free gateway call; caller owns the durable claim.
+
+    This helper is not a retry or recovery boundary. Call only after a fenced
+    finalizer claim, and settle or fail the claim even if this call raises.
+    """
+    result = await gateway.chat_completion(
+        client, model=model, messages=messages, tools=[], traceparent=traceparent,
+    )
+    if result.assistant_message.get("tool_calls"):
+        raise FinalizerToolCallsError(result)
+    return result
 
 
 class _StreamAccumulator:

@@ -69,6 +69,7 @@ from haas_sdk.models import (
     UsageEntry,
     WebhookEvent,
 )
+from haas_sdk.phase_config import PhaseConfig
 from haas_sdk.secrets import Secret
 
 __all__ = [
@@ -105,6 +106,7 @@ __all__ = [
     "Membership",
     "NotFoundError",
     "Page",
+    "PhaseConfig",
     "PendingCall",
     "PermissionDeniedError",
     "PluginCatalog",

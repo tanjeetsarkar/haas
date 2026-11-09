@@ -67,6 +67,8 @@ class RegisteredTool:
     # static: catalog-only entry whose code exists only inside the sandbox.
     execution: str = "inprocess"
     secret_keys: list[str] = field(default_factory=list)
+    endpoint_url: str = ""
+    endpoint_protocol: str = ""
 
     def to_openai_schema(self) -> dict[str, Any]:
         if self.parameters_schema is not None:
@@ -435,6 +437,8 @@ class PluginRegistry:
             queue=queue,
             plugin_id=owner,
             secret_key=secret_key or "",
+            endpoint_url=endpoint_url,
+            endpoint_protocol=protocol,
         )
 
     # --- discovery -----------------------------------------------------------------------

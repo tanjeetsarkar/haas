@@ -30,3 +30,17 @@ before starting new work. Workflow and handoff rules: [AGENTS.md](../../AGENTS.m
 | 021 | [Stage Atlas explorer stylesheets](021-atlas-ui-stylesheets-copy.md) | done |
 | 022 | [Stage Atlas explorer component](022-atlas-ui-explorer-component-copy.md) | done |
 | 023 | [Activate the Atlas service UI](023-atlas-ui-service-ui-activation.md) | done |
+| 024 | [Atlas knowledge exploration UX — epic](024-atlas-exploration-ux-epic.md) | in-progress — A–D done; live workspace default and conditional service-UI retirement reported; live research/authorization proof pending |
+| 025 | [Atlas exploration contract foundation](025-atlas-exploration-contract-foundation.md) | done — independent reviewer APPROVE; 13 client tests pass |
+| 026 | [Atlas exploration runtime validation](026-atlas-exploration-validation.md) | done — independent reviewer APPROVE; combined B/C 113 client / 19 isolated Python tests pass |
+| 027 | [Atlas exploration navigation state](027-atlas-exploration-navigation.md) | done — independent reviewer APPROVE; local immutable navigation and update guard only |
+| 028 | [Atlas fixture-only Miller-column preview](028-atlas-miller-column-preview.md) | done — independent reviewer APPROVE after review fix round 1; opt-in fixture preview only |
+| 029 | [Atlas live public-API client and immutable snapshots](029-atlas-live-client-snapshots.md) | in-progress — source-pair/branch-history fix independently approved; current live research graph and remaining security proof pending |
+| 030 | [Atlas loopback-only authenticated development proxy](030-atlas-loopback-proxy.md) | done — independent APPROVE, 78 tests reported, authenticated live `/v1/me` returned 200; production gateway remains out of scope |
+| 031 | [Atlas live workspace, capability parity and legacy retirement](031-atlas-live-workspace-parity-retirement.md) | in-progress — default live UI and conditional legacy service-UI retirement reported; latest web 120 tests/build/typecheck pass reported; live proof pending |
+| 032 | [Generic artifact multipart validation and tenant context cleanup](032-artifact-upload-validation-fix.md) | done — 112 targeted tests reported passing, independent review approved; browser-native artifact round trip recorded under 034 |
+| 033 | [Resolve tenant UUIDs for generic audit writes](033-audit-tenant-uuid-mapping.md) | done — independent review approved; Docker-backed authenticated `POST /v1/threads` 201, configured identity 200 and mismatch 403 reported |
+| 034 | [Generic artifact CRUD against the canonical schema](034-artifact-canonical-schema-roundtrip.md) | in-progress — 126 tests incl. 14 DB tests and browser save/list/download byte match reported; empty-cursor fix and independent review pending |
+| 035 | [Bounded external-action initiation — epic and first slice](035-bounded-action-initiation.md) | proposed — generic restriction/separate approver direction user-approved; detailed contract proposed; live approval credential/session boundary unavailable |
+| 036 | [Bounded acquisition and tool-free finalization — epic and first slices](036-bounded-acquisition-finalization.md) | approved for 036a/036b implementation; one reversible migration authorized for disposable verification only; no shared DB apply or execution claimed |
+| 037 | [Live final-entry authorization RPC — 035c2](037-live-final-entry-authorization-rpc.md) | approved design; implementation gated on confirming existing worker service-auth identity; no new auth mechanism or env setting inferred |

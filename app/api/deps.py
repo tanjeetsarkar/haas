@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, AsyncIterator
 
 from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -83,13 +83,14 @@ def get_principal(request: Request) -> PrincipalInfo:
     )
 
 
-def tenant_scope(
+async def tenant_scope(
     principal: PrincipalInfo = Depends(get_principal),
-) -> Iterator[PrincipalInfo]:
+) -> AsyncIterator[PrincipalInfo]:
     """Set the tenant context for the duration of the request, then reset.
 
     Any code that calls ``store.connection()`` inside this dependency's
     lifetime automatically runs with RLS scoped to ``principal.tenant_id``.
+    Enter and exit on the request task, not separate threadpool contexts.
     """
     token = tenant_context.set(principal.tenant_id)
     try:

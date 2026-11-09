@@ -1,0 +1,163 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://atlas.invalid/schemas/atlas-exploration.v2.json",
+  "title": "Atlas exploration v2 (structural contract; semantic checks also required)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "exploration_id", "revision", "root_query", "interpretation", "entities", "sources", "claims", "relationships", "occurrences", "paths", "active_path_id", "requests", "actions"],
+  "properties": {
+    "schema_version": { "const": "atlas-exploration.v2" },
+    "exploration_id": { "$ref": "#/definitions/id" },
+    "revision": { "$ref": "#/definitions/counter" },
+    "root_query": { "$ref": "#/definitions/id" },
+    "interpretation": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["kind", "subject_entity_id"], "properties": {
+        "kind": { "const": "resolved" }, "subject_entity_id": { "$ref": "#/definitions/id" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "candidate_entity_ids"], "properties": {
+        "kind": { "const": "ambiguous" }, "candidate_entity_ids": { "$ref": "#/definitions/refs" }
+      } }
+    ] },
+    "entities": { "type": "array", "items": { "$ref": "#/definitions/entity" } },
+    "sources": { "type": "array", "items": { "$ref": "#/definitions/source" } },
+    "claims": { "type": "array", "items": { "$ref": "#/definitions/claim" } },
+    "relationships": { "type": "array", "items": { "$ref": "#/definitions/relationship" } },
+    "occurrences": { "type": "array", "items": { "$ref": "#/definitions/occurrence" } },
+    "paths": { "type": "array", "items": { "$ref": "#/definitions/path" } },
+    "active_path_id": { "$ref": "#/definitions/nullableId" },
+    "requests": { "type": "array", "items": { "$ref": "#/definitions/request" } },
+    "actions": { "type": "array", "items": { "$ref": "#/definitions/action" } }
+  },
+  "definitions": {
+    "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "nullableId": { "anyOf": [{ "$ref": "#/definitions/id" }, { "type": "null" }] },
+    "counter": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "date": { "type": "string", "format": "date-time" },
+    "refs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/id" } },
+    "evidence": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["status", "source_ids"], "properties": {
+        "status": { "const": "sourced" }, "source_ids": { "$ref": "#/definitions/refs" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["status", "supporting_source_ids", "opposing_source_ids"], "properties": {
+        "status": { "const": "conflicting" }, "supporting_source_ids": { "$ref": "#/definitions/refs" }, "opposing_source_ids": { "$ref": "#/definitions/refs" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["status", "reason"], "properties": {
+        "status": { "const": "unsupported" }, "reason": { "$ref": "#/definitions/id" }
+      } }
+    ] },
+    "facet": {
+      "type": "object", "additionalProperties": false, "required": ["key", "label", "scope", "status"],
+      "properties": { "key": { "$ref": "#/definitions/id" }, "label": { "type": "string" }, "scope": { "type": "string" },
+        "status": { "enum": ["known", "research_needed", "unavailable"] }, "reason": { "$ref": "#/definitions/id" } },
+      "if": { "properties": { "status": { "const": "unavailable" } } },
+      "then": { "required": ["reason"] }, "else": { "not": { "required": ["reason"] } }
+    },
+    "entity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entity_id", "kind", "title", "summary", "identity_status", "external_references", "facets"],
+      "properties": {
+        "entity_id": { "$ref": "#/definitions/id" }, "kind": { "enum": ["concept", "category", "person", "organization", "place", "product", "event", "other"] },
+        "title": { "type": "string" }, "summary": { "type": "string" }, "identity_status": { "enum": ["resolved", "candidate"] },
+        "external_references": { "type": "array", "uniqueItems": true, "items": {
+          "type": "object", "additionalProperties": false, "required": ["namespace", "value"],
+          "properties": { "namespace": { "$ref": "#/definitions/id" }, "value": { "$ref": "#/definitions/id" } }
+        } },
+        "facets": { "type": "array", "items": { "$ref": "#/definitions/facet" } }
+      }
+    },
+    "source": {
+      "type": "object", "additionalProperties": false, "required": ["source_id", "url", "title", "publisher", "retrieved_at", "excerpt", "trust"],
+      "properties": {
+        "source_id": { "$ref": "#/definitions/id" }, "url": { "type": "string", "format": "uri", "pattern": "^[hH][tT][tT][pP][sS]?://" },
+        "title": { "type": "string" }, "publisher": { "type": "string" }, "retrieved_at": { "$ref": "#/definitions/date" },
+        "excerpt": { "type": "string" }, "trust": { "enum": ["official", "third_party", "unverified"] }
+      }
+    },
+    "claimDetails": {
+      "type": "object", "additionalProperties": false, "minProperties": 1,
+      "properties": {
+        "attributes": { "type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["key", "label", "value"],
+          "properties": {
+            "key": { "$ref": "#/definitions/id" }, "label": { "type": "string" },
+            "value": { "anyOf": [
+              { "type": "string" }, { "type": "number" }, { "type": "boolean" }, { "type": "null" },
+              { "type": "array", "items": { "type": "string" } }
+            ] },
+            "unit": { "type": "string" }, "uncertainty": { "type": "string" }
+          }
+        } },
+        "checklist": { "type": "array", "items": {
+          "type": "object", "additionalProperties": false, "required": ["id", "text", "required"],
+          "properties": {
+            "id": { "$ref": "#/definitions/id" }, "text": { "type": "string" },
+            "required": { "type": "boolean" }
+          }
+        } },
+        "draft": { "type": "object", "additionalProperties": false, "required": ["title", "body"],
+          "properties": { "title": { "type": "string" }, "body": { "type": "string" } } }
+      }
+    },
+    "claim": {
+      "type": "object", "additionalProperties": false, "required": ["claim_id", "subject_entity_id", "text", "observed_at", "evidence"],
+      "properties": {
+        "claim_id": { "$ref": "#/definitions/id" }, "subject_entity_id": { "$ref": "#/definitions/id" }, "facet_key": { "$ref": "#/definitions/id" },
+        "text": { "type": "string" }, "observed_at": { "$ref": "#/definitions/date" }, "evidence": { "$ref": "#/definitions/evidence" },
+        "details": { "$ref": "#/definitions/claimDetails" }
+      }
+    },
+    "relationship": {
+      "type": "object", "additionalProperties": false, "required": ["relationship_id", "from_entity_id", "to_entity_id", "label", "verification", "evidence"],
+      "properties": {
+        "relationship_id": { "$ref": "#/definitions/id" }, "from_entity_id": { "$ref": "#/definitions/id" }, "to_entity_id": { "$ref": "#/definitions/id" },
+        "label": { "type": "string" }, "verification": { "enum": ["confirmed", "suggested"] }, "evidence": { "$ref": "#/definitions/evidence" }
+      }
+    },
+    "target": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["kind", "entity_id"], "properties": {
+        "kind": { "const": "entity" }, "entity_id": { "$ref": "#/definitions/id" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "entity_id", "facet_key"], "properties": {
+        "kind": { "const": "facet" }, "entity_id": { "$ref": "#/definitions/id" }, "facet_key": { "$ref": "#/definitions/id" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "source_id"], "properties": {
+        "kind": { "const": "source" }, "source_id": { "$ref": "#/definitions/id" }
+      } }
+    ] },
+    "occurrence": {
+      "type": "object", "additionalProperties": false, "required": ["occurrence_id", "path_id", "parent_occurrence_id", "target"],
+      "properties": {
+        "occurrence_id": { "$ref": "#/definitions/id" }, "path_id": { "$ref": "#/definitions/id" },
+        "parent_occurrence_id": { "$ref": "#/definitions/nullableId" }, "target": { "$ref": "#/definitions/target" }
+      }
+    },
+    "path": {
+      "type": "object", "additionalProperties": false, "required": ["path_id", "parent_path_id", "selected_occurrence_ids"],
+      "properties": {
+        "path_id": { "$ref": "#/definitions/id" }, "parent_path_id": { "$ref": "#/definitions/nullableId" },
+        "selected_occurrence_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/id" } }
+      }
+    },
+    "request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_id", "exploration_id", "path_id", "parent_occurrence_id", "run_id", "thread_id", "committed_history_version", "last_sequence", "status"],
+      "properties": {
+        "request_id": { "$ref": "#/definitions/id" }, "exploration_id": { "$ref": "#/definitions/id" }, "path_id": { "$ref": "#/definitions/id" },
+        "parent_occurrence_id": { "$ref": "#/definitions/nullableId" }, "run_id": { "$ref": "#/definitions/id" }, "thread_id": { "$ref": "#/definitions/id" },
+        "committed_history_version": { "$ref": "#/definitions/counter" }, "last_sequence": { "$ref": "#/definitions/counter" },
+        "status": { "enum": ["loading", "partial", "completed", "failed", "cancelled"] }
+      }
+    },
+    "action": {
+      "type": "object", "additionalProperties": false, "required": ["action_id", "label", "target", "kind", "requires_approval"],
+      "properties": {
+        "action_id": { "$ref": "#/definitions/id" }, "label": { "type": "string" }, "target": { "$ref": "#/definitions/target" },
+        "kind": { "enum": ["local", "external"] }, "requires_approval": { "type": "boolean" },
+        "operation": { "enum": ["inspect_sources", "open_connections"] }, "tool_name": { "$ref": "#/definitions/id" }
+      },
+      "if": { "properties": { "kind": { "const": "local" } } },
+      "then": { "required": ["operation"], "properties": { "requires_approval": { "const": false } }, "not": { "required": ["tool_name"] } },
+      "else": { "required": ["tool_name"], "properties": { "requires_approval": { "const": true } }, "not": { "required": ["operation"] } }
+    }
+  }
+}
