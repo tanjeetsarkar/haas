@@ -3,7 +3,7 @@
  */
 
 import React from 'react';
-import { AtlasLayerNode } from '@haas/sdk';
+import type { AtlasLayerNode } from '@haas/atlas-explorer-client';
 import './PricingTierCard.css';
 
 interface PricingTierCardProps {

@@ -1201,6 +1201,47 @@
         "title": "CreateRunRequest",
         "type": "object"
       },
+      "CreateRunResponse": {
+        "additionalProperties": true,
+        "description": "Run admission response; additive fields remain supported.",
+        "properties": {
+          "created_at": {
+            "description": "Persisted run creation time in epoch seconds.",
+            "title": "Created At",
+            "type": "number"
+          },
+          "events_url": {
+            "title": "Events Url",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_url": {
+            "title": "Stream Url",
+            "type": "string"
+          },
+          "thread_id": {
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "thread_id",
+          "status",
+          "stream_url",
+          "events_url",
+          "created_at"
+        ],
+        "title": "CreateRunResponse",
+        "type": "object"
+      },
       "CreateTenantAPIKeyRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1241,6 +1282,25 @@
           "rules"
         ],
         "title": "CreateTenantPolicyRequest",
+        "type": "object"
+      },
+      "CreateThreadRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          }
+        },
+        "title": "CreateThreadRequest",
         "type": "object"
       },
       "CredentialGrantRequest": {
@@ -9675,7 +9735,7 @@
         "summary": "List Revisions"
       },
       "post": {
-        "description": "Create a plugin revision (publish).",
+        "description": "Create a plugin revision (publish) with automated review, signature verification, and transparency log.",
         "operationId": "create_revision_v1_marketplace_revisions_post",
         "requestBody": {
           "content": {
@@ -11358,6 +11418,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "$ref": "#/components/schemas/CreateRunResponse",
                   "additionalProperties": true,
                   "title": "Response Create Run V1 Runs Post",
                   "type": "object"
@@ -12140,6 +12201,56 @@
           }
         },
         "summary": "List Threads"
+      },
+      "post": {
+        "operationId": "create_thread_v1_threads_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-tenant-id",
+            "required": false,
+            "schema": {
+              "default": "default-tenant",
+              "title": "X-Tenant-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Thread V1 Threads Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Thread"
       }
     },
     "/v1/threads/{thread_id}": {

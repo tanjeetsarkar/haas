@@ -92,6 +92,10 @@ approver key to inspect/approve its pending action in the TUI with `/approve <ru
 through the API. The queued run ID is displayed in the chat. Use
 `haas dev seed --rotate-key` to revoke and replace both keys.
 
+For the full local API + PostgreSQL + SearXNG + Atlas UI workflow, see the
+[Atlas Explorer local runbook](docs/atlas-explorer-local-runbook.md). The browser
+UI is a loopback-only development flow; it does not yet support authenticated sign-in.
+
 ### OpenAI-compatible access and API contracts
 
 Existing OpenAI SDKs can target `http://127.0.0.1:18000/v1` with a HaaS API key and

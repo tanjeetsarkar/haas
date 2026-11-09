@@ -9,7 +9,7 @@ import pytest
 
 import app.main as main_module
 from app.main import app
-from haas_sdk import AsyncHaas, NotFoundError
+from haas_sdk import AsyncHaas, NotFoundError, Run, RunEvent
 
 ROWS = [
     {
@@ -67,14 +67,25 @@ async def test_async_sdk_pages_filters_and_errors_against_app(stub_store: None) 
         transport=httpx.ASGITransport(app=app),
     ) as haas:
         page = await haas.runs.list(limit=5, status="failed", thread_id="thd-a")
-        assert page.items and all(
-            r.status == "failed" and r.thread_id == "thd-a" for r in page.items
-        )
+        assert all(isinstance(run, Run) for run in page.items)
+        assert [(run.run_id, run.status, run.thread_id) for run in page.items] == [
+            ("run-27", "failed", "thd-a"),
+            ("run-21", "failed", "thd-a"),
+            ("run-15", "failed", "thd-a"),
+            ("run-09", "failed", "thd-a"),
+            ("run-03", "failed", "thd-a"),
+        ]
+        assert page.items[0].step_count == 1
+        assert page.items[0].created_at == 1_700_000_027.0
         every = [r.run_id async for r in haas.runs.iter(page_size=7)]
         assert every == [r["run_id"] for r in ROWS]
         events = await haas.runs.events("run-01", after=1)
-        assert [e.type for e in events.items] == ["run_completed"]
-        assert events.items[0].sequence == 2
+        assert all(isinstance(event, RunEvent) for event in events.items)
+        assert [(event.type, event.sequence, event.data) for event in events.items] == [
+            ("run_completed", 2, {"result": "ok"})
+        ]
         with pytest.raises(NotFoundError) as info:
             await haas.runs.get("nope")
+        assert info.value.status == 404
         assert info.value.request_id
+        assert "Run not found." in str(info.value)

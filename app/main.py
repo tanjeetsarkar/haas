@@ -237,6 +237,19 @@ class ResumeRunRequest(BaseModel):
     batch_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
+class CreateRunResponse(BaseModel):
+    """Run admission response; additive fields remain supported."""
+
+    model_config = ConfigDict(extra="allow")
+
+    run_id: str
+    thread_id: str
+    status: str
+    stream_url: str
+    events_url: str
+    created_at: float = Field(description="Persisted run creation time in epoch seconds.")
+
+
 class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -738,6 +751,8 @@ async def list_runs(
 @app.post(
     "/v1/runs",
     status_code=202,
+    # Document the producer contract without narrowing the existing dict serializer.
+    responses={202: {"model": CreateRunResponse}},
     dependencies=[_require_action(Action.RUN_SUBMIT)],
 )
 async def create_run(
@@ -761,7 +776,10 @@ async def create_run(
             "request_digest": _admission_digest(req),
         }
         previous = await store.find_admission(
-            x_tenant_id, admission["principal_key"], idempotency_key
+            x_tenant_id,
+            admission["principal_key"],
+            idempotency_key,
+            include_created_at=True,
         )
         if previous is not None:
             if previous["request_digest"] != admission["request_digest"]:
@@ -909,7 +927,7 @@ async def create_run(
         )
     history.append({"role": "user", "content": req.prompt})
 
-    result = {
+    result: dict[str, Any] = {
         "run_id": run_id,
         "thread_id": thread_id,
         "status": "queued",
@@ -921,7 +939,7 @@ async def create_run(
     # Secrets must exist before admission commits: the outbox relay may dispatch immediately.
     await store.store_ephemeral_secrets(run_id, req.secrets)
     try:
-        await store.create_run(
+        created_at = await store.create_run(
             run_id=run_id,
             thread_id=thread_id,
             tenant_id=x_tenant_id,
@@ -942,6 +960,7 @@ async def create_run(
             else None,
             expected_history_version=req.expected_history_version,
             admission=admission,
+            include_created_at=True,
             deadline_sec=req.deadline_sec,
             max_tool_invocations=req.max_tool_invocations,
         )
@@ -963,6 +982,7 @@ async def create_run(
     except BaseException:
         await store.clear_ephemeral_secrets(run_id)
         raise
+    result["created_at"] = created_at
     return result
 
 

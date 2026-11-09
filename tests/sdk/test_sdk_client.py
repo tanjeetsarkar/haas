@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import time
 from typing import Any
 
 import httpx
@@ -18,13 +21,85 @@ from haas_sdk import (
     ValidationError,
 )
 from haas_sdk.errors import (
+    APIError,
     ApprovalStaleError,
     ConfigError,
     IncompatibleServerError,
     RunFailed,
+    api_error,
 )
 
 BATCH_DIGEST = "a" * 64
+
+
+async def test_public_sync_async_constructor_and_run_signatures() -> None:
+    sync_defaults = {
+        "base_url": None,
+        "api_key": None,
+        "tenant": None,
+        "timeout": 30.0,
+        "max_retries": 2,
+        "stream_max_reconnects": 5,
+        "stream_reconnect_delay": 1.0,
+        "default_headers": None,
+        "transport": None,
+        "http_client": None,
+        "sleep": time.sleep,
+        "allow_test_keys": False,
+        "verify_server": False,
+    }
+    async_defaults = {**sync_defaults, "sleep": asyncio.sleep}
+    for client_type, defaults in (
+        (Haas, sync_defaults),
+        (AsyncHaas, async_defaults),
+    ):
+        constructor = inspect.signature(client_type)
+        assert list(constructor.parameters) == list(defaults)
+        assert all(
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            and parameter.default == defaults[name]
+            for name, parameter in constructor.parameters.items()
+        )
+
+    def shape(method: Any) -> list[tuple[str, Any, Any]]:
+        return [
+            (parameter.name, parameter.kind, parameter.default)
+            for parameter in inspect.signature(method).parameters.values()
+        ]
+
+    expected_run_methods = {
+        "get": [
+            ("run_id", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty)
+        ],
+        "list": [
+            (name, inspect.Parameter.KEYWORD_ONLY, None)
+            for name in (
+                "limit",
+                "cursor",
+                "status",
+                "thread_id",
+                "created_after",
+                "created_before",
+            )
+        ],
+        "events": [
+            ("run_id", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+            ("after", inspect.Parameter.KEYWORD_ONLY, 0),
+            ("limit", inspect.Parameter.KEYWORD_ONLY, None),
+        ],
+    }
+    with _client(lambda request: httpx.Response(200)) as sync:
+        async with AsyncHaas(
+            base_url="http://haas.test",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        ) as async_client:
+            for name, expected in expected_run_methods.items():
+                sync_method = getattr(sync.runs, name)
+                async_method = getattr(async_client.runs, name)
+                assert shape(sync_method) == expected
+                assert shape(async_method) == expected
+                assert inspect.iscoroutinefunction(sync_method) is False
+                assert inspect.iscoroutinefunction(async_method) is True
 
 
 def _client(handler: Any, **kwargs: Any) -> Haas:
@@ -176,6 +251,125 @@ def test_retries_reuse_generated_idempotency_key_and_honor_retry_after() -> None
     assert haas.runs.create("x").run_id == "r1"
     assert len(set(keys)) == 1 and keys[0].startswith("sdk-")
     assert sleeps == [2.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("header", "parsed", "metadata"),
+    [
+        ("NaN", None, None),
+        ("+inf", None, None),
+        ("-inf", None, None),
+        ("1e309", None, None),
+        ("bad", None, None),
+        ("", None, None),
+        (None, None, None),
+        ("-2", 0.0, -2.0),
+        ("2", 2.0, 2.0),
+        ("120", 60.0, 120.0),
+    ],
+)
+def test_retry_after_values_are_finite_and_preserve_finite_semantics(
+    header: str | None, parsed: float | None, metadata: float | None
+) -> None:
+    from haas_sdk import _core
+
+    headers = {} if header is None else {"Retry-After": header}
+    response = httpx.Response(503, headers=headers)
+    assert _core.retry_after_seconds(response) == parsed
+    assert api_error(response).retry_after == metadata
+
+
+def test_sync_retry_never_sleeps_on_non_finite_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from haas_sdk import _core
+
+    monkeypatch.setattr(_core.random, "uniform", lambda _low, _high: 0.25)
+    sync_sleeps: list[float] = []
+    sync_calls = 0
+
+    def sync_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            return httpx.Response(503, headers={"Retry-After": "NaN"})
+        if sync_calls == 2:
+            return httpx.Response(503, headers={"Retry-After": "120"})
+        return httpx.Response(200, json={"items": []})
+
+    with Haas(
+        base_url="http://haas.test",
+        api_key="hk_test_abc",
+        transport=httpx.MockTransport(sync_handler),
+        sleep=sync_sleeps.append,
+        max_retries=2,
+    ) as sync_client:
+        assert sync_client.runs.list().items == ()
+    assert sync_calls == 3
+    assert sync_sleeps == [0.25, 60.0]
+
+
+@pytest.mark.asyncio
+async def test_async_retry_never_sleeps_on_non_finite_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from haas_sdk import _core
+
+    monkeypatch.setattr(_core.random, "uniform", lambda _low, _high: 0.25)
+    async_sleeps: list[float] = []
+    async_calls = 0
+
+    async def async_sleep(seconds: float) -> None:
+        async_sleeps.append(seconds)
+
+    def async_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal async_calls
+        async_calls += 1
+        if async_calls == 1:
+            return httpx.Response(503, headers={"Retry-After": "bad"})
+        if async_calls == 2:
+            return httpx.Response(503, headers={"Retry-After": "2"})
+        return httpx.Response(200, json={"items": []})
+
+    async with AsyncHaas(
+        base_url="http://haas.test",
+        api_key="hk_test_abc",
+        transport=httpx.MockTransport(async_handler),
+        sleep=async_sleep,
+        max_retries=2,
+    ) as async_client:
+        assert (await async_client.runs.list()).items == ()
+    assert async_calls == 3
+    assert async_sleeps == [0.25, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_non_finite_retry_after_error_metadata_is_none_for_sync_and_async() -> None:
+    for status in (429, 503):
+        for header in ("NaN", "+inf", "-inf", "1e309", "bad"):
+            with _client(
+                lambda _request, s=status, h=header: httpx.Response(
+                    s, headers={"Retry-After": h}, json={"detail": "busy"}
+                ),
+                max_retries=0,
+            ) as sync_client:
+                with pytest.raises(APIError) as sync_error:
+                    sync_client.runs.list()
+            assert getattr(sync_error.value, "retry_after") is None
+
+            async with AsyncHaas(
+                base_url="http://haas.test",
+                api_key="hk_test_abc",
+                transport=httpx.MockTransport(
+                    lambda _request, s=status, h=header: httpx.Response(
+                        s, headers={"Retry-After": h}, json={"detail": "busy"}
+                    )
+                ),
+                max_retries=0,
+            ) as async_client:
+                with pytest.raises(APIError) as async_error:
+                    await async_client.runs.list()
+            assert getattr(async_error.value, "retry_after") is None
 
 
 def test_non_idempotent_post_is_not_retried_on_5xx() -> None:

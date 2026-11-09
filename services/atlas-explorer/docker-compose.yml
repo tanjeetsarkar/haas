@@ -1,0 +1,27 @@
+services:
+  atlas-explorer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${ATLAS_EXPLORER_PORT:-8081}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          response = urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2);
+          assert response.status == 200 and response.read() == b'{"status":"ok"}'
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - haas-core
+
+networks:
+  haas-core:
+    external: true
+    name: ${HAAS_CORE_NETWORK:-atlas-explorer-local}

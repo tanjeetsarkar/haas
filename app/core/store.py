@@ -1372,6 +1372,39 @@ class DistributedStore(
                 raise ThreadOwnershipError(thread_id)
             return _loads(row["messages_json"])
 
+    async def find_admission(
+        self,
+        tenant_id: str,
+        principal_key: str,
+        idempotency_key: str,
+        *,
+        include_created_at: bool = False,
+    ) -> dict[str, Any] | None:
+        # Other admission consumers retain their existing response shape.
+        if not include_created_at:
+            return await super().find_admission(tenant_id, principal_key, idempotency_key)
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT a.request_digest, a.response, r.created_at "
+                "FROM admission_requests a JOIN runs r "
+                "ON r.tenant_id = a.tenant_id AND r.run_id = a.run_id "
+                "WHERE a.principal_key = $1 "
+                "AND COALESCE(a.tenant_uuid::text, a.tenant_id) "
+                "= COALESCE(resolve_haas_tenant_uuid($2)::text, $2) "
+                "AND a.operation = 'run.create' AND a.idempotency_key = $3 "
+                "AND a.expires_at > now()",
+                principal_key,
+                tenant_id,
+                idempotency_key,
+            )
+        if row is None:
+            return None
+        response = _loads(row["response"])
+        if "created_at" not in response:
+            # The composite foreign key supplies the authoritative legacy association.
+            response["created_at"] = float(row["created_at"])
+        return {"request_digest": row["request_digest"], "response": response}
+
     async def create_run(
         self,
         *,
@@ -1393,10 +1426,11 @@ class DistributedStore(
         agent_revision_id: str | None = None,
         expected_history_version: int | None = None,
         admission: dict[str, Any] | None = None,
+        include_created_at: bool = False,
         deadline_sec: int | None = None,
         max_tool_invocations: int | None = None,
         parent_run_id: str | None = None,
-    ) -> None:
+    ) -> float:
         now = time.time()
         fx = Effects()
         if agent_revision_id is not None and policy_revision_id is None:
@@ -1513,6 +1547,7 @@ class DistributedStore(
                         max_tool_invocations or settings.default_max_tool_invocations,
                         parent_run_id,
                     )
+                    created_at = float(run_row["created_at"])
                     await self._append_events(
                         conn,
                         fx,
@@ -1522,6 +1557,9 @@ class DistributedStore(
                     )
                     await self._enqueue_orchestrate(conn, fx, run_row, "step", 0)
                     if admission is not None:
+                        admission_response = dict(admission["response"])
+                        if include_created_at:
+                            admission_response["created_at"] = created_at
                         stored = await conn.fetchval(
                             "INSERT INTO admission_requests (tenant_id, principal_key, "
                             "operation, idempotency_key, request_digest, run_id, response, "
@@ -1533,7 +1571,7 @@ class DistributedStore(
                             admission["idempotency_key"],
                             admission["request_digest"],
                             run_id,
-                            json.dumps(admission["response"]),
+                            json.dumps(admission_response),
                             float(settings.idempotency_ttl_sec),
                         )
                         if not stored:
@@ -1546,7 +1584,10 @@ class DistributedStore(
         except _AdmissionRace:
             assert admission is not None
             previous = await self.find_admission(
-                tenant_id, admission["principal_key"], admission["idempotency_key"]
+                tenant_id,
+                admission["principal_key"],
+                admission["idempotency_key"],
+                include_created_at=include_created_at,
             )
             if (
                 previous is None
@@ -1555,6 +1596,7 @@ class DistributedStore(
                 raise IdempotencyConflictError(admission["idempotency_key"]) from None
             raise IdempotentReplay(previous["response"]) from None
         await self._after_commit(fx)
+        return created_at
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         async with self.connection() as conn:

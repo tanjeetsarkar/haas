@@ -85,6 +85,7 @@ class FakeHaas:
         self.failures: list[
             tuple[int, dict[str, Any]]
         ] = []  # (call_index, response spec)
+        self._scripted_run_ids: list[str] = []
         self._call_count = 0
         self._lock = threading.Lock()
 
@@ -111,6 +112,7 @@ class FakeHaas:
             cost_usd=cost_usd,
         )
         self.runs[run_id] = run
+        self._scripted_run_ids.append(run_id)
         return run_id
 
     def fail_next(
@@ -352,18 +354,16 @@ class FakeHaas:
                 )
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         thread_id = body.get("thread_id") or f"thd-{uuid.uuid4().hex[:8]}"
-        # Scripted runs are matched by prompt for convenience; otherwise a bare run.
-        scripted = next(
-            (r for r in self.runs.values() if r.prompt == body.get("prompt")), None
-        )
-        if scripted is None:
-            self.script_run(
-                steps=[Step(model="fake-model")],
-                result="done",
+        if self._scripted_run_ids:
+            scripted = self.runs[self._scripted_run_ids.pop(0)]
+        else:
+            scripted = _FakeRun(
                 run_id=run_id,
                 thread_id=thread_id,
+                steps=[Step(model="fake-model")],
+                result="done",
             )
-            scripted = self.runs[run_id]
+            self.runs[run_id] = scripted
         scripted.prompt = body.get("prompt", "")
         self._admit(scripted)
         response = {

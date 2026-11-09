@@ -6,6 +6,8 @@ User-visible contract changes, newest first. Policy: [api-deprecation-policy.md]
 
 ### Added
 
+- Successful `POST /v1/runs` responses include numeric epoch-seconds `created_at`
+  from the persisted run; idempotent replays retain the same creation time.
 - **OpenAI-compatible facade**:
   - `POST /v1/chat/completions` (streaming and non-streaming), `POST /v1/responses`,
     `GET /v1/responses/{id}` and `GET /v1/models`.

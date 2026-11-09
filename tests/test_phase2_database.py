@@ -356,7 +356,7 @@ async def test_legacy_backfill_quarantine_and_cutover(db):
 async def test_api_revision_journey_policy_denials_and_history(db, monkeypatch):
     import app.main as main
 
-    _, store, slug, other_slug, _, _, principal, _ = db
+    owner, store, slug, other_slug, _, _, principal, _ = db
     role = "tenant_admin"
 
     async def authenticate(_credential, tenant):
@@ -412,6 +412,10 @@ async def test_api_revision_journey_policy_denials_and_history(db, monkeypatch):
             },
         )
         assert created.status_code == 202, created.text
+        assert isinstance(created.json()["created_at"], (int, float))
+        assert created.json()["created_at"] == await owner.fetchval(
+            "SELECT created_at FROM runs WHERE run_id = $1", created.json()["run_id"]
+        )
         thread = created.json()["thread_id"]
         assert (
             await client.post(
@@ -450,7 +454,7 @@ async def test_api_revision_journey_policy_denials_and_history(db, monkeypatch):
 async def test_real_api_key_identity_and_admin_queries_under_rls(db, monkeypatch):
     import app.main as main
 
-    _, store, slug, other_slug, _, _, principal, _ = db
+    owner, store, slug, other_slug, _, _, principal, _ = db
     thread = "legacy_" + uuid4().hex
     await store.get_or_create_thread_messages(thread, slug)
     credential = "hk_test_" + uuid4().hex + uuid4().hex
@@ -478,19 +482,44 @@ async def test_real_api_key_identity_and_admin_queries_under_rls(db, monkeypatch
         threads = await client.get("/v1/threads", headers=headers)
         assert threads.status_code == 200, threads.text
         assert any(row["thread_id"] == thread for row in threads.json()["items"])
-        created = await client.post(
-            "/v1/runs",
-            headers=headers,
-            json={
-                "prompt": "Continue legacy thread",
-                "thread_id": thread,
-                "primary_model": "model-a",
-                "planner_model": "model-b",
-                "max_steps": 2,
-            },
-        )
+        payload = {
+            "prompt": "Continue legacy thread",
+            "thread_id": thread,
+            "primary_model": "model-a",
+            "planner_model": "model-b",
+            "max_steps": 2,
+        }
+        keyed_headers = {**headers, "Idempotency-Key": "created-at-qa"}
+        created = await client.post("/v1/runs", headers=keyed_headers, json=payload)
         assert created.status_code == 202, created.text
-        run_path = "/v1/runs/" + created.json()["run_id"]
+        body = created.json()
+        assert isinstance(body["created_at"], (int, float))
+        assert body["thread_id"] == thread and body["status"] == "queued"
+        run_id = body["run_id"]
+        assert body["stream_url"] == f"/v1/runs/{run_id}/stream"
+        assert body["events_url"] == f"/v1/runs/{run_id}/events"
+        assert body["created_at"] == await owner.fetchval(
+            "SELECT created_at FROM runs WHERE run_id = $1", run_id
+        )
+        stored_response = await owner.fetchval(
+            "SELECT response FROM admission_requests WHERE run_id = $1", run_id
+        )
+        assert json.loads(stored_response) == body
+        replay = await client.post("/v1/runs", headers=keyed_headers, json=payload)
+        assert replay.status_code == 202, replay.text
+        assert replay.headers["Idempotent-Replayed"] == "true"
+        assert replay.json() == body
+        # Simulate a still-live pre-deployment admission response.
+        await owner.execute(
+            "UPDATE admission_requests SET response = response - 'created_at' "
+            "WHERE run_id = $1",
+            run_id,
+        )
+        legacy = await client.post("/v1/runs", headers=keyed_headers, json=payload)
+        assert legacy.status_code == 202, legacy.text
+        assert legacy.headers["Idempotent-Replayed"] == "true"
+        assert legacy.json() == body
+        run_path = "/v1/runs/" + run_id
         assert (await client.get(run_path, headers=headers)).status_code == 200
         assert (
             await client.post(run_path + "/cancel", headers=headers)

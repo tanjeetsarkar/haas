@@ -4,7 +4,7 @@
  */
 
 import React, { useMemo, CSSProperties } from 'react';
-import { AtlasLayerNode, AtlasLayerEnvelope } from '@haas/sdk';
+import type { AtlasLayerNode, AtlasLayerEnvelope } from '@haas/atlas-explorer-client';
 import { EntityCard } from './EntityCard';
 import { ComparisonRow } from './ComparisonRow';
 import { PricingTierCard } from './PricingTierCard';

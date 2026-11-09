@@ -633,6 +633,13 @@ fake.decisions                 # recorded decisions (batch_id, digest, approve)
 fake.last_request              # for header assertions
 fake.fail_next(status=503)     # fault injection (429 with Retry-After, dropped stream, etc.)
 ```
+`script_run()` queues a scenario for the next run submission; queued scenarios are
+consumed once each in FIFO submission order, regardless of prompt text. Once the
+queue is empty, submissions use the default fake run (`result="done"`). An
+idempotency replay returns the original run and does not consume another scenario.
+`fail_next()` faults the next request, so retry tests should first submit/admit a
+run, then inject the fault before the request whose retry behavior is under test.
+
 | ID | Requirement |
 |---|---|
 | SDK-TEST-01 | The fake implements the semantics that matter: integer sequences, resume by `Last-Event-ID`, `stream_gap`, digest checking (409 on mismatch), single-winner decisions, idempotency replay + conflict, `input_required` closing the stream. |

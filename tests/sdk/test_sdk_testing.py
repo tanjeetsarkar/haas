@@ -103,6 +103,24 @@ def test_fake_idempotency_replay_and_conflict() -> None:
             haas.runs.create("different", idempotency_key="k-1")
 
 
+def test_fake_scripted_runs_are_consumed_fifo_then_default() -> None:
+    fake = _fake()
+    fake.script_run(result="first", cost_usd=0.1)
+    fake.script_run(result="second", cost_usd=0.2)
+    with fake.client() as haas:
+        first = haas.runs.create("prompt one", idempotency_key="first-key")
+        replay = haas.runs.create("prompt one", idempotency_key="first-key")
+        assert replay.run_id == first.run_id and replay.replayed
+        first_run = haas.runs.attach(first.run_id).wait(timeout=5)
+
+        second_run = haas.runs.start("prompt two").wait(timeout=5)
+        default_run = haas.runs.start("prompt three").wait(timeout=5)
+
+    assert (first_run.result, first_run.total_cost_usd) == ("first", 0.1)
+    assert (second_run.result, second_run.total_cost_usd) == ("second", 0.2)
+    assert default_run.result == "done"
+
+
 def test_fake_stream_resumes_from_last_event_id() -> None:
     fake = _fake()
     fake.script_run(steps=[Step(model="m")], result="done")
@@ -123,11 +141,14 @@ def test_fake_strict_rejects_unknown_routes() -> None:
 
 def test_fake_fail_next_injects_fault() -> None:
     fake = _fake()
-    fake.script_run(result="ok")
-    fake.fail_next(status=503, headers={"Retry-After": "0"}, body={"detail": "busy"})
     with fake.client() as haas:
-        run = haas.runs.attach(next(iter(fake.runs))).get()
+        created = haas.runs.create("admit this run")
+        fake.fail_next(
+            status=503, headers={"Retry-After": "0"}, body={"detail": "busy"}
+        )
+        run = haas.runs.attach(created.run_id).get()
     assert run.status == "completed"
+    assert not fake.failures
 
 
 def test_fake_tenant_isolation() -> None:
@@ -179,6 +200,7 @@ def test_fake_stale_review_refused_locally() -> None:
         run = handle.get()
         review = haas.approvals.review(run.approval.batch_id)  # type: ignore[union-attr]
         haas.approvals.decide(review, review.approve())
-        # The review is now decided; a second decide is refused locally.
+        stale_review = haas.approvals.review(review.batch_id)
+        # A refreshed review reports the decided status and is refused locally.
         with pytest.raises(ApprovalStaleError):
-            haas.approvals.decide(review, review.reject())
+            haas.approvals.decide(stale_review, stale_review.reject())

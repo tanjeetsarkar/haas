@@ -3,7 +3,8 @@
  */
 
 import { useEffect, useState } from 'react';
-import { createClientFromEnv, createAtlasSessionManager } from '@haas/sdk';
+import { createClientFromEnv } from '@haas/sdk';
+import { createAtlasSessionManager } from '@haas/atlas-explorer-client';
 import { AtlasExplorer } from './components/atlas';
 import './App.css';
 

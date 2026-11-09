@@ -11,10 +11,10 @@ export { SpecialistProfile } from './SpecialistProfile';
 export { ChecklistCard } from './ChecklistCard';
 export { HITLApprovalDrawer } from './HITLApprovalDrawer';
 
-// Re-export types from SDK
-export type { 
+// Re-export types from Atlas service client
+export type {
   AtlasLayerNode, 
   AtlasLayerEnvelope,
   AtlasRunEvent,
-  DrilldownRequest 
-} from '@haas/sdk';
+  DrilldownRequest
+} from '@haas/atlas-explorer-client';

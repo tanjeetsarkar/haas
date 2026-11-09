@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import re
@@ -173,9 +174,12 @@ def retry_after_seconds(response: httpx.Response | None) -> float | None:
     if not value:
         return None
     try:
-        return min(max(float(value), 0.0), MAX_RETRY_AFTER)
+        seconds = float(value)
     except ValueError:
         return None
+    if not math.isfinite(seconds):
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER)
 
 
 def retry_delay(

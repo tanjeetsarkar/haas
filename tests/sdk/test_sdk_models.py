@@ -365,6 +365,86 @@ def test_public_exports_are_annotated() -> None:
         assert hasattr(haas_sdk, name), name
 
 
+def test_root_exports_and_supported_import_paths() -> None:
+    from haas_sdk.async_client import AsyncHaas as AsyncHaasModule
+    from haas_sdk.client import Haas as HaasModule
+    from haas_sdk.errors import NotFoundError as NotFoundErrorModule
+    from haas_sdk.handles import AsyncRunHandle, RunHandle
+    from haas_sdk.models import Run as RunModule
+
+    assert set(haas_sdk.__all__) == {
+        "APIError",
+        "AgentRevision",
+        "ApiKey",
+        "ApprovalAlreadyDecidedError",
+        "ApprovalExpiredError",
+        "ApprovalRef",
+        "ApprovalRequired",
+        "ApprovalReview",
+        "ApprovalStaleError",
+        "AsyncHaas",
+        "AsyncRunHandle",
+        "AuditEvent",
+        "AuthenticationError",
+        "BadRequestError",
+        "Budget",
+        "Capabilities",
+        "ConfigError",
+        "ConflictError",
+        "Decision",
+        "DecisionReceipt",
+        "EventPage",
+        "Haas",
+        "HaasConnectionError",
+        "HaasError",
+        "HistoryChangedError",
+        "IdempotencyConflictError",
+        "Identity",
+        "IncompatibleServerError",
+        "Invocation",
+        "IssuedApiKey",
+        "Membership",
+        "NotFoundError",
+        "Page",
+        "PendingCall",
+        "PermissionDeniedError",
+        "PluginCatalog",
+        "PluginRecord",
+        "PolicyChangedError",
+        "PolicyRevision",
+        "RateLimitError",
+        "Run",
+        "RunEvent",
+        "RunFailed",
+        "RunHandle",
+        "RunReceipt",
+        "RunSteps",
+        "RunUsage",
+        "Secret",
+        "ServerError",
+        "Skill",
+        "StepAttempt",
+        "StreamClosedError",
+        "Thread",
+        "ThreadBusyError",
+        "ThreadHistory",
+        "Tool",
+        "UsageEntry",
+        "ValidationError",
+        "WebhookEvent",
+        "WebhookVerificationError",
+        "__version__",
+        "constants",
+        "webhooks",
+    }
+    assert haas_sdk.Haas is HaasModule
+    assert haas_sdk.AsyncHaas is AsyncHaasModule
+    assert haas_sdk.Run is RunModule
+    assert haas_sdk.NotFoundError is NotFoundErrorModule
+    assert haas_sdk.RunHandle is RunHandle
+    assert haas_sdk.AsyncRunHandle is AsyncRunHandle
+
+
 def test_type_hints_complete_on_models() -> None:
     """G9: public model fields are annotated."""
     for cls in (Run, Budget, RunEvent, ApprovalReview, PendingCall):

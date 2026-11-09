@@ -3,7 +3,7 @@
  */
 
 import React from 'react';
-import { AtlasLayerNode } from '@haas/sdk';
+import type { AtlasLayerNode } from '@haas/atlas-explorer-client';
 import './EntityCard.css';
 
 interface EntityCardProps {

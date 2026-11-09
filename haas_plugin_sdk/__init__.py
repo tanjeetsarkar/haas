@@ -23,7 +23,7 @@ from __future__ import annotations
 import inspect
 import typing
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, TypeVar, TypedDict, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -33,12 +33,39 @@ __all__ = [
     "ToolContext",
     "ToolError",
     "ToolSpec",
+    "ServiceInvocationClaims",
     "get_spec",
     "tool",
 ]
 
 ABI_VERSION = "haas.sandbox/1"
 SPEC_ATTR = "__haas_tool__"
+
+
+class ServiceInvocationClaims(TypedDict):
+    """Version-1 identity and request-binding claims for a plugin service call."""
+
+    v: Literal[1]
+    iss: str
+    aud: str
+    tenant_id: str
+    plugin_id: str
+    plugin_digest: str
+    run_id: str
+    invocation_id: str
+    tool_name: str
+    operation: str
+    effect_key: str
+    policy_revision: str
+    catalog_revision: str
+    method: str
+    destination: str
+    content_type: str
+    request_sha256: str
+    iat: int
+    exp: int
+    jti: str
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 

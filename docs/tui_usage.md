@@ -211,6 +211,8 @@ haas-chat --url https://haas.example.com --tenant my-tenant
 | Mouse | Scroll the log; click buttons in dialogs; select text with the mouse to copy (terminal-dependent) |
 
 While a task runs you can still use `/commands`; plain messages are held back with a notice.
+In dialogs, `Tab` moves between controls. Long administration forms and profile lists
+can be scrolled; approval details scroll separately so the decision buttons remain visible.
 
 ## 4. Slash commands
 

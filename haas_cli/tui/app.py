@@ -430,6 +430,7 @@ class TenantSwitchScreen(ModalScreen[str | None]):
                 classes="note",
             )
             yield Input(value=self.current_tenant, placeholder="Tenant ID", id="tenant")
+            yield Static("", id="identity-error")
             with Horizontal(id="identity-buttons"):
                 yield Button("Switch", variant="primary", id="tenant-submit")
                 yield Button("Cancel", id="tenant-cancel")
@@ -445,6 +446,8 @@ class TenantSwitchScreen(ModalScreen[str | None]):
         tenant = self.query_one("#tenant", Input).value.strip()
         if tenant:
             self.dismiss(tenant)
+        else:
+            self.query_one("#identity-error", Static).update("Enter a tenant ID.")
 
     @on(Input.Submitted, "#tenant")
     def _on_submitted(self) -> None:
@@ -480,10 +483,12 @@ class ProfileSwitchScreen(ModalScreen[str | None]):
         )
         with Vertical(id="identity-box"):
             yield Static("Switch environment profile", id="identity-title")
-            yield Static(summary, id="profile-list")
+            with VerticalScroll(id="profile-list-scroll"):
+                yield Static(Text(summary), id="profile-list")
             yield Input(
                 value=self.current_profile, placeholder="Profile name", id="profile"
             )
+            yield Static("", id="identity-error")
             with Horizontal(id="identity-buttons"):
                 yield Button("Use profile", variant="primary", id="profile-submit")
                 yield Button("Cancel", id="profile-cancel")
@@ -500,8 +505,8 @@ class ProfileSwitchScreen(ModalScreen[str | None]):
         if name in self.profile_names:
             self.dismiss(name)
         else:
-            self.query_one("#profile-list", Static).update(
-                f"Unknown profile {sanitize_terminal_text(name, limit=64)!r}."
+            self.query_one("#identity-error", Static).update(
+                Text(f"Unknown profile {sanitize_terminal_text(name, limit=64)!r}.")
             )
 
     @on(Input.Submitted, "#profile")
@@ -535,7 +540,7 @@ class AdminFormScreen(ModalScreen[dict[str, str] | None]):
         self.json_label = json_label
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="admin-form-box"):
+        with VerticalScroll(id="admin-form-box"):
             yield Static(self.form_title, id="identity-title")
             for field_id, label, placeholder in self.fields:
                 yield Static(label, classes="admin-field-label")
@@ -727,16 +732,16 @@ class ChatApp(App[None]):
     #identity-buttons { height: auto; margin-top: 1; align-horizontal: right; }
     #identity-buttons Button { margin-left: 2; }
     #identity-error { color: $error; }
-    #profile-list { height: auto; max-height: 10; margin: 1 0; }
+    #profile-list-scroll { height: auto; max-height: 10; margin: 1 0; }
     #admin-form-box { width: 80%; max-width: 90; height: auto; max-height: 90%;
         border: thick $primary; background: $surface; padding: 1 2; }
     .admin-field-label { margin-top: 1; color: $text-muted; }
     #admin-form-json { height: 12; min-height: 6; margin-top: 1; }
-    #approval-box { width: 80%; max-width: 100; height: auto; max-height: 85%;
+    #approval-box { width: 80%; max-width: 100; height: 85%;
         border: thick $warning; background: $surface; padding: 1 2; }
     #approval-title { text-style: bold; color: $warning; }
     #approval-sub { color: $text-muted; margin-bottom: 1; }
-    #approval-calls { height: auto; max-height: 20; }
+    #approval-calls { height: 1fr; min-height: 3; max-height: 20; }
     .call-args { margin: 0 0 1 2; }
     #reason { margin-top: 1; }
     #approval-buttons { height: auto; margin-top: 1; align-horizontal: right; }

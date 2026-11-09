@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { AtlasSessionManager, AtlasLayerEnvelope, AtlasRunEvent, AtlasLayerNode } from '@haas/sdk';
+import type { AtlasSessionManager, AtlasLayerEnvelope, AtlasRunEvent, AtlasLayerNode } from '@haas/atlas-explorer-client';
 import { MillerColumn } from './MillerColumn';
 import { HITLApprovalDrawer } from './HITLApprovalDrawer';
 import './AtlasExplorer.css';

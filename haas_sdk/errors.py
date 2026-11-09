@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 
@@ -112,7 +113,7 @@ class ValidationError(APIError):
 
 
 class RateLimitError(APIError):
-    """429. `.retry_after` carries the server hint (capped at 60 s)."""
+    """429. `.retry_after` carries the finite server hint when provided."""
 
 
 class ServerError(APIError):
@@ -259,9 +260,10 @@ def _retry_after(response: Any) -> float | None:
     if not value:
         return None
     try:
-        return float(value)
+        seconds = float(value)
     except ValueError:
         return None
+    return seconds if math.isfinite(seconds) else None
 
 
 def run_error_code(raw: Any) -> str | None:

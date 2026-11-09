@@ -22,6 +22,8 @@ here named `NNNN-short-title.md` using the template below, and are added to the 
 | [ADR-14](0014-provider-neutral-identity.md) | Provider-neutral identity and secret-manager boundary | Partially accepted — OIDC/API-key contract; secret manager open |
 | ADR-15 | Delegation token format (Biscuit vs macaroons vs signed JSON) | Open — roadmap `a-attenuation-budget` |
 | [ADR-16](0016-api-contract-toolchain.md) | API contract toolchain (OpenAPI 3.1, JSON Schema events, AsyncAPI, Spectral, oasdiff, deprecation headers); docs portal and SDK generator | Partially accepted — contract toolchain accepted; portal/SDK generator open (`d-docs-portal`, `d-sdk-*`) |
+| [ADR-17](0017-trusted-plugin-service-invocation.md) | Generic authenticated plugin-service invocation scope and safe dispatch | Proposed — selected directions and candidate profile recorded; claims, lifecycle, replay, catalog and IPC hypotheses unverified; separate implementation approval required |
+| [ADR-18](0018-domain-client-package-ownership.md) | Domain client packages belong to extensions; public generic SDK composition and coordinated export removal | Accepted — plan 010; package/version selected; no publication authorization |
 
 ## Template
 
