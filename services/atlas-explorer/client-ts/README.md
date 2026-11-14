@@ -70,6 +70,9 @@ unsubscribe();
 - `constructor(client: HaaSClient, options?: AtlasExplorationClientOptions)`
 - `research(query: string, context?: AtlasResearchContext, signal?: AbortSignal): Promise<AtlasExplorationSnapshot>`
 - `observe(observer: (event: AtlasResearchEvent) => void): () => void`
+- `observeExecution(observer: (event: AtlasExecutionEvent) => void): () => void`
+- `resumeObservation(context: AtlasExecutionContext, lastEventId?: string, signal?: AbortSignal): Promise<AtlasRunObservationResult>`
+- `recoverOperationBinding(workspaceId: string): Promise<void>`
 - `getRunStatus(runId: string): Promise<RunResponse>`
 - `cancelRun(runId: string): Promise<RunResponse>`
 - `getApproval(batchId: string): Promise<ApprovalBatch>`
@@ -78,14 +81,79 @@ unsubscribe();
 - `load(artifactId: string): Promise<AtlasExplorationSnapshot>`
 - `listSaved(runId: string): Promise<AtlasSaveDescriptor[]>`
 
+### SSE observation and progress (041)
+
+Research creates one run and observes it through `HaaSClient.streamEvents`
+with `outputDeltas: true` and the operation's `AbortSignal`. There is no
+periodic run GET; one authenticated `getRun` reconciles stream EOF/errors
+before terminal output is validated. The legacy `pollIntervalMs` option remains
+accepted but is deprecated and ignored.
+
+Observers may receive `submitted` with the exact question, application prompt
+and selected context; `progress` with bounded/redacted telemetry; and
+`disconnected` with the last applied durable numeric event ID. ID-less output
+deltas are capped volatile previews marked `provisional`; they never become
+graph data or replay cursors. Durable duplicate IDs are ignored, and a sequence
+gap is surfaced rather than moving the cursor forward. `AtlasExecutionContext`
+includes optional workspace/operation IDs and generation for stale-event
+gating. `telemetry` includes the public run status/count/cost, bounded step/tool
+IDs and public usage totals where the public endpoints return them; plans and
+tool arguments are intentionally omitted.
+
+An authoritative `input_required` reconciliation emits the actual approval
+batch and rejects as pending; it is not treated as successful research.
+Observation abort, supersede and timeout do not cancel the remote run.
+`cancelRun(runId)` is the explicit remote cancellation action and is issued at
+most once for the active run. Stream failures never cause a replacement
+`createRun`. `resumeObservation(context, lastEventId, signal)` resumes the same
+run from the last applied durable ID; it returns authoritative status, cursor,
+terminal and disconnected flags, and never creates/cancels a run or projects
+research output. Call it again with its returned cursor to resume observation.
+
+For 042, optional `operationPersistence` supplies awaited `prepare`, `outcome`
+and `bind` hooks. Payloads match the service's strict models:
+
+- `prepare`: `{operation_id, prompt, selected_context: [<selected context>]}`.
+  The service computes `intent_digest` and starts the operation as prepared.
+- Before `createRun`, `outcome`: `{operation_id, state:"submitting",
+  status:"submitting"}`. A dispatch is never attempted without its receipt.
+- After an ambiguous createRun failure, `outcome` records
+  `{operation_id, state:"unknown", status:"unknown"}`. `run_id` is omitted if
+  unknown; it is permitted only when state is `unknown` and a run ID is known.
+- After a run ID is returned, `bind`: `{operation_id, run_id, thread_id?}`.
+  The server retains that known run ID and rejects a different ID.
+- If bind is unacknowledged, the client retains it locally and records an
+  `unknown` outcome with the known `run_id`; a concurrent/already-committed
+  binding is recovered by retrying the exact original binding mutation.
+- After authoritative terminal reconciliation, `outcome` records
+  `{operation_id, state:"terminal", status:"completed"|"failed"|"cancelled"}`.
+
+Each hook supplies the mutation envelope (`schema_version`, fresh
+`mutation_id`, current `expected_revision`) and must return the server receipt.
+The `bind` adapter must retry the *identical queued mutation* (same mutation
+ID and body) after an ambiguous acknowledgement; never enqueue a new binding
+mutation. A known run stays blocked until binding receives a valid receipt.
+`recoverOperationBinding(workspaceId)` explicitly asks the adapter to retry the
+retained binding. Its adapter is keyed by operation ID and must reuse the
+original mutation ID and canonical body from the queue after an ambiguous
+acknowledgement; the client passes the retained payload unchanged. A
+failed/missing `unknown` receipt or unresolved binding
+blocks further dispatch; a late createRun result is bound if its ID becomes
+known. The client never retries a paid submission. Without these hooks,
+operation intent is not claimed durable. Exported
+`AtlasWorkspaceMutationKind` and operation state types match the strict 042
+protocol. Full graph projection continues to use only validated terminal
+output or the existing successful-tool full-history fallback.
+
 `AtlasResearchContext = { snapshot: AtlasExplorationSnapshot; target: AtlasTarget;
 parentOccurrenceId: string | null }`. The parent is the selected **target's parent**,
 not the target itself. Existing selection is reused and any restored suffix is
 trimmed locally for research; saved branches remain intact.
 
-One client instance supports one active research operation. A new operation
-aborts/cancels its predecessor. Use `AbortSignal` when navigating away even if
-not launching another run. UI must additionally gate promise/event application
+One client instance supports one active research observation. Starting newer
+research aborts the predecessor's observation; it does not remotely cancel its
+run. Use `AbortSignal` when navigating away even if not launching another run.
+UI must additionally gate promise/event application
 on its current workspace generation; the client cannot observe local navigation.
 Observers are status/approval notifications, not a token stream or durable log.
 Keep parent data visible until the returned validated snapshot is accepted.
@@ -93,24 +161,25 @@ Submission failures before a run ID is known reject the promise without an
 execution-context event. Snapshot requests persist completed run/thread/history IDs.
 
 Research creates/branches threads with real server history versions and
-preloads **only** `web-research`. Root runs retain the legacy caps of 6 steps,
-$0.15 and 12 tool invocations; scoped runs retain 5 steps, $0.10 and 8 invocations.
-Tenant policy may impose stricter limits; a policy rejection is surfaced unchanged,
-never bypassed by raising policy or silently resubmitting a cheaper paid run.
+preloads **only** `web-research`. Root and scoped runs request up to 1,000 steps;
+root retains its $0.15 and 12-tool-invocation budgets, while scoped runs retain
+$0.10 and 8 invocations. Tenant policy may impose stricter limits; policy
+rejections are surfaced unchanged and never bypassed by raising policy or
+silently resubmitting a cheaper paid run.
 No automatic application-level API retry or paid resubmission;
 configure the underlying SDK's retry policy explicitly if needed. Default
-deadline is five minutes, including approval wait. A timeout/abort requests
-actual remote cancellation, waiting up to ten additional seconds for its
-acknowledgement; failure/timeout is surfaced, not reported as confirmed cancel.
-SDK calls lack AbortSignal support: a submission completing after abort triggers
-a late cancellation request; it never publishes a stale completed snapshot.
+deadline is five minutes for local observation. Timeout/abort/supersede never
+calls remote cancellation; invoke `cancelRun(runId)` explicitly for that action.
+Non-stream SDK calls cannot be interrupted, so late results are not applied as
+stale completion; with persistence enabled, their known run ID is bound or the
+workspace remains blocked pending recovery.
 
 Approval-required runs remain pending until an authorized human decides through
 the public API. Events expose the batch ID, digest, expiry, tool destinations
 and exact arguments. `decideApproval` forwards an explicit caller decision; it
 does not grant authority, self-approve, bypass server policies or replay a run.
 401/403/expiry/rejection/dismissal are not interchangeable. Dismissal alone makes
-no decision; research can remain paused until timeout or explicit cancellation.
+no decision; observing a pending approval does not wait or cancel remote work.
 
 ### Graph/result and capability contracts
 
@@ -124,6 +193,32 @@ read from version-pinned public thread history and correlated run events. This
 proves observation, not source truth or semantic entailment. No missing data,
 quotes, prices or citations are synthesized. Existing identities are preserved;
 explicit candidate selection can resolve that candidate before facts attach.
+
+Model-owned `targets` are strict, one-level references; they contain no labels,
+descriptions, entity categories or action data. The only accepted shapes are:
+
+```json
+{"kind":"entity","entity_id":"hospital-1"}
+{"kind":"facet","entity_id":"hospital-1","facet_key":"specialists"}
+{"kind":"source","source_id":"source-1"}
+```
+
+`kind: "entity"` identifies the reference shape; an entity's own kind (for
+example `category`, `person` or `organization`) is separate. The schema rejects
+mixed references, missing IDs, extra properties and unknown kinds. Valid-shaped
+references are also checked for dangling entity, facet and source references
+before a snapshot is projected. Neither validation nor projection strips or
+repairs model fields.
+
+Malformed final JSON fails closed: it is not projected, saved as a successful
+graph or retried automatically. `AtlasResearchValidationError` has a bounded
+message with target index, received kind and required/extra fields (or allowed
+kinds); other schema issue summaries are capped with an omitted-count notice.
+Its `details` retains the structured AJV errors for authorized inspection, but
+the summary never embeds the submitted payload. JSON syntax errors remain the
+original parser errors. Once run execution context exists, the client's error
+event correlates the failure with request/run/thread IDs without adding prompts
+or credentials.
 
 `AtlasClaim.details?: AtlasClaimDetails` provides optional typed attributes
 (`key`, `label`, `value`, optional `unit`/`uncertainty`), proposed checklist steps

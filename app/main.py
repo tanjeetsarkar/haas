@@ -280,7 +280,7 @@ class CreateRunRequest(BaseModel):
     skills: list[str] | None = None
     primary_model: str | None = None
     planner_model: str | None = None
-    max_steps: int | None = Field(default=None, ge=1, le=50)
+    max_steps: int | None = Field(default=None, ge=1, le=1_000)
     max_cost_usd: float | None = Field(default=None, gt=0.0, le=10.0)
     webhook_url: str | None = None
     secrets: dict[str, str] = Field(default_factory=dict)

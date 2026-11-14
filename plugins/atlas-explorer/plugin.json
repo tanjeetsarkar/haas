@@ -5,7 +5,7 @@
   "description": "Structured entity graph caching, provenance verification, and SDUI layer emission for progressive disclosure exploration.",
   "category": "intelligence",
   "provides": {
-    "skills": ["atlas-explorer"],
+    "skills": ["atlas-explorer", "atlas-action-drafting"],
     "tools": [
       "atlas_cache_lookup",
       "atlas_cache_upsert",

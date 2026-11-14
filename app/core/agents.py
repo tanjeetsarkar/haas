@@ -13,7 +13,7 @@ class AgentConfiguration(BaseModel):
     planner_model: str = Field(min_length=1, max_length=256)
     skills: list[str] = Field(default_factory=list, max_length=100)
     preload_skills: list[str] = Field(default_factory=list, max_length=100)
-    max_steps: int = Field(default=15, ge=1, le=50)
+    max_steps: int = Field(default=15, ge=1, le=1_000)
     max_cost_usd: float = Field(default=0.30, gt=0, le=10, allow_inf_nan=False)
 
     def validate_policy(self, policy: TenantPolicy, registry: PluginRegistry) -> None:

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApprovalBatch, Artifact, HaaSClient, RunResponse } from '@haas/sdk';
 import {
   AtlasExplorationClient, parseExplorationSnapshot, selectExplorationTarget,
-  type AtlasResearchEvent, type AtlasResearchResult, type AtlasExplorationSnapshot,
+  type AtlasExecutionEvent, type AtlasResearchEvent, type AtlasResearchResult, type AtlasExplorationSnapshot,
 } from '../src';
 
 const source = {
@@ -30,12 +30,32 @@ const run = (status: RunResponse['status'] = 'completed', result = JSON.stringif
 const tool = (content = JSON.stringify({ url: source.url, snippet: source.excerpt })) => ({
   role: 'tool', tool_call_id: 'call-search', content,
 });
-const stub = () => ({
+const stub = () => {
+  const createRun = vi.fn(async (_request?: unknown) => run());
+  return {
   createThread: vi.fn(async () => ({ thread_id: 'thread-root', history_version: 3 })),
   branchThread: vi.fn(async () => ({ thread_id: 'thread-child', history_version: 17 })),
-  createRun: vi.fn(async (_request?: unknown) => run()),
-  getRun: vi.fn(async (_id?: string) => run()),
+  createRun,
+  getRun: vi.fn(async (id?: string) => {
+    const result = createRun.mock.results.at(-1)?.value;
+    const created = result ? await result : run();
+    return { ...created, run_id: id ?? created.run_id };
+  }),
   cancelRun: vi.fn(async (_id?: string) => run('cancelled')),
+  streamEvents: vi.fn(async function* (
+    _id?: string, _options?: unknown,
+  ): AsyncGenerator<{ event: string; data: Record<string, unknown>; id?: string }> { }),
+  getRunSteps: vi.fn(async (_id?: string) => ({ items: [{
+    step_id: 'step-1', run_id: 'run-root', attempt: 1, status: 'completed',
+    started_at: 10, completed_at: 20,
+    plan: { private_reasoning: 'must not enter telemetry' },
+    tool_calls: [{ tool_name: 'web_search', invocation_id: 'call-search',
+      arguments: { token: 'private' }, destination: 'https://example.test', required_secrets: [] }],
+  }] })),
+  getRunUsage: vi.fn(async (_id?: string) => ({
+    run_id: 'run-root', model_tokens: { prompt: 10, completion: 20, total: 30 },
+    tool_invocations: 1, egress_bytes: 100, artifact_bytes: 0, cost_usd: 0.02,
+  })),
   getThread: vi.fn(async (_id?: string, _params?: unknown) => ({
     thread_id: 'thread-root', history_version: 17, items: [tool()], next_offset: null as number | null,
   })),
@@ -53,7 +73,8 @@ const stub = () => ({
   getArtifact: vi.fn<[], Promise<Artifact>>(),
   downloadArtifact: vi.fn<[], Promise<Blob>>(),
   listArtifacts: vi.fn(async (_params?: unknown) => ({ items: [] as Artifact[], next_cursor: undefined as string | undefined })),
-});
+  };
+};
 type Stub = ReturnType<typeof stub>;
 const make = (sdk: Stub, timeoutMs = 1000) => new AtlasExplorationClient(
   sdk as unknown as HaaSClient, { pollIntervalMs: 0, timeoutMs },
@@ -72,20 +93,381 @@ describe('Atlas authenticated live research adapter', () => {
     const sdk = stub();
     const client = make(sdk);
     const events: AtlasResearchEvent[] = [];
+    const executionEvents: AtlasExecutionEvent[] = [];
     const unsubscribe = client.observe(e => events.push(e));
+    client.observeExecution(e => executionEvents.push(e));
     const snapshot = await client.research('computers');
     expect(parseExplorationSnapshot(snapshot)).toBe(snapshot);
     expect(sdk.createRun).toHaveBeenCalledWith(expect.objectContaining({
       preload_skills: ['web-research'], expected_history_version: 3,
-      max_steps: 6, max_cost_usd: 0.15, max_tool_invocations: 12,
+      max_steps: 1000, max_cost_usd: 0.15, max_tool_invocations: 12,
     }));
     expect(snapshot.requests[0]).toMatchObject({
       run_id: 'run-root', thread_id: 'thread-root', committed_history_version: 17, status: 'completed',
     });
     expect(snapshot.occurrences[0].target).toEqual({ kind: 'entity', entity_id: 'computers' });
     expect(events.at(-1)).toMatchObject({ type: 'completed', context: { historyVersion: 17 } });
+    expect(sdk.streamEvents).toHaveBeenCalledTimes(1);
+    expect(sdk.streamEvents).toHaveBeenCalledWith('run-root', expect.objectContaining({
+      lastEventId: '0', outputDeltas: true, signal: expect.any(AbortSignal),
+    }));
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+    expect(executionEvents.find(e => e.type === 'submitted')).toMatchObject({
+      submission: { question: 'computers', prompt: expect.stringContaining('Question: "computers"'),
+        selectedContext: { ancestry: [] } },
+    });
+    const telemetry = executionEvents.find(e => e.type === 'telemetry');
+    expect(telemetry).toMatchObject({
+      telemetry: { status: 'completed', steps: [{ tools: [{ toolName: 'web_search' }] }],
+        usage: { model_tokens: { total: 30 }, cost_usd: 0.02 } },
+    });
+    expect(JSON.stringify(telemetry)).not.toContain('private_reasoning');
+    expect(JSON.stringify(telemetry)).not.toContain('private');
     expect(sdk.createArtifact).not.toHaveBeenCalled();
     unsubscribe();
+  });
+
+  it('projects bounded telemetry, keeps ID-less deltas provisional, and deduplicates replayed IDs', async () => {
+    const sdk = stub();
+    sdk.streamEvents.mockImplementationOnce(async function* () {
+      yield { event: 'output_delta', data: { delta: 'draft only' } };
+      yield { event: 'step_started', id: '1', data: {
+        step: 2, model: 'model/example', active_skills: ['web-research'], timestamp: 123,
+      } };
+      yield { event: 'step_started', id: '1', data: { step: 99 } };
+      yield { event: 'tool_result', id: '2', data: {
+        tool: 'web_search', tool_call_id: 'call', preview: `token=top-secret ${'x'.repeat(1500)}`,
+      } };
+    });
+    const events: AtlasResearchEvent[] = [];
+    const executionEvents: AtlasExecutionEvent[] = [];
+    const client = make(sdk);
+    client.observeExecution(event => executionEvents.push(event));
+    await client.research('computers');
+    const progress = executionEvents.filter((event): event is Extract<AtlasExecutionEvent, { type: 'progress' }> =>
+      event.type === 'progress').map(event => event.progress);
+    expect(progress.map(event => event.event)).toEqual(['output_delta', 'step_started', 'tool_result']);
+    expect(progress[0]).toMatchObject({ preview: 'draft only', provisional: true });
+    expect(progress[0].eventId).toBeUndefined();
+    expect(progress[1]).toMatchObject({ eventId: 1, step: 2, model: 'model/example', activeSkills: ['web-research'] });
+    expect(progress[2].preview).not.toContain('top-secret');
+    expect(progress[2].previewTruncated).toBe(true);
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('makes replay gaps visible without advancing the applied cursor', async () => {
+    const sdk = stub();
+    sdk.streamEvents.mockImplementationOnce(async function* () {
+      yield { event: 'step_started', id: '1', data: { step: 1 } };
+      yield { event: 'tool_result', id: '3', data: { tool: 'web_search' } };
+    });
+    const events: AtlasExecutionEvent[] = [];
+    const client = make(sdk);
+    client.observeExecution(event => events.push(event));
+    await client.research('computers');
+    expect(events.find(event => event.type === 'disconnected')).toMatchObject({
+      lastEventId: '1',
+    });
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes observation with the same run and durable cursor only', async () => {
+    const sdk = stub();
+    const client = make(sdk);
+    const context = {
+      requestId: 'request', operationId: 'operation', generation: 1,
+      explorationId: 'exploration', pathId: 'path', parentOccurrenceId: null,
+      baseRevision: 1, runId: 'run-root', threadId: 'thread-root', historyVersion: 3,
+    };
+    sdk.streamEvents.mockImplementationOnce(async function* (_id?: string, options?: unknown) {
+      expect(_id).toBe('run-root');
+      expect(options).toMatchObject({ lastEventId: '7', outputDeltas: true });
+      yield { event: 'output_delta', data: { delta: 'preview' } };
+      yield { event: 'tool_result', id: '8', data: { tool: 'web_search' } };
+    });
+    const result = await client.resumeObservation(context, '7');
+    expect(result).toMatchObject({ status: 'completed', lastEventId: '8', terminal: true, disconnected: false });
+    expect(sdk.createRun).not.toHaveBeenCalled();
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists validated terminal outcome when resumed observation reconciles a terminal run', async () => {
+    const sdk = stub();
+    const outcome = vi.fn(async () => ({
+      workspace_id: 'workspace', mutation_id: 'terminal', revision: 4, saved_at: '2026-11-10T00:00:00Z',
+    }));
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, {
+      operationPersistence: {
+        workspaceId: 'workspace',
+        prepare: vi.fn(), outcome, bind: vi.fn(), submitting: vi.fn(), unknown: vi.fn(),
+      } as never,
+    });
+    const context = {
+      requestId: 'request', operationId: 'operation', workspaceId: 'workspace', generation: 1,
+      explorationId: 'exploration', pathId: 'path', parentOccurrenceId: null,
+      baseRevision: 1, runId: 'run-root', threadId: 'thread-root', historyVersion: 3,
+    };
+    const result = await client.resumeObservation(context, '0');
+    expect(result.terminal).toBe(true);
+    expect(outcome).toHaveBeenCalledWith({
+      workspaceId: 'workspace', operationId: 'operation', kind: 'operation_outcome',
+      payload: { operation_id: 'operation', state: 'terminal', status: 'completed' },
+    });
+    expect(sdk.createRun).not.toHaveBeenCalled();
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it('awaits 042 operation prepare and bind receipts around the single run dispatch', async () => {
+    const sdk = stub();
+    const order: string[] = [];
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async input => {
+        order.push(`prepare:${input.kind}`);
+        return { workspace_id: 'workspace', mutation_id: 'm1', revision: 2, saved_at: '2026-11-10T00:00:00Z' };
+      }),
+      outcome: vi.fn(async input => {
+        order.push(`outcome:${input.payload.state}`);
+        return { workspace_id: 'workspace', mutation_id: `m-${input.payload.state}`, revision: 3, saved_at: '2026-11-10T00:00:00Z' };
+      }),
+      bind: vi.fn(async input => {
+        order.push(`bind:${input.kind}:${input.payload.run_id}`);
+        return { workspace_id: 'workspace', mutation_id: 'm2', revision: 4, saved_at: '2026-11-10T00:00:00Z' };
+      }),
+    };
+    sdk.createRun.mockImplementationOnce(async () => {
+      order.push('dispatch');
+      return run();
+    });
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    await client.research('exact question');
+    expect(order).toEqual([
+      'prepare:operation_prepared', 'outcome:submitting', 'dispatch', 'bind:operation_bound:run-root',
+      'outcome:terminal',
+    ]);
+    expect(operationPersistence.prepare).toHaveBeenCalledTimes(1);
+    const prepared = operationPersistence.prepare.mock.calls[0][0];
+    expect(prepared).toMatchObject({
+      workspaceId: 'workspace', kind: 'operation_prepared', payload: {
+        operation_id: expect.any(String),
+      },
+    });
+    expect(prepared.payload.prompt).toContain('Question: "exact question"');
+    expect(prepared.payload.selected_context).toEqual([{ ancestry: [], entities: [], claims: [], sources: [] }]);
+    expect(operationPersistence.bind).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'operation_bound',
+      payload: expect.objectContaining({ run_id: 'run-root', thread_id: 'thread-root' }),
+    }));
+    expect(operationPersistence.outcome).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'operation_outcome',
+      payload: expect.objectContaining({ state: 'terminal', status: 'completed' }),
+    }));
+  });
+
+  it('does not dispatch when operation preparation has no server receipt', async () => {
+    const sdk = stub();
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async () => { throw new Error('workspace save failed'); }),
+      outcome: vi.fn(),
+      bind: vi.fn(),
+    };
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    await expect(client.research('exact question')).rejects.toThrow('workspace save failed');
+    expect(sdk.createRun).not.toHaveBeenCalled();
+    expect(operationPersistence.bind).not.toHaveBeenCalled();
+  });
+
+  it('persists unknown submission outcome and blocks additional paid submissions', async () => {
+    const sdk = stub();
+    sdk.createRun.mockRejectedValueOnce(new Error('connection lost after dispatch'));
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async () => ({ workspace_id: 'workspace', mutation_id: 'm1', revision: 1, saved_at: '2026-11-10T00:00:00Z' })),
+      outcome: vi.fn(async input => ({
+        workspace_id: 'workspace', mutation_id: input.payload.state, revision: 2, saved_at: '2026-11-10T00:00:00Z',
+      })),
+      bind: vi.fn(),
+    };
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    await expect(client.research('uncertain')).rejects.toThrow('connection lost');
+    expect(operationPersistence.outcome).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { operation_id: expect.any(String), state: 'submitting', status: 'submitting' },
+    }));
+    expect(operationPersistence.outcome).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { operation_id: expect.any(String), state: 'unknown', status: 'unknown' },
+    }));
+    await expect(client.research('must not resubmit')).rejects.toThrow('Workspace operation is unresolved');
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when the ambiguous submission outcome cannot be durably acknowledged', async () => {
+    const sdk = stub();
+    sdk.createRun.mockRejectedValueOnce(new Error('submission response lost'));
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async () => ({
+        workspace_id: 'workspace', mutation_id: 'm1', revision: 1, saved_at: '2026-11-10T00:00:00Z',
+      })),
+      outcome: vi.fn()
+        .mockResolvedValueOnce({
+          workspace_id: 'workspace', mutation_id: 'submitting', revision: 2, saved_at: '2026-11-10T00:00:00Z',
+        })
+        .mockRejectedValueOnce(new Error('storage unavailable')),
+      bind: vi.fn(),
+    };
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    await expect(client.research('uncertain')).rejects.toMatchObject({ name: 'AggregateError' });
+    await expect(client.research('blocked')).rejects.toThrow('Workspace operation is unresolved');
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('records an unknown submission on observation abort and binds any late known run ID', async () => {
+    const sdk = stub();
+    let finish!: (value: RunResponse) => void;
+    sdk.createRun.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async () => ({
+        workspace_id: 'workspace', mutation_id: 'm1', revision: 1, saved_at: '2026-11-10T00:00:00Z',
+      })),
+      outcome: vi.fn(async input => ({
+        workspace_id: 'workspace', mutation_id: input.payload.state, revision: 2, saved_at: '2026-11-10T00:00:00Z',
+      })),
+      bind: vi.fn(async () => ({
+        workspace_id: 'workspace', mutation_id: 'bound', revision: 3, saved_at: '2026-11-10T00:00:00Z',
+      })),
+    };
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    const controller = new AbortController();
+    const research = client.research('late run', undefined, controller.signal);
+    const rejected = expect(research).rejects.toMatchObject({ name: 'AbortError' });
+    await settle();
+    controller.abort();
+    await rejected;
+    finish(run('running'));
+    await settle();
+    expect(operationPersistence.outcome).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { operation_id: expect.any(String), state: 'unknown', status: 'unknown' },
+    }));
+    expect(operationPersistence.bind).toHaveBeenCalledWith(expect.objectContaining({
+      payload: { operation_id: expect.any(String), run_id: 'run-root', thread_id: 'thread-root' },
+    }));
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it('retains a known run and blocks until the same operation_bound mutation receives a receipt', async () => {
+    const sdk = stub();
+    const boundInput: unknown[] = [];
+    let fail = true;
+    const operationPersistence = {
+      workspaceId: 'workspace',
+      prepare: vi.fn(async () => ({ workspace_id: 'workspace', mutation_id: 'm1', revision: 1, saved_at: '2026-11-10T00:00:00Z' })),
+      outcome: vi.fn(async input => ({
+        workspace_id: 'workspace', mutation_id: input.payload.state, revision: 2, saved_at: '2026-11-10T00:00:00Z',
+      })),
+      bind: vi.fn(async input => {
+        boundInput.push(structuredClone(input));
+        if (fail) { fail = false; throw new Error('ack lost'); }
+        return { workspace_id: 'workspace', mutation_id: 'bound-mutation', revision: 3, saved_at: '2026-11-10T00:00:00Z' };
+      }),
+    };
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, { operationPersistence });
+    await expect(client.research('known run')).rejects.toThrow('Known run is blocked');
+    expect(boundInput[0]).toMatchObject({
+      kind: 'operation_bound',
+      payload: { operation_id: expect.any(String), run_id: 'run-root', thread_id: 'thread-root' },
+    });
+    await expect(client.research('must wait')).rejects.toThrow('Workspace operation is unresolved');
+    await client.recoverOperationBinding('workspace');
+    expect(boundInput[1]).toEqual(boundInput[0]);
+    expect(operationPersistence.outcome).toHaveBeenCalledWith(expect.objectContaining({
+      payload: {
+        operation_id: expect.any(String), state: 'unknown', status: 'unknown', run_id: 'run-root',
+      },
+    }));
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows disconnect for a nonterminal run and does not create a replacement run', async () => {
+    const sdk = stub();
+    sdk.createRun.mockResolvedValue(run('running'));
+    sdk.getRun.mockResolvedValue(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* () {
+      yield { event: 'step_started', id: '1', data: { step: 1 } };
+      throw new Error('network disconnected');
+    });
+    const events: AtlasExecutionEvent[] = [];
+    const client = make(sdk);
+    client.observeExecution(event => events.push(event));
+    await expect(client.research('computers')).rejects.toThrow('network disconnected');
+    expect(events.find(event => event.type === 'disconnected')).toMatchObject({ lastEventId: '1' });
+    expect(sdk.createRun).toHaveBeenCalledTimes(1);
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not trust a stale stream terminal event over authoritative run status', async () => {
+    const sdk = stub();
+    sdk.createRun.mockResolvedValue(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* () {
+      yield { event: 'run_completed', id: '1', data: { output: JSON.stringify(graph()) } };
+    });
+    const events: AtlasResearchEvent[] = [];
+    const executionEvents: AtlasExecutionEvent[] = [];
+    const client = make(sdk);
+    client.observe(event => events.push(event));
+    client.observeExecution(event => executionEvents.push(event));
+    await expect(client.research('computers')).rejects.toThrow('Run remains running');
+    expect(events.some(event => event.type === 'completed')).toBe(false);
+    expect(executionEvents.find(event => event.type === 'disconnected')).toMatchObject({ lastEventId: '1' });
+    expect(sdk.getRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces bounded final-target diagnostics with child execution context and keeps the parent intact', async () => {
+    const sdk = stub();
+    const rootResult = graph();
+    rootResult.targets.push({ kind: 'source', source_id: 'src' });
+    sdk.createRun.mockResolvedValueOnce(run('completed', JSON.stringify(rootResult)));
+    const client = make(sdk);
+    const events: AtlasResearchEvent[] = [];
+    client.observe(event => events.push(event));
+    const parent = await client.research('computers');
+    const before = structuredClone(parent);
+    const selected = selectExplorationTarget(parent, { kind: 'entity', entity_id: 'computers' }, null);
+    const malformed = graph();
+    malformed.targets = [
+      { kind: 'entity' } as never,
+      { kind: 'facet', entity_id: 'computers' } as never,
+      { kind: 'source' } as never,
+      { kind: 'unknown', entity_id: 'computers' } as never,
+      { kind: 'entity', entity_id: 'computers', title: 'DO NOT ECHO MODEL PAYLOAD' } as never,
+      { kind: 'entity', entity_id: 'computers', source_id: 'src' } as never,
+    ];
+    sdk.createRun.mockResolvedValueOnce({
+      ...run('completed', JSON.stringify(malformed)), run_id: 'run-child', thread_id: 'thread-child',
+    });
+
+    await expect(client.research('History', {
+      snapshot: selected, target: { kind: 'entity', entity_id: 'computers' }, parentOccurrenceId: null,
+    })).rejects.toMatchObject({ name: 'AtlasResearchValidationError' });
+
+    const failure = events.find(event => event.type === 'error');
+    expect(failure).toMatchObject({
+      type: 'error',
+      context: { runId: 'run-child', threadId: 'thread-child', requestId: expect.any(String) },
+    });
+    if (failure?.type === 'error') {
+      expect((failure.error as Error).message).toContain('target[5]');
+      expect((failure.error as Error).message).not.toContain('DO NOT ECHO MODEL PAYLOAD');
+    }
+    expect(parent).toEqual(before);
+    expect(parent.occurrences).toHaveLength(2);
+    expect(events.filter(event => event.type === 'completed')).toHaveLength(1);
+    expect(sdk.createRun).toHaveBeenCalledTimes(2);
+    expect(sdk.createArtifact).not.toHaveBeenCalled();
   });
 
   it('uses the real committed history version and only selected ancestry for child facets', async () => {
@@ -105,7 +487,7 @@ describe('Atlas authenticated live research adapter', () => {
     expect(sdk.branchThread).toHaveBeenCalledWith('thread-root', { expected_history_version: 17 });
     expect(sdk.createRun).toHaveBeenLastCalledWith(expect.objectContaining({
       thread_id: 'thread-child', expected_history_version: 17,
-      max_steps: 5, max_cost_usd: 0.10, max_tool_invocations: 8,
+      max_steps: 1000, max_cost_usd: 0.10, max_tool_invocations: 8,
     }));
     const call = sdk.createRun.mock.calls.at(-1)?.[0] as { prompt: string };
     expect(call.prompt).not.toContain('UNRELATED');
@@ -266,7 +648,8 @@ describe('Atlas authenticated live research adapter', () => {
 
   it('surfaces budget failures without retries or fabricated partial success', async () => {
     const sdk = stub();
-    sdk.createRun.mockResolvedValueOnce(run('failed', 'max_cost_usd budget exceeded'));
+    sdk.createRun.mockResolvedValueOnce(run('running'));
+    sdk.getRun.mockResolvedValueOnce(run('failed', 'max_cost_usd budget exceeded'));
     await expect(make(sdk).research('computers')).rejects.toThrow('budget exceeded');
     expect(sdk.createRun).toHaveBeenCalledTimes(1);
     expect(sdk.cancelRun).not.toHaveBeenCalled();
@@ -281,15 +664,23 @@ describe('Atlas authenticated live research adapter', () => {
     await expect(make(sdk).research('computers')).rejects.toBe(rejection);
     expect(sdk.createRun).toHaveBeenCalledTimes(1);
     expect(sdk.createRun).toHaveBeenCalledWith(expect.objectContaining({
-      max_steps: 6, max_cost_usd: 0.15, max_tool_invocations: 12,
+      max_steps: 1000, max_cost_usd: 0.15, max_tool_invocations: 12,
     }));
     expect(sdk.getRun).not.toHaveBeenCalled();
     expect(sdk.cancelRun).not.toHaveBeenCalled();
   });
 
-  it('aborts the actual run and never publishes stale completion', async () => {
+  it('aborts stream observation without cancelling remote work or publishing stale completion', async () => {
     const sdk = stub();
     sdk.createRun.mockResolvedValueOnce(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* (
+      _id?: string, _options?: unknown,
+    ): AsyncGenerator<{ event: string; data: Record<string, unknown>; id?: string }> {
+      const signal = (_options as { signal: AbortSignal }).signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
     const controller = new AbortController();
     const client = make(sdk);
     const listener = vi.fn();
@@ -299,12 +690,71 @@ describe('Atlas authenticated live research adapter', () => {
     await settle();
     controller.abort();
     await rejected;
-    expect(sdk.cancelRun).toHaveBeenCalledTimes(1);
-    expect(sdk.cancelRun).toHaveBeenCalledWith('run-root');
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
     expect(listener.mock.calls.some(([event]) => event.type === 'completed')).toBe(false);
   });
 
-  it('cancels a superseded selected scope even if its late run creation finishes afterward', async () => {
+  it('records explicit Cancel once and aborts only that active run observation', async () => {
+    const sdk = stub();
+    sdk.createRun.mockResolvedValue(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* (_id?: string, options?: unknown) {
+      const signal = (options as { signal: AbortSignal }).signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    const client = make(sdk);
+    const research = client.research('computers');
+    const rejected = expect(research).rejects.toMatchObject({ name: 'AbortError' });
+    await settle();
+    await Promise.all([client.cancelRun('run-root'), client.cancelRun('run-root')]);
+    await rejected;
+    expect(sdk.cancelRun).toHaveBeenCalledTimes(1);
+    expect(sdk.cancelRun).toHaveBeenCalledWith('run-root');
+  });
+
+  it('persists the authoritative terminal status returned by explicit cancellation', async () => {
+    const sdk = stub();
+    sdk.createRun.mockResolvedValue(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* (_id?: string, options?: unknown) {
+      const signal = (options as { signal: AbortSignal }).signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    sdk.cancelRun.mockResolvedValue(run('cancelled'));
+    const outcome = vi.fn(async input => ({
+      workspace_id: 'workspace', mutation_id: input.payload.state, revision: 3,
+      saved_at: '2026-11-10T00:00:00Z',
+    }));
+    const client = new AtlasExplorationClient(sdk as unknown as HaaSClient, {
+      operationPersistence: {
+        workspaceId: 'workspace',
+        prepare: vi.fn(async () => ({
+          workspace_id: 'workspace', mutation_id: 'prepared', revision: 1, saved_at: '2026-11-10T00:00:00Z',
+        })),
+        submitting: vi.fn(async () => ({
+          workspace_id: 'workspace', mutation_id: 'submitting', revision: 2, saved_at: '2026-11-10T00:00:00Z',
+        })),
+        outcome, unknown: vi.fn(), bind: vi.fn(async () => ({
+          workspace_id: 'workspace', mutation_id: 'bound', revision: 3, saved_at: '2026-11-10T00:00:00Z',
+        })),
+      } as never,
+    });
+    const research = client.research('cancel me');
+    const rejected = expect(research).rejects.toMatchObject({ name: 'AbortError' });
+    await settle();
+    await client.cancelRun('run-root');
+    await rejected;
+    expect(outcome).toHaveBeenCalledWith({
+      workspaceId: 'workspace',
+      operationId: expect.any(String),
+      kind: 'operation_outcome',
+      payload: { operation_id: expect.any(String), state: 'terminal', status: 'cancelled' },
+    });
+  });
+
+  it('does not cancel a superseded remote run when its late creation finishes afterward', async () => {
     const sdk = stub();
     let finish!: (value: RunResponse) => void;
     sdk.createRun.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
@@ -317,23 +767,26 @@ describe('Atlas authenticated live research adapter', () => {
     await rejected;
     const snapshot = await current;
     expect(snapshot.root_query).toBe('new');
-    expect(sdk.cancelRun).toHaveBeenCalledWith('old-run');
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
   });
 
-  it('uses a bounded timeout while waiting for human approval and calls cancelRun', async () => {
+  it('times out stream observation without remotely cancelling the run', async () => {
     vi.useFakeTimers();
     const sdk = stub();
-    const waiting = { ...run('input_required'), approval: {
-      batch_id: 'batch', batch_digest: 'digest', expires_at: approval().expires_at, tool_calls: approval().tool_calls,
-    } };
-    sdk.createRun.mockResolvedValue(waiting);
-    sdk.getRun.mockResolvedValue(waiting);
-    sdk.getApproval.mockResolvedValue(approval());
+    sdk.createRun.mockResolvedValue(run('running'));
+    sdk.streamEvents.mockImplementationOnce(async function* (
+      _id?: string, options?: unknown,
+    ): AsyncGenerator<{ event: string; data: Record<string, unknown>; id?: string }> {
+      const signal = (options as { signal: AbortSignal }).signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
     const pending = make(sdk, 20).research('computers');
     const rejected = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
     await vi.advanceTimersByTimeAsync(21);
     await rejected;
-    expect(sdk.cancelRun).toHaveBeenCalledWith('run-root');
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
     expect(sdk.decideApproval).not.toHaveBeenCalled();
   });
 
@@ -355,7 +808,7 @@ describe('Atlas authenticated live research adapter', () => {
         });
       }
     });
-    await client.research('computers');
+    await expect(client.research('computers')).rejects.toThrow('pending approval');
     await humanDecision;
     expect(events.find(e => e.type === 'approval')).toMatchObject({
       approval: { batch_id: 'batch', batch_digest: 'digest',
@@ -367,6 +820,9 @@ describe('Atlas authenticated live research adapter', () => {
   it('rejects approval mismatch and does not bypass a denied public API decision', async () => {
     const sdk = stub();
     sdk.createRun.mockResolvedValueOnce({ ...run('input_required'), approval: {
+      batch_id: 'batch', batch_digest: 'wrong', expires_at: approval().expires_at, tool_calls: [],
+    } });
+    sdk.getRun.mockResolvedValueOnce({ ...run('input_required'), approval: {
       batch_id: 'batch', batch_digest: 'wrong', expires_at: approval().expires_at, tool_calls: [],
     } });
     sdk.getApproval.mockResolvedValue(approval());
@@ -424,10 +880,10 @@ describe('Atlas authenticated live research adapter', () => {
     sdk.createRun.mockResolvedValueOnce(run('running'));
     sdk.getRun.mockResolvedValueOnce({ ...run(), run_id: 'other-run' });
     await expect(make(sdk).research('computers')).rejects.toThrow('Run execution context mismatch');
-    expect(sdk.cancelRun).toHaveBeenCalledWith('run-root');
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
   });
 
-  it('aborts waiting for a stalled SDK poll without publishing late data', async () => {
+  it('aborts waiting for reconciliation without publishing late data or remote cancellation', async () => {
     const sdk = stub();
     sdk.createRun.mockResolvedValueOnce(run('running'));
     let finish!: (value: RunResponse) => void;
@@ -442,7 +898,7 @@ describe('Atlas authenticated live research adapter', () => {
     finish(run());
     await settle();
     expect(sdk.getThread).not.toHaveBeenCalled();
-    expect(sdk.cancelRun).toHaveBeenCalledTimes(1);
+    expect(sdk.cancelRun).not.toHaveBeenCalled();
   });
 });
 

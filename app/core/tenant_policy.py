@@ -54,7 +54,7 @@ class TenantPolicyRules(BaseModel):
     default_planner_model: str | None = None
     plugin_grants: list[PluginGrant] = Field(default_factory=list)
     destination_hosts: list[str] = Field(default_factory=list)
-    max_steps: int = Field(default=15, ge=1, le=50)
+    max_steps: int = Field(default=15, ge=1, le=1_000)
     max_cost_usd: float = Field(default=0.30, gt=0, le=10)
     retention_class: str = Field(default="standard", min_length=1, max_length=64)
     # Track M: marketplace trust tiers this tenant may install; None = platform/verified/private.

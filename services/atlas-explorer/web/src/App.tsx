@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { AtlasPreview } from './components/AtlasPreview';
-import { AtlasWorkspace } from './components/AtlasWorkspace';
+import { AtlasDurableWorkspace } from './components/AtlasDurableWorkspace';
+import { WorkspaceStorageApi } from './workspaceStorageApi';
 import { createBrowserAtlasAdapter } from './liveAdapter';
 import { createBrowserApproverAdapter } from './approverAdapter';
 import { AtlasApproverPage } from './components/AtlasApproverPage';
@@ -21,8 +22,9 @@ function OperatorApproverApp() {
 
 function LiveAtlasApp() {
   const [adapter] = useState(createBrowserAtlasAdapter);
+  const [storage] = useState(() => new WorkspaceStorageApi());
   const approverOrigin = document.querySelector<HTMLMetaElement>('meta[name="atlas-approver-origin"]')?.content;
-  return <AtlasWorkspace adapter={adapter} approverOrigin={approverOrigin} />;
+  return <AtlasDurableWorkspace adapter={adapter} storage={storage} approverOrigin={approverOrigin} />;
 }
 
 export default App;

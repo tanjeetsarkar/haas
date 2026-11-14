@@ -1,9 +1,12 @@
-import type { KeyboardEvent } from 'react';
-import type { AtlasExplorationSnapshot, AtlasOccurrence, AtlasTarget } from '@haas/atlas-explorer-client';
+import { useState, type KeyboardEvent } from 'react';
+import type { AtlasActionDraftV1, AtlasExplorationSnapshot, AtlasOccurrence, AtlasTarget } from '@haas/atlas-explorer-client';
 import { facetResearchComplete, targetKey, targetTitle } from '../graphProjection';
+import { AtlasCardActions } from './AtlasCardActions';
 
 export function AtlasGraphColumn({ snapshot, title, rows, index, active, selected, explored, emptyMessage,
-  sample = false, onSelect, onKeyDown }: {
+  sample = false, actionDrafts = {}, editingActionCard, actionDraftText,
+  onEditAction, onActionDraftText,
+  onSaveActionDraft, onSelect, onKeyDown }: {
   snapshot: AtlasExplorationSnapshot;
   title: string;
   rows: AtlasOccurrence[];
@@ -13,9 +16,22 @@ export function AtlasGraphColumn({ snapshot, title, rows, index, active, selecte
   explored: Set<string>;
   emptyMessage: string;
   sample?: boolean;
+  actionDrafts?: Record<string, unknown>;
+  editingActionCard?: string | null;
+  actionDraftText?: string;
+  onEditAction?: (cardId: string, initialText: string) => void;
+  onActionDraftText?: (value: string) => void;
+  onSaveActionDraft?: (cardId: string, draft: AtlasActionDraftV1) => Promise<void>;
   onSelect: (row: AtlasOccurrence, index: number) => void;
   onKeyDown: (event: KeyboardEvent<HTMLElement>, rows: AtlasOccurrence[], index: number) => void;
 }) {
+  const [localEditor, setLocalEditor] = useState<{ cardId: string | null; text: string }>({ cardId: null, text: '' });
+  const editorCard = editingActionCard === undefined ? localEditor.cardId : editingActionCard;
+  const editorText = actionDraftText ?? localEditor.text;
+  const editAction = onEditAction ?? ((cardId: string, initialText: string) =>
+    setLocalEditor({ cardId, text: initialText }));
+  const changeDraft = onActionDraftText ?? ((text: string) =>
+    setLocalEditor(current => ({ ...current, text })));
   return <section className={`atlas-preview__column${active ? ' is-mobile-active' : ''}`}
     aria-label={`${title} column`} onKeyDown={event => onKeyDown(event, rows, index)}>
     <header className="atlas-preview__column-heading">
@@ -33,16 +49,21 @@ export function AtlasGraphColumn({ snapshot, title, rows, index, active, selecte
         const status = facet?.status === 'unavailable' ? 'Unavailable'
           : facet?.status === 'research_needed' && !facetResearchComplete(snapshot, target) ? 'Research needed' : facet ? sample ? 'Sample details' : 'Known results' : null;
         const isSelected = selected && targetKey(selected) === targetKey(target);
-        return <button className={`atlas-preview__row type-${target.kind}${isSelected ? ' is-selected' : ''}`}
-          key={targetKey(target)} type="button" data-atlas-row aria-current={isSelected ? 'step' : undefined}
-          onClick={() => onSelect(row, index)}>
-          <span className="atlas-preview__row-type">{target.kind === 'entity' ? 'Entity' : target.kind === 'facet' ? 'Facet' : 'Source'}</span>
-          <strong>{targetTitle(snapshot, target)}</strong>
-          <span className="atlas-preview__row-summary">{summary}</span>
-          {target.kind === 'entity' && explored.has(target.entity_id) && <span className="atlas-preview__facet-status">Already explored</span>}
-          {status && <span className={`atlas-preview__facet-status status-${status.toLowerCase().replace(/\s/g, '-')}`}>{status}</span>}
-          <span className="atlas-preview__row-arrow" aria-hidden="true">›</span>
-        </button>;
+        return <div className="atlas-preview__card-entry" key={targetKey(target)}>
+          <button className={`atlas-preview__row type-${target.kind}${isSelected ? ' is-selected' : ''}`}
+            type="button" data-atlas-row aria-current={isSelected ? 'step' : undefined}
+            onClick={() => onSelect(row, index)}>
+            <span className="atlas-preview__row-type">{target.kind === 'entity' ? 'Entity' : target.kind === 'facet' ? 'Facet' : 'Source'}</span>
+            <strong>{targetTitle(snapshot, target)}</strong>
+            <span className="atlas-preview__row-summary">{summary}</span>
+            {target.kind === 'entity' && explored.has(target.entity_id) && <span className="atlas-preview__facet-status">Already explored</span>}
+            {status && <span className={`atlas-preview__facet-status status-${status.toLowerCase().replace(/\s/g, '-')}`}>{status}</span>}
+            <span className="atlas-preview__row-arrow" aria-hidden="true">›</span>
+          </button>
+          <AtlasCardActions snapshot={snapshot} target={target} drafts={actionDrafts}
+            editingCardId={editorCard} draftText={editorText}
+            onEdit={editAction} onDraftText={changeDraft} onSaveDraft={onSaveActionDraft} />
+        </div>;
       })}
     </div>
   </section>;

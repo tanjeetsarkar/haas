@@ -40,7 +40,7 @@ describe('AtlasSessionManager legacy facade behavior', () => {
       thread_id: 'thread-root',
       prompt: 'Layer 1 Root Query: Clinics in Mumbai. Emit atlas-layer.v1 JSON.',
       preload_skills: ['atlas-explorer', 'web-research', 'data-analyst'],
-      max_steps: 6, max_cost_usd: 0.15, max_tool_invocations: 12,
+      max_steps: 1000, max_cost_usd: 0.15, max_tool_invocations: 12,
     });
     await settle();
     expect(received).toHaveBeenCalledWith({
@@ -61,7 +61,7 @@ describe('AtlasSessionManager legacy facade behavior', () => {
       thread_id: 'thread-branch',
       prompt: '[parent_node_id=node-2] [dimension=specialties] Compare specialties',
       preload_skills: ['atlas-explorer', 'web-research', 'data-analyst'],
-      max_steps: 5, max_cost_usd: 0.10, max_tool_invocations: 8,
+      max_steps: 1000, max_cost_usd: 0.10, max_tool_invocations: 8,
     });
   });
 

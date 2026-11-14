@@ -28,6 +28,7 @@ here named `NNNN-short-title.md` using the template below, and are added to the 
 | [ADR-20](0020-generic-audit-tenant-uuid-mapping.md) | Resolve tenant UUIDs for generic audit writes | Accepted — plan 033 done on parent-reported independent approval and Docker-backed authenticated API verification |
 | [ADR-21](0021-run-tool-restrictions-and-exact-intents.md) | Generic per-run tool restrictions, immutable exact invocation intents and separate approval connections | Proposed — plan 035; internal live authorization RPC selected for c2; exact-intent release gates remain |
 | [ADR-22](0022-bounded-acquisition-and-tool-free-finalization.md) | Generic bounded acquisition followed by a reserved tool-free finalization attempt | Accepted — plan 036 behavior/quotas and one reversible phase-state migration authorized; shared DB application not authorized |
+| [ADR-23](0023-sdk-stream-lifecycle.md) | Generic abortable, bounded SDK stream observation lifecycle | Accepted — approved epic 038 scope; plan 040 implementation/review pending |
 
 ## Template
 

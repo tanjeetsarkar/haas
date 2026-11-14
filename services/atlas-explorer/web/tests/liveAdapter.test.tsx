@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { HaaSClient, type ApprovalBatch } from '@haas/sdk';
+import { HaaSClient, type ApprovalBatch, type RunResponse } from '@haas/sdk';
 import { AtlasExplorationClient, selectExplorationTarget, type AtlasResearchEvent } from '@haas/atlas-explorer-client';
 import { createBrowserAtlasAdapter, createLiveAtlasAdapter } from '../src/liveAdapter';
 import { claimPresentations } from '../src/graphProjection';
@@ -33,6 +33,41 @@ describe('Public Atlas client adapter contract', () => {
       .toBe('HTTP 403: Tenant policy restriction.');
     expect(describeAtlasError({ status: 401, problem: { detail: 'Internal response detail' } }))
       .toBe('Authentication required. Connect through the authenticated same-origin HaaS proxy.');
+  });
+
+  it('forwards the typed execution channel and unsubscribes after research', async () => {
+    const { client } = clientSetup();
+    const execution = vi.fn();
+    const stop = vi.fn();
+    vi.spyOn(client, 'observeExecution').mockImplementation(observer => {
+      observer({ type: 'telemetry', telemetry: { context, status: 'running' } });
+      return stop;
+    });
+
+    vi.spyOn(client, 'research').mockResolvedValue(testData().snapshot);
+    await createLiveAtlasAdapter(client).research({
+      query: 'question', onStatus: vi.fn(), onExecution: execution,
+    }).result;
+    expect(execution).toHaveBeenCalledWith({ type: 'telemetry', telemetry: { context, status: 'running' } });
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it('resumes only observation through the persistent client and releases its observer', async () => {
+    const { client } = clientSetup();
+    const stop = vi.fn();
+    vi.spyOn(client, 'observeExecution').mockReturnValue(stop);
+    const resume = vi.spyOn(client, 'resumeObservation').mockResolvedValue({
+      context, status: 'completed', lastEventId: '12', terminal: true, disconnected: false,
+    });
+    const research = vi.spyOn(client, 'research');
+    const persistence = { workspaceId: 'w', prepare: vi.fn(), outcome: vi.fn(), bind: vi.fn() };
+    const adapter = createLiveAtlasAdapter(client, () => client);
+    const controller = new AbortController();
+    await adapter.resume!({ context, lastEventId: '9', persistence,
+      signal: controller.signal, onExecution: vi.fn() });
+    expect(resume).toHaveBeenCalledWith(context, '9', controller.signal);
+    expect(research).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it('uses the real exported research/observe contract and includes full approval batch contents', async () => {
@@ -79,6 +114,10 @@ describe('Public Atlas client adapter contract', () => {
   it('waits for remote cancellation acknowledgement and reports cancellation failure', async () => {
     const { client, emit } = clientSetup();
     const ack = deferred<void>();
+    vi.spyOn(client, 'cancelRun').mockImplementation(async () => {
+      await ack.promise;
+      return { run_id: 'run', status: 'cancelled' } as RunResponse;
+    });
     vi.spyOn(client, 'research').mockImplementation((_q, _c, signal) => new Promise((_res, reject) => {
       signal?.addEventListener('abort', () => {
         void ack.promise.then(() => reject(signal.reason));

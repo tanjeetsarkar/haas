@@ -1234,6 +1234,8 @@ export interface ClientOptions {
 export interface StreamOptions {
   lastEventId?: string;
   outputDeltas?: boolean;
+  /** Stops local observation; this does not cancel the remote run. */
+  signal?: AbortSignal;
 }
 
 export interface SSEEvent {

@@ -6,6 +6,7 @@ WORKDIR /service
 
 COPY pyproject.toml README.md ./
 COPY app ./app
+COPY migrations ./migrations
 RUN pip install --no-cache-dir .
 
 RUN useradd --create-home --uid 10001 service

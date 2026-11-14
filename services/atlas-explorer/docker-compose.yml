@@ -4,7 +4,21 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${ATLAS_EXPLORER_PORT:-8081}:8080"
+      - "127.0.0.1:${ATLAS_EXPLORER_PORT:-8081}:8080"
+    environment:
+      ATLAS_DATABASE_HOST: atlas-postgres
+      ATLAS_DATABASE_NAME: atlas_explorer
+      ATLAS_DATABASE_USER: atlas_runtime
+      ATLAS_DATABASE_PORT: "5432"
+      ATLAS_RUNTIME_PASSWORD_FILE: /run/secrets/atlas_runtime_password
+      ATLAS_HAAS_API_ORIGIN: "${ATLAS_HAAS_API_ORIGIN:-}"
+      ATLAS_ALLOW_LOCAL_HAAS_HTTP: "${ATLAS_ALLOW_LOCAL_HAAS_HTTP:-false}"
+    entrypoint: ["/bin/sh", "/postgres/atlas-api-entrypoint.sh"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - ./postgres/atlas-api-entrypoint.sh:/postgres/atlas-api-entrypoint.sh:ro
+    secrets:
+      - atlas_runtime_password
     healthcheck:
       test:
         - CMD
@@ -18,10 +32,74 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    depends_on:
+      atlas-postgres:
+        condition: service_healthy
     networks:
       - haas-core
+      - atlas-db
+
+  atlas-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: atlas_explorer
+      POSTGRES_USER: atlas_bootstrap_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/atlas_bootstrap_password
+    secrets:
+      - atlas_bootstrap_password
+      - atlas_migration_password
+      - atlas_runtime_password
+    volumes:
+      - atlas_postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-roles.sh:/docker-entrypoint-initdb.d/10-atlas-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas_bootstrap_admin -d atlas_explorer"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - atlas-db
+
+  atlas-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["migrate"]
+    entrypoint: ["/bin/sh", "/postgres/atlas-migration-entrypoint.sh"]
+    command: ["python", "-m", "app.migrate", "up"]
+    environment:
+      ATLAS_DATABASE_HOST: atlas-postgres
+      ATLAS_DATABASE_NAME: atlas_explorer
+      ATLAS_DATABASE_USER: atlas_migrator
+      ATLAS_DATABASE_PORT: "5432"
+      ATLAS_MIGRATION_PASSWORD_FILE: /run/secrets/atlas_migration_password
+    volumes:
+      - ./postgres/atlas-migration-entrypoint.sh:/postgres/atlas-migration-entrypoint.sh:ro
+    secrets:
+      - atlas_migration_password
+    networks:
+      - atlas-db
 
 networks:
   haas-core:
     external: true
-    name: ${HAAS_CORE_NETWORK:-atlas-explorer-local}
+    name: ${HAAS_CORE_NETWORK:-harness_default}
+  atlas-db:
+    name: atlas-explorer-db
+    internal: true
+
+volumes:
+  atlas_postgres_data:
+    name: atlas_explorer_postgres_data
+
+secrets:
+  atlas_bootstrap_password:
+    file: ./postgres/secrets/bootstrap_password
+  atlas_migration_password:
+    file: ./postgres/secrets/migration_password
+  atlas_runtime_password:
+    file: ./postgres/secrets/runtime_password
+  atlas_external_runtime_url:
+    file: ./postgres/secrets/external_runtime_database_url
+  atlas_external_migration_url:
+    file: ./postgres/secrets/external_migration_database_url

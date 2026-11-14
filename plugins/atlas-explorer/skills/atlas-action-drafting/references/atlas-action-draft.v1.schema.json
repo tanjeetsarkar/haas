@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://haas.local/contracts/atlas-action-draft.v1.schema.json",
+  "title": "AtlasActionDraftV1",
+  "description": "Untrusted, non-executable action intent draft. It grants no capability or authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "proposal_id",
+    "card_reference",
+    "intent_text",
+    "capability",
+    "proposed_arguments",
+    "evidence_refs",
+    "missing_fields",
+    "warnings",
+    "external_execution"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "atlas-action-draft.v1"
+    },
+    "proposal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "card_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "card_id",
+        "workspace_revision",
+        "branch_revision"
+      ],
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workspace_revision": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        },
+        "branch_revision": {
+          "type": ["string", "null"],
+          "maxLength": 128
+        }
+      }
+    },
+    "intent_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "schema_version",
+        "resolution",
+        "reason"
+      ],
+      "properties": {
+        "capability_id": {
+          "type": "null"
+        },
+        "schema_version": {
+          "type": "null"
+        },
+        "resolution": {
+          "type": "string",
+          "const": "unverified"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      }
+    },
+    "proposed_arguments": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "field",
+          "value",
+          "source",
+          "uncertain"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "source": {
+            "type": "string",
+            "enum": ["user_input", "public_card"]
+          },
+          "uncertain": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^(?!https?://).+$"
+      }
+    },
+    "missing_fields": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    },
+    "external_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "unavailable"
+        },
+        "reason": {
+          "type": "string",
+          "const": "External execution unavailable — authorization release gates pending"
+        }
+      }
+    }
+  }
+}

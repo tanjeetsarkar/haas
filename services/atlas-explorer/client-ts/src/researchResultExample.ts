@@ -1,6 +1,12 @@
 import type { AtlasResearchResult } from './explorationResearch';
 
 /** Synthetic format example only. Never a source of facts or fallback research data. */
+const referenceExamples = [
+  { kind: 'entity', entity_id: 'road' },
+  { kind: 'facet', entity_id: 'road', facet_key: 'overview' },
+  { kind: 'source', source_id: 'synthetic-format-source' },
+] satisfies AtlasResearchResult['targets'];
+
 export const researchResultExample: AtlasResearchResult = {
   interpretation: { kind: 'resolved', subject_entity_id: 'transport' },
   entities: [
@@ -37,5 +43,5 @@ export const researchResultExample: AtlasResearchResult = {
     evidence: { status: 'sourced', source_ids: ['synthetic-format-source'] },
   })),
   relationships: [],
-  targets: ['road', 'rail', 'water'].map(entity_id => ({ kind: 'entity', entity_id })),
+  targets: referenceExamples,
 };

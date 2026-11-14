@@ -5,7 +5,7 @@
  * for interacting with the HaaS /v1 REST API and SSE event streams.
  */
 
-import { createParser, ParsedEvent } from 'eventsource-parser';
+import { createParser } from 'eventsource-parser';
 import {
   ClientOptions,
   StreamOptions,
@@ -23,6 +23,7 @@ import {
   RunEventsResponse,
   RunStepsResponse,
   RunUsageResponse,
+  RunStatus,
   ApprovalBatch,
   ApprovalDecision,
   ApprovalListParams,
@@ -148,6 +149,22 @@ const SETTLED_EVENTS = new Set([
   'run_paused',
   'input_required',
 ]);
+
+const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+]);
+
+const MAX_DURABLE_EVENT_ID = BigInt('9223372036854775807');
+
+function parseDurableEventId(value: string): bigint | undefined {
+  if (!/^\d+$/.test(value)) return undefined;
+  const normalized = value.replace(/^0+(?=\d)/, '');
+  if (normalized.length > 19) return undefined;
+  const id = BigInt(normalized);
+  return id <= MAX_DURABLE_EVENT_ID ? id : undefined;
+}
 
 /**
  * Main HaaS Client Class
@@ -321,127 +338,184 @@ export class HaaSClient {
   }
 
   /**
-   * Make a streaming request with automatic reconnection
+   * Make a streaming request with automatic reconnection.
+   * Abort the provided signal before returning an iterator with a pending read.
    */
   async *streamEvents(runId: string, options: StreamOptions = {}): AsyncGenerator<SSEEvent, void, unknown> {
-    const { lastEventId = '0', outputDeltas = false } = options;
-    let cursor = /^\d{1,18}$/.test(lastEventId) ? lastEventId : '0';
-    let failures = 0;
+    const { lastEventId = '0', outputDeltas = false, signal } = options;
+    let cursor = parseDurableEventId(lastEventId) !== undefined ? lastEventId : '0';
+    let reconnects = 0;
+
+    const abortError = (): Error => {
+      if (signal?.reason instanceof Error) return signal.reason;
+      return new DOMException('The operation was aborted.', 'AbortError');
+    };
+    const throwIfAborted = (): void => {
+      if (signal?.aborted) throw abortError();
+    };
+    const waitForReconnect = (): Promise<void> => new Promise((resolve, reject) => {
+      throwIfAborted();
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, this.streamReconnectDelay);
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(abortError());
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+    const readRunStatus = async (): Promise<RunResponse> => {
+      const controller = new AbortController();
+      const onAbort = () => controller.abort(signal?.reason);
+      if (signal?.aborted) throw abortError();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(), this.timeout);
+      try {
+        const response = await fetch(`${this.baseUrl}/v1/runs/${runId}`, {
+          method: 'GET',
+          headers: this.getHeaders(),
+          signal: controller.signal,
+        });
+        if (signal?.aborted) throw abortError();
+        if (response.status >= 400) {
+          const body = await response.text();
+          let detail = body;
+          try {
+            const errorBody = JSON.parse(body) as { detail?: string; message?: string };
+            detail = errorBody.detail || errorBody.message || body;
+          } catch {
+            // Keep the response text as the API error detail.
+          }
+          throw new HaaSAPIError(detail, response.status, detail);
+        }
+        return await response.json() as RunResponse;
+      } catch (error) {
+        if (signal?.aborted) throw abortError();
+        if (controller.signal.aborted) {
+          throw new HaaSConnectionError(`Run status request timed out after ${this.timeout}ms`);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
+      }
+    };
 
     while (true) {
-      // Create a queue to bridge the parser callback and the async generator
+      throwIfAborted();
       const eventQueue: SSEEvent[] = [];
       let parseError: Error | null = null;
-
-      const parser = createParser((event: { type: string; data?: string | number; id?: string; event?: string; error?: Error }) => {
-        // Handle different event types from eventsource-parser
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let readerDone = false;
+      let failure: unknown;
+      const parser = createParser((event: {
+        type: string;
+        data?: string | number;
+        id?: string;
+        event?: string;
+        error?: Error;
+      }) => {
         if (event.type === 'error') {
           parseError = event.error || new Error('SSE parse error');
           return;
         }
-        // event can be { type: 'event', event: string, data: string, id: string | undefined }
-        // or { type: 'reconnect-interval', data: number }
-        if (event.type === 'reconnect-interval') {
-          return;
-        }
-        if (event.type !== 'event') {
-          return;
-        }
-        const sseEvent: SSEEvent = {
-          event: event.event || 'message',
-          data: event.data ? JSON.parse(String(event.data)) : {},
-          id: event.id,
-        };
-        eventQueue.push(sseEvent);
-        // Update cursor for reconnection
-        if (sseEvent.id) {
-          cursor = sseEvent.id;
+        if (event.type !== 'event') return;
+        try {
+          eventQueue.push({
+            event: event.event || 'message',
+            data: event.data ? JSON.parse(String(event.data)) : {},
+            id: event.id,
+          });
+        } catch (error) {
+          parseError = error instanceof Error ? error : new Error(String(error));
         }
       });
 
       try {
         const url = new URL(`${this.baseUrl}/v1/runs/${runId}/stream`);
-        if (outputDeltas) {
-          url.searchParams.set('output_deltas', 'true');
-        }
-
+        if (outputDeltas) url.searchParams.set('output_deltas', 'true');
         const response = await fetch(url.toString(), {
           method: 'GET',
           headers: {
             ...this.getHeaders(),
-            'Accept': 'text/event-stream',
+            Accept: 'text/event-stream',
             'Last-Event-ID': cursor,
           },
+          signal,
         });
-
+        throwIfAborted();
         if (response.status >= 400) {
-          let detail: string;
+          const body = await response.text();
+          let detail = body;
           try {
-            const errorBody = await response.json() as { detail?: string; message?: string };
-            detail = errorBody.detail || errorBody.message || JSON.stringify(errorBody);
+            const errorBody = JSON.parse(body) as { detail?: string; message?: string };
+            detail = errorBody.detail || errorBody.message || body;
           } catch {
-            detail = await response.text();
+            // Keep the response text as the API error detail.
           }
           throw new HaaSAPIError(detail, response.status, detail);
         }
+        if (!response.body) throw new HaaSConnectionError('No response body for stream');
 
-        if (!response.body) {
-          throw new HaaSConnectionError('No response body for stream');
-        }
-
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
+        const onAbort = () => { void reader?.cancel().catch(() => undefined); };
+        signal?.addEventListener('abort', onAbort, { once: true });
         const decoder = new TextDecoder();
-
-        let done = false;
-        while (!done) {
-          // Yield any queued events
-          while (eventQueue.length > 0) {
-            yield eventQueue.shift()!;
+        try {
+          while (!readerDone) {
+            throwIfAborted();
+            while (eventQueue.length > 0) {
+              const next = eventQueue.shift()!;
+              const nextId = next.id ? parseDurableEventId(next.id) : undefined;
+              if (nextId !== undefined && nextId > BigInt(cursor)) {
+                cursor = next.id!;
+              }
+              yield next;
+              throwIfAborted();
+            }
+            const result = await reader.read();
+            throwIfAborted();
+            readerDone = result.done;
+            if (result.value) parser.feed(decoder.decode(result.value, { stream: true }));
+            if (parseError) throw parseError;
           }
-
-          const { done: readerDone, value } = await reader.read();
-          done = readerDone;
-          if (value) {
-            const chunk = decoder.decode(value, { stream: true });
-            parser.feed(chunk);
-          }
-
-          if (parseError) {
-            throw parseError;
-          }
+          const run = await readRunStatus();
+          if (TERMINAL_RUN_STATUSES.has(run.status)) return;
+          failure = new HaaSConnectionError(`Run stream ended while status was ${run.status}`);
+        } finally {
+          signal?.removeEventListener('abort', onAbort);
         }
-
-        reader.releaseLock();
-
-        // Yield any remaining events
-        while (eventQueue.length > 0) {
-          yield eventQueue.shift()!;
-        }
-
-        // Stream ended cleanly
-        const run = await this.getRun(runId);
-        if (!['queued', 'running', 'cancelling'].includes(run.status)) {
-          return;
-        }
-
-        failures++;
-        if (failures > this.streamMaxReconnects) {
-          throw new HaaSConnectionError(`Lost connection to event stream after ${this.streamMaxReconnects} reconnects`);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, this.streamReconnectDelay));
       } catch (error) {
-        if (error instanceof HaaSAPIError || error instanceof HaaSStreamClosedError) {
-          throw error;
+        if (signal?.aborted) throw abortError();
+        if (error instanceof HaaSAPIError || error instanceof HaaSStreamClosedError) throw error;
+        failure = error;
+      } finally {
+        if (reader) {
+          if (!readerDone) {
+            try {
+              await reader.cancel();
+            } catch {
+              // Cancellation is best-effort; release the reader lock regardless.
+            }
+          }
+          try {
+            reader.releaseLock();
+          } catch {
+            // A pending read can temporarily prevent lock release during abort.
+          }
         }
-
-        failures++;
-        if (failures > this.streamMaxReconnects) {
-          throw new HaaSConnectionError(`Lost connection to event stream: ${error instanceof Error ? error.message : String(error)}`);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, this.streamReconnectDelay));
       }
+
+      throwIfAborted();
+      const message = failure instanceof Error ? failure.message : String(failure);
+      if (reconnects >= this.streamMaxReconnects) {
+        throw new HaaSConnectionError(`Lost connection to event stream: ${message}`);
+      }
+      reconnects++;
+      await waitForReconnect();
     }
   }
 

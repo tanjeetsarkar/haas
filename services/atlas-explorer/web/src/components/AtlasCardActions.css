@@ -1,0 +1,34 @@
+.atlas-preview__card-entry { display: grid; gap: 5px; }
+.atlas-preview__card-entry > .atlas-preview__row { min-height: 96px; }
+.atlas-card-actions {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--atlas-line);
+  border-radius: 9px;
+  background: rgba(8, 15, 27, .7);
+  font-size: 11px;
+}
+.atlas-card-actions h4 { margin: 0; color: var(--atlas-muted); font-size: 10px; text-transform: uppercase; }
+.atlas-card-actions__buttons { display: flex; flex-wrap: wrap; gap: 5px; }
+.atlas-card-actions button {
+  border: 1px solid var(--atlas-line);
+  border-radius: 6px;
+  padding: 5px 7px;
+  background: var(--atlas-panel-raised);
+}
+.atlas-card-actions__editor { display: grid; gap: 6px; }
+.atlas-card-actions__editor label { display: grid; gap: 4px; }
+.atlas-card-actions textarea {
+  width: 100%;
+  min-height: 65px;
+  border: 1px solid var(--atlas-line);
+  border-radius: 6px;
+  padding: 7px;
+  background: var(--atlas-panel);
+  color: var(--atlas-ink);
+  font: inherit;
+}
+.atlas-card-actions__hold { margin: 0; color: var(--atlas-warm); font-size: 10px; }
+.atlas-card-actions p, .atlas-card-actions ul { margin: 0; overflow-wrap: anywhere; }
+.atlas-card-actions ul { padding-left: 18px; }

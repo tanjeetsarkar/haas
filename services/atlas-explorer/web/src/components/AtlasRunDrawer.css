@@ -1,0 +1,10 @@
+.atlas-run-drawer { margin: 1rem 0; padding: 1rem; border: 1px solid #536274; border-radius: .5rem; }
+.atlas-run-drawer summary { cursor: pointer; font-weight: 600; }
+.atlas-run-drawer dl { display: grid; grid-template-columns: minmax(7rem, 1fr) minmax(0, 3fr); gap: .5rem; }
+.atlas-run-drawer dd { margin: 0; overflow-wrap: anywhere; }
+.atlas-run-drawer pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; }
+.atlas-run-drawer li { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .atlas-run-drawer dl { display: block; }
+  .atlas-run-drawer dd { margin-bottom: .75rem; }
+}

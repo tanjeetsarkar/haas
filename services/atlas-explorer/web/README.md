@@ -1,9 +1,18 @@
 # Atlas Explorer web UI
 
-This package builds the Atlas Explorer UI as a standalone static application.
-The Python service/container remains health-only and does not serve these files.
-The UI uses the public HaaS TypeScript SDK and Atlas client; it does not provide
-an Atlas backend, authentication, or a production routing configuration.
+This package builds the Atlas Explorer UI. The UI uses the public HaaS
+TypeScript SDK and Atlas client: research and execution data come from the
+public HaaS API, while durable workspace drafts and mutation history are served
+by the separate Atlas Explorer Python service. The Python service does not
+serve the static web bundle. For the complete local setup, ports, credentials
+and recovery steps, see the [local runbook](../../../docs/atlas-explorer-local-runbook.md).
+
+Local development uses a loopback-only Vite proxy. It forwards same-origin
+requests to the HaaS API and the workspace service, reading the submitter
+credential server-side only from the repository-root `.env.haas` file. The
+browser bundle does not receive credentials. This development proxy is not a
+production authentication or routing configuration; a production deployment
+must supply its own server-authenticated routing and authorization.
 
 ## Local checks and dependency ownership
 
@@ -33,12 +42,11 @@ replacement parity tests; this does not remove core marketplace or public SDK AP
 - Submit any query to start actual research through `AtlasExplorationClient`.
   Unknown queries never become sample answers. Columns are derived from canonical
   graph entities, facets, relationships and sources—not fixture templates or names.
-- Known facets reuse results; unknown facets research only the selected ancestry.
-  Parent columns remain visible. New searches invalidate stale callbacks and cancel
-  the preceding remote operation. Cancellation success is shown only after the
-  client acknowledges remote cancellation; failures remain explicit.
-  Cancelling before a run ID arrives is labeled requested/unconfirmed, not
-  acknowledged; the client cancels any subsequently completed submission.
+- New selections research only the selected ancestry; completed scoped branches
+  reuse cached results. Parent columns remain visible. Navigation invalidates
+  stale callbacks and detaches observation, without cancelling remote execution.
+  Explicit Cancel uses the public run-cancellation API for a known run. Before a
+  run ID arrives cancellation is unconfirmed and requires submission recovery.
 - The inspector retains sourced, conflicting and unsupported claims, identity
   references, observed timestamps and source records. Typed `claim.details` render
   price/unit/uncertainty, specialties/credentials, checklists and unsent action drafts
@@ -46,24 +54,123 @@ replacement parity tests; this does not remove core marketplace or public SDK AP
   missing values are labeled “Not reported”, never estimated by the UI.
 - Connection maps show actual direct graph neighbors, canonical IDs, direction
   and evidence status. No inferred person-to-person edges are created.
-- **Save new artifact snapshot** explicitly creates a new immutable HaaS artifact.
-  The artifact and run IDs are selectable/copyable. Load by artifact ID or list
-  recent saves scoped to the current run. API errors (including storage errors)
-  do not fall back to browser storage or claim success.
+- The default durable workspace saves automatically; **Saving**, **Saved**,
+  **Save failed** and **Conflict** reflect the server queue, not research completion.
+  It does not show **Save new artifact snapshot**. Existing artifact imports,
+  readers and export/client APIs remain compatible; artifact and run IDs remain
+  selectable/copyable. The default durable workspace has no manual artifact
+  snapshot save control. API errors never fall back to browser storage or claim
+  success.
 - Approval review displays actual server batch arguments, destinations and digest,
   including every tool call. Approve/reject use `decideApproval` with the exact
   batch digest. Only server responses change approval state. Separate-authorizer
   and approver-role enforcement remain server responsibilities; 401/403 errors
   are explicit. Dismiss closes the dialog without making a decision.
-- Browser back/forward restores in-memory paths or explicit artifact references.
-  URLs/history contain only query/path/artifact references, never snapshots or
-  credentials. Reopening a query URL fills the form but does not silently start a
-  billable run. Paths without an artifact are not durable across reloads.
+- Workspace URLs restore server drafts/committed graphs and recorded execution
+  bindings without submitting research. Unresolved intents block fresh dispatch.
+  URLs/history contain references only, never snapshots or credentials. Query
+  references fill the form without silently starting a billable run.
 
 `src/explorationAdapter.ts` is the typed injected UI boundary; `src/liveAdapter.ts`
 implements it using only exported Atlas/public HaaS SDK methods. Offline DOM and
 adapter tests mock that boundary or those public methods, never replace real live
 results with fixtures. No new runtime or test dependency was required.
+
+### Durable workspace integration checkpoint (043a)
+
+`src/workspaceSaveQueue.ts` provides a receipt-driven serial queue behind an
+injected Atlas storage transport. Only adjacent unsent draft checkpoints
+coalesce. Queries, operation intents and commits stay ordered; explicit retry
+retains the identical mutation ID/body. A conflict blocks writes and fetches
+authorized latest state without merging it. Storage failures remain unsaved.
+
+The default workspace uses this queue with aligned 041/042 callbacks. Actual
+storage readiness is not assumed: failures remain visible and prevent dispatch.
+With local 042 readiness verified, manual artifact save is hidden only in durable
+mode; artifact import remains available. No browser-unload write or automatic
+retry is introduced.
+The storage adapter invokes default browser fetch through `globalThis`, preserving
+its required receiver; catalog metadata includes backend timestamps without
+requiring graph state. Invalid catalogs still fail visibly, never fall back.
+
+### Public execution drawer checkpoint (043d)
+
+The collapsible run drawer consumes the typed `observeExecution` channel and,
+only after the user opens it, reads run status/timestamps, steps, usage and
+authorized thread history through existing public `@haas/sdk` methods. Thread
+history loads in stable-version pages on demand; older pages require an explicit
+button. Only public tool messages render (not system/assistant reasoning);
+credential fields are redacted and React renders text rather than HTML.
+Each item is UTF-8 bounded at 16KiB with a truncation label, and steps/history/
+stream rows share a 200-visible-entry cap. Missing SDK values stay unavailable,
+not zero. There is no interval polling, run creation, retry, approval or action.
+
+`AtlasRunDrawerProps` accepts the recorded `runId`, optional saved `threadId`,
+events and saved submission. The drawer derives a thread binding from the
+matching public event when omitted, and its default API creates a same-origin
+public SDK client without reading environment credentials. `detailsApi` is an
+optional typed injection point for tests or a parent-owned SDK client.
+
+### Workspace history protocol checkpoint (043b)
+
+The fixed same-origin `/__atlas/workspaces` API adapter and catalog/Continue/
+Start afresh component are implemented behind an injected storage boundary.
+Navigation awaits the caller's flush; unavailable storage fails visibly.
+Prepared/submitting/unknown records block fresh research, including legacy
+records without a state. Neither loading nor creating a fresh view dispatches
+research. These components are mounted through the durable entry point; a
+successful local storage round-trip was verified in the local record dated
+2026-11-10; that evidence does not imply production readiness.
+
+`workspaceSession.ts` adapts aligned 041 prepare/outcome/bind callbacks to that
+queue. It saves the exact submitted question before prepared intent, awaits
+submitting/binding receipts, blocks unresolved work, and recovers a known binding
+by retrying its original queue item/ID. Restored canonical graphs are strictly
+parsed; restore never executes an operation. Storage failures block execution.
+
+`AtlasDurableWorkspace` is the tested integration entry point: it composes
+catalog navigation, meaningful blur checkpoints, server-save receipts, strict
+graph reload and the awaited operation adapter. Storage 503 prevents dispatch;
+unknown intents block new research. Failed saves retain the exact retry item,
+and conflicts offer authorized reload without merging. It is now the default
+application entry point; unavailable/unapplied storage fails closed (including
+503) before research, rather than silently reverting to an unsaved paid run.
+Artifact import/export remains available. Navigation/unmount detaches observation;
+explicit user cancellation calls public `cancelRun` when the run ID is known.
+
+The durable entry point uses one scoped dive for a newly selected entity/category
+or available facet, retaining the exact original question and selected ancestry.
+Candidate facets wait for identity resolution. Sources/unavailable rows do not
+research; completed branches revisit from canonical cache. Duplicate in-flight
+selection submissions are suppressed. Artifact import/export remains available.
+
+Hard reload/Continue reattaches telemetry only when saved public execution
+correlation matches a bound operation/run/thread. Missing correlation is
+explicitly unavailable, never guessed. Reconnect uses that same run/cursor and
+never creates/cancels a run or projects provisional output as a graph. Start
+afresh/unmount abort observation, not remote execution. Completed reload
+observations do not synthesize missing graph results.
+
+### Card actions and custom drafts
+
+Every graph card and the selected-card inspector use the Atlas client's shared
+deterministic action catalog. Inspect is local and reports source references or
+missing evidence; a sourced summary is downloaded only after an explicit click.
+Exports carry source provenance and missing-data labels. These actions never
+fetch a source URL or submit an external request. **Custom action** is an explicit
+user-authored draft editor, not model drafting: saving writes the
+`action_draft_changed` workspace mutation and the UI confirms it only after the
+server receipt. A restored draft is displayed only when its card and graph
+revision still match. No model run, approval, capability resolution, or external
+execution is initiated; external execution remains unavailable pending release
+gates. The default durable workspace has no manual artifact snapshot control;
+artifact import/export remains separate.
+
+Review repairs: returning to a history entry without a workspace flushes then
+clears/detaches the current session, just like Start afresh. Cached selections
+offer explicit **Research again**; ordinary revisit still submits nothing.
+Reloaded drawers render saved operation prompt/context and the receipt-backed
+submitted question (when recorded), using the same redaction/text bounds.
 
 ## Independent operator approval page
 
@@ -91,7 +198,8 @@ For local development, launch the independent operator proxy explicitly:
 npm --prefix services/atlas-explorer/web run dev -- --mode approver
 ```
 
-It listens at `http://127.0.0.1:4318`; the usual submitter window uses port 4317.
+It listens at `http://127.0.0.1:4318`; the normal submitter window uses
+`http://127.0.0.1:3000`.
 The workspace offers an operator-window link only after its same-origin
 `GET /__atlas/dev-session` returns `{role:"submitter",developmentOnly:true}`.
 That endpoint is a navigation hint, not authentication. Nothing launches
@@ -142,6 +250,7 @@ it never reads environment files, calls `createClientFromEnv`, or stores credent
 The development proxy is a separate, loopback-only server concern; outside local
 development unauthenticated requests must fail closed. Never put credentials in
 the bundle or expose the development proxy as a production authentication service.
-This UI does not implement
-authentication, an Atlas backend, or health/readiness beyond the separate
-service health endpoint. No package is published by this slice.
+The Atlas backend is the separate workspace service, whose `/healthz` is
+process liveness only and whose `/readyz` checks database/schema/runtime-role
+readiness. Neither endpoint proves HaaS provider or live research readiness.
+No package is published by this slice.

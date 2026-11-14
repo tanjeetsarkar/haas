@@ -251,6 +251,47 @@ async def test_authenticated_run_rejects_policy_expansions(
     assert dispatched.calls == []
 
 
+@pytest.mark.parametrize(
+    ("policy_steps", "requested_steps", "status", "effective_steps"),
+    [
+        (1_000, 1_000, 202, 1_000),
+        (1_000, 1_001, 422, None),
+        (15, 1_000, 403, None),
+        (999, 1_000, 403, None),
+        (1_000, None, 202, 15),
+        (15, None, 202, 15),
+        (4, None, 202, 4),
+    ],
+)
+async def test_run_step_ceiling_preserves_tenant_limits(
+    monkeypatch, policy_steps, requested_steps, status, effective_steps
+):
+    rules = TenantPolicyRules(
+        model_providers=["openrouter"],
+        models=["example/provider-model"],
+        default_primary_model="example/provider-model",
+        default_planner_model="example/provider-model",
+        max_steps=policy_steps,
+        max_cost_usd=0.1,
+    )
+    client, store, dispatched = await _client(monkeypatch, _policy_record(rules))
+    monkeypatch.setattr(main_module.settings, "default_max_steps", 15)
+    async with client:
+        response = await client.post(
+            "/v1/runs",
+            headers={"Authorization": "Bearer test-step-ceiling", "X-Tenant-ID": "acme"},
+            json={"prompt": "run", "max_steps": requested_steps},
+        )
+    assert response.status_code == status, response.text
+    if effective_steps is None:
+        assert store.runs == dispatched.calls == []
+    else:
+        assert len(store.runs) == 1
+        assert store.runs[0]["max_steps"] == effective_steps
+        assert store.runs[0]["max_cost_usd"] == pytest.approx(0.1)
+        assert store.runs[0]["max_tool_invocations"] is None
+
+
 async def test_authenticated_run_webhook_must_match_exact_policy_host(
     monkeypatch,
 ):

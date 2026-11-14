@@ -306,7 +306,7 @@
           },
           "max_steps": {
             "default": 15,
-            "maximum": 50.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Max Steps",
             "type": "integer"
@@ -1104,7 +1104,7 @@
           "max_steps": {
             "anyOf": [
               {
-                "maximum": 50.0,
+                "maximum": 1000.0,
                 "minimum": 1.0,
                 "type": "integer"
               },
@@ -1970,7 +1970,7 @@
           "max_steps": {
             "anyOf": [
               {
-                "maximum": 50.0,
+                "maximum": 1000.0,
                 "minimum": 1.0,
                 "type": "integer"
               },
@@ -5096,7 +5096,7 @@
           },
           "max_steps": {
             "default": 15,
-            "maximum": 50.0,
+            "maximum": 1000.0,
             "minimum": 1.0,
             "title": "Max Steps",
             "type": "integer"

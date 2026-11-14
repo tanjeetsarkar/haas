@@ -34,6 +34,11 @@ describe('Bounded research prompt strategy', () => {
     expect(prompt).toContain('For status "known" or "research_needed", reason MUST be absent');
     expect(prompt).toContain('the example is not an allowed citation or fallback');
     expect(prompt).toContain(JSON.stringify(researchResultExample));
+    expect(prompt).toContain('{"kind":"entity","entity_id":"hospital-1"}');
+    expect(prompt).toContain('{"kind":"facet","entity_id":"hospital-1","facet_key":"specialists"}');
+    expect(prompt).toContain('{"kind":"source","source_id":"source-1"}');
+    expect(prompt).toContain('Entity kind (such as category,\nperson or organization) is separate from target kind ("entity").');
+    expect(prompt).toContain('Use only a target for the next row; do not generate deeper levels.');
   });
 
   it('validates and projects the complete broad-category fixture only with observed page evidence', () => {
@@ -61,5 +66,75 @@ describe('Bounded research prompt strategy', () => {
     result.entities[1].facets = [facet];
     expect(() => parseResearchResult(result)).toThrow('Invalid Atlas research result');
     expect(result.entities[1].facets[0]).toHaveProperty('reason', facet.reason);
+  });
+
+  it('reports a synthetic six-invalid-target regression without exposing model values', () => {
+    const result = structuredClone(researchResultExample);
+    result.targets = [
+      { kind: 'entity' } as never,
+      { kind: 'facet', entity_id: 'road' } as never,
+      { kind: 'source' } as never,
+      { kind: 'mystery', entity_id: 'road' } as never,
+      { kind: 'entity', entity_id: 'road', title: 'SENSITIVE MODEL TEXT' } as never,
+      { kind: 'entity', entity_id: 'road', source_id: 'source-1' } as never,
+    ];
+    const original = structuredClone(result);
+    let failure: unknown;
+    try { parseResearchResult(result); } catch (error) { failure = error; }
+    expect(failure).toMatchObject({ name: 'AtlasResearchValidationError' });
+    const error = failure as Error & { details: unknown[] };
+    expect(error.message).toContain('target[0]');
+    expect(error.message).toContain('target[5]');
+    expect(error.message).toContain('received kind "mystery"');
+    expect(error.message).toContain('allowed kinds: entity, facet, source');
+    expect(error.message).toContain('required fields: "kind", "entity_id"');
+    expect(error.message).toContain('extra fields: "title"');
+    expect(error.message).not.toContain('SENSITIVE MODEL TEXT');
+    expect(error.details.length).toBeGreaterThan(6);
+    expect(result).toEqual(original);
+  });
+
+  it('rejects mixed, unknown, extra, and missing reference fields strictly', () => {
+    const invalidTargets = [
+      { kind: 'entity', entity_id: 'road', source_id: 'synthetic-format-source' },
+      { kind: 'unsupported', entity_id: 'road' },
+      { kind: 'entity', entity_id: 'road', label: 'Road' },
+      { kind: 'entity' },
+      { kind: 'facet', entity_id: 'road' },
+      { kind: 'source' },
+    ];
+    for (const target of invalidTargets) {
+      const result = structuredClone(researchResultExample);
+      result.targets = [target] as never;
+      expect(() => parseResearchResult(result)).toThrow('Invalid Atlas research result');
+    }
+  });
+
+  it.each([
+    { kind: 'entity', entity_id: 'missing-entity' },
+    { kind: 'facet', entity_id: 'road', facet_key: 'missing-facet' },
+    { kind: 'source', source_id: 'missing-source' },
+  ] as const)('rejects structurally valid but dangling target $kind references semantically', target => {
+    const result = structuredClone(researchResultExample);
+    result.targets = [target];
+    const base = prepareResearch('transport');
+    const request = {
+      request_id: 'test-request', exploration_id: base.exploration_id, path_id: base.active_path_id!,
+      parent_occurrence_id: null, run_id: 'test-run', thread_id: 'test-thread',
+      committed_history_version: 7, last_sequence: 4, status: 'completed' as const,
+    };
+    const observed = [JSON.stringify({ url: result.sources[0].url, text: result.sources[0].excerpt })];
+    expect(() => projectResearch(base, parseResearchResult(result), request, false, observed))
+      .toThrow('Invalid Atlas exploration');
+  });
+
+  it('caps unrelated validation diagnostics and reports omitted issue count', () => {
+    const result = structuredClone(researchResultExample);
+    result.entities = Array.from({ length: 12 }, (_, index) => ({ entity_id: `bad-${index}` })) as never;
+    let failure: unknown;
+    try { parseResearchResult(result); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('additional validation issue(s) omitted');
+    expect((failure as Error).message.length).toBeLessThan(1600);
   });
 });

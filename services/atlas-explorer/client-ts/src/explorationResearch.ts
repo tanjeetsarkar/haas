@@ -1,4 +1,4 @@
-import Ajv from 'ajv';
+import Ajv, { type ErrorObject } from 'ajv';
 import addFormats from 'ajv-formats';
 import schema from './explorationSchema.v2.json';
 import type { AtlasExplorationRequest, AtlasExplorationSnapshot, AtlasTarget } from './explorationTypes';
@@ -33,6 +33,88 @@ const ajv = new Ajv({ allErrors: true });
 addFormats(ajv);
 const validateResult = ajv.compile<AtlasResearchResult>(atlasResearchResultSchema);
 let serial = 0;
+
+/** Structured schema details are retained without copying the rejected payload into the error. */
+export class AtlasResearchValidationError extends Error {
+  readonly details: readonly ErrorObject[];
+
+  constructor(message: string, details: ErrorObject[]) {
+    super(message);
+    this.name = 'AtlasResearchValidationError';
+    this.details = details.map(detail => ({ ...detail, params: { ...detail.params } }));
+  }
+}
+
+const targetFields = {
+  entity: { required: ['kind', 'entity_id'], allowed: ['kind', 'entity_id'] },
+  facet: { required: ['kind', 'entity_id', 'facet_key'], allowed: ['kind', 'entity_id', 'facet_key'] },
+  source: { required: ['kind', 'source_id'], allowed: ['kind', 'source_id'] },
+} as const;
+const allowedTargetKinds = Object.keys(targetFields);
+
+function safeToken(value: string): string {
+  const printable = value.replace(/[^\x20-\x7e]/gu, '?');
+  return JSON.stringify(printable.length > 48 ? `${printable.slice(0, 45)}...` : printable);
+}
+
+function safeFields(fields: string[]): string {
+  const shown = fields.slice(0, 6).map(safeToken);
+  return `${shown.join(', ')}${fields.length > shown.length ? `, +${fields.length - shown.length} more` : ''}`;
+}
+
+function targetSummary(value: unknown, index: number): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return `target[${index}] is not a reference object`;
+  }
+  const target = value as Record<string, unknown>;
+  const kind = typeof target.kind === 'string' ? target.kind : '(missing)';
+  const fields = Object.keys(target);
+  if (!Object.hasOwn(targetFields, kind)) {
+    return `target[${index}] received kind ${safeToken(kind)}; allowed kinds: ${allowedTargetKinds.join(', ')}`;
+  }
+  const shape = targetFields[kind as keyof typeof targetFields];
+  const missing = shape.required.filter(field => !Object.hasOwn(target, field));
+  const extra = fields.filter(field => !(shape.allowed as readonly string[]).includes(field));
+  const problems = [
+    `required fields: ${safeFields([...shape.required])}`,
+    missing.length ? `missing fields: ${safeFields(missing)}` : '',
+    extra.length ? `extra fields: ${safeFields(extra)}` : '',
+  ];
+  if (!missing.length && !extra.length) problems.push('reference fields do not satisfy the schema');
+  return `target[${index}] received kind ${safeToken(kind)}; ${problems.filter(Boolean).join('; ')}`;
+}
+
+function validationMessage(errors: ErrorObject[], value: unknown): string {
+  const targetIndexes = new Set<number>();
+  const other = new Map<string, { path: string; keyword: string; count: number }>();
+  for (const error of errors) {
+    const targetMatch = /^\/targets\/(\d+)(?:\/|$)/u.exec(error.instancePath);
+    if (targetMatch) {
+      targetIndexes.add(Number(targetMatch[1]));
+      continue;
+    }
+    const key = `${error.instancePath}\u0000${error.keyword}`;
+    const existing = other.get(key);
+    if (existing) existing.count++;
+    else other.set(key, { path: error.instancePath || '/', keyword: error.keyword, count: 1 });
+  }
+  const targets = value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>).targets : undefined;
+  const targetsMessages = [...targetIndexes].sort((a, b) => a - b).map(index =>
+    targetSummary(Array.isArray(targets) ? targets[index] : undefined, index));
+  const otherIssues = [...other.values()];
+  const maxIssues = 8;
+  const otherMessages = otherIssues.map(issue =>
+    `${issue.path}: ${issue.keyword} validation failed${issue.count > 1 ? ` (${issue.count} occurrences)` : ''}`);
+  const messages = [...targetsMessages, ...otherMessages].slice(0, maxIssues);
+  const omittedTargets = Math.max(0, targetsMessages.length - maxIssues);
+  const firstOmittedOther = Math.max(0, maxIssues - targetsMessages.length);
+  const omitted = omittedTargets +
+    otherIssues.slice(firstOmittedOther).reduce((sum, issue) => sum + issue.count, 0);
+  if (omitted) messages.push(`${omitted} additional validation issue(s) omitted`);
+  return messages.length ? messages.join('; ') : 'schema validation failed';
+}
+
 export const atlasId = (kind: string): string =>
   `${kind}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${++serial}`}`;
 
@@ -42,7 +124,12 @@ export function parseResearchResult(value: unknown): AtlasResearchResult {
     const text = value.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/u, '$1');
     decoded = JSON.parse(text);
   }
-  if (!validateResult(decoded)) throw new Error(`Invalid Atlas research result: ${ajv.errorsText(validateResult.errors)}`);
+  if (!validateResult(decoded)) {
+    throw new AtlasResearchValidationError(
+      `Invalid Atlas research result: ${validationMessage(validateResult.errors ?? [], decoded)}`,
+      validateResult.errors ?? [],
+    );
+  }
   return decoded;
 }
 
@@ -121,6 +208,14 @@ For informational checklists and inquiry drafts use claims[].details.checklist a
 Each detail is covered by its enclosing claim's evidence. Never mark proposed steps completed
 or invent prices, qualifications, availability or exact fees. Keep claim.text human-readable.
 Research only this level; targets are the next useful rows, not automatically researched descendants.
+Targets are strict one-level references, not descriptions: emit exactly one of
+{"kind":"entity","entity_id":"hospital-1"}
+{"kind":"facet","entity_id":"hospital-1","facet_key":"specialists"}
+{"kind":"source","source_id":"source-1"}
+Do not add title, label, description or other fields to a target. Entity kind (such as category,
+person or organization) is separate from target kind ("entity"). A facet reference needs its
+entity_id and facet_key; a source reference needs source_id. Never mix reference shapes.
+Use only a target for the next row; do not generate deeper levels.
 Exact source URLs and excerpts MUST come from successful research tool outputs. Never invent citations.
 Keep existing entity IDs when referring to selected context; new IDs must be unique.
 Do not rewrite existing identities. Attach facts as evidenced claims, not unsupported summaries.

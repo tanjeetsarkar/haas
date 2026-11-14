@@ -272,3 +272,200 @@ describe('durable SSE and live-only output', () => {
     expect(fetch).toHaveBeenCalledTimes(4);
   });
 });
+
+describe('SSE lifecycle', () => {
+  const sse = (body: string) => new Response(body, {
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+  const frame = (id: string, event: string, data: unknown = {}) =>
+    `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+
+  it('does not request with a pre-aborted signal and preserves Error abort reasons', async () => {
+    const fetch = mockFetch();
+    const controller = new AbortController();
+    const reason = new Error('stop observing');
+    controller.abort(reason);
+    const iterator = client().streamEvents(runId, { signal: controller.signal });
+    await expect(iterator.next()).rejects.toBe(reason);
+    expect(fetch).not.toHaveBeenCalled();
+
+    const stringReason = new AbortController();
+    stringReason.abort('not an Error');
+    await expect(client().streamEvents(runId, { signal: stringReason.signal }).next())
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('passes abort to fetch and rejects with the caller reason', async () => {
+    const fetch = mockFetch().mockImplementation((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('fetch aborted')));
+    }));
+    const controller = new AbortController();
+    const reason = new Error('stop fetching');
+    const pending = client().streamEvents(runId, { signal: controller.signal }).next();
+    expect(fetch).toHaveBeenCalledWith(
+      `https://harness.example/v1/runs/${runId}/stream`,
+      expect.objectContaining({ signal: controller.signal }),
+    );
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the reader on abort while reading and on early iterator return', async () => {
+    let abortCancel = vi.fn();
+    const abortBody = () => new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame('1', 'run_queued')));
+      },
+      cancel: abortCancel,
+    });
+    const controller = new AbortController();
+    const reason = new Error('stop reading');
+    mockFetch().mockResolvedValueOnce(new Response(abortBody()));
+    const iterator = client().streamEvents(runId, { signal: controller.signal });
+    await expect(iterator.next()).resolves.toMatchObject({ value: { event: 'run_queued' }, done: false });
+    const pending = iterator.next();
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(abortCancel).toHaveBeenCalled();
+
+    const returnCancel = vi.fn();
+    mockFetch().mockResolvedValueOnce(new Response(new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode(frame('1', 'run_queued')));
+      },
+      cancel: returnCancel,
+    })));
+    const early = client().streamEvents(runId);
+    await early.next();
+    await early.return();
+    expect(returnCancel).toHaveBeenCalled();
+  });
+
+  it('aborts EOF reconciliation and reconnect backoff without another request', async () => {
+    const statusFetch = mockFetch().mockImplementation((_input, init) => {
+      if (String(_input).endsWith('/stream')) return Promise.resolve(sse(''));
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('status aborted')));
+      });
+    });
+    const statusController = new AbortController();
+    const statusReason = new Error('stop status check');
+    const statusPending = client().streamEvents(runId, { signal: statusController.signal }).next();
+    await vi.waitFor(() => expect(statusFetch).toHaveBeenCalledTimes(2));
+    statusController.abort(statusReason);
+    await expect(statusPending).rejects.toBe(statusReason);
+
+    const backoffFetch = mockFetch()
+      .mockResolvedValueOnce(sse(''))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'input_required' }));
+    const backoffController = new AbortController();
+    const backoffReason = new Error('stop reconnecting');
+    const backoffPending = client({ streamReconnectDelay: 10000 })
+      .streamEvents(runId, { signal: backoffController.signal }).next();
+    await vi.waitFor(() => expect(backoffFetch).toHaveBeenCalledTimes(2));
+    backoffController.abort(backoffReason);
+    await expect(backoffPending).rejects.toBe(backoffReason);
+    expect(backoffFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats input_required EOF as reconnectable and terminal EOF as completion', async () => {
+    const fetch = mockFetch()
+      .mockResolvedValueOnce(sse(''))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'input_required' }))
+      .mockResolvedValueOnce(sse(frame('1', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    const events: SSEEvent[] = [];
+    for await (const event of client({ streamReconnectDelay: 0 }).streamEvents(runId)) {
+      events.push(event);
+    }
+    expect(events).toEqual([{ id: '1', event: 'run_completed', data: completed.data }]);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('uses only yielded durable numeric IDs for a non-regressing replay cursor', async () => {
+    const delta = { preview: true };
+    const fetch = mockFetch()
+      .mockResolvedValueOnce(sse(
+        `${frame('3', 'first')}${frame('2', 'replayed')}` +
+        `event: output_delta\ndata: ${JSON.stringify(delta)}\n\n`,
+      ))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'running' }))
+      .mockResolvedValueOnce(sse(frame('4', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    const events: SSEEvent[] = [];
+    for await (const event of client({ streamReconnectDelay: 0 }).streamEvents(runId, {
+      outputDeltas: true,
+    })) events.push(event);
+    expect(events.map(event => event.id)).toEqual(['3', '2', undefined, '4']);
+    expect(fetch).toHaveBeenNthCalledWith(3,
+      `https://harness.example/v1/runs/${runId}/stream?output_deltas=true`,
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': '3' }) }),
+    );
+  });
+
+  it('accepts the maximum nonnegative BIGINT ID and rejects out-of-range IDs', async () => {
+    const maxId = '9223372036854775807';
+    const overflowId = '9223372036854775808';
+    const fetch = mockFetch()
+      .mockResolvedValueOnce(sse(`${frame(maxId, 'largest')}${frame(overflowId, 'overflow')}`))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'running' }))
+      .mockResolvedValueOnce(sse(frame('1', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    const events: SSEEvent[] = [];
+    for await (const event of client({ streamReconnectDelay: 0 }).streamEvents(runId, {
+    })) events.push(event);
+    expect(events.map(event => event.id)).toEqual([maxId, overflowId, '1']);
+    expect(fetch).toHaveBeenNthCalledWith(1, expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': '0' }) }));
+    expect(fetch).toHaveBeenNthCalledWith(3, expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': maxId }) }));
+
+    const validInitial = mockFetch()
+      .mockResolvedValueOnce(sse(frame('1', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    for await (const _event of client().streamEvents(runId, { lastEventId: maxId })) {
+      // Consume the terminal event.
+    }
+    expect(validInitial).toHaveBeenCalledWith(expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': maxId }) }));
+
+    const invalidInitial = mockFetch()
+      .mockResolvedValueOnce(sse(frame('1', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    for await (const _event of client().streamEvents(runId, { lastEventId: overflowId })) {
+      // Consume the terminal event.
+    }
+    expect(invalidInitial).toHaveBeenCalledWith(expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': '0' }) }));
+  });
+
+  it('retries malformed JSON without advancing its ID and honors the exact retry budget', async () => {
+    const fetch = mockFetch()
+      .mockResolvedValueOnce(sse('id: 42\nevent: bad\ndata: {not json}\n\n'))
+      .mockResolvedValueOnce(sse(frame('2', 'run_completed', completed.data)))
+      .mockResolvedValueOnce(json({ ...admitted, status: 'completed' }));
+    const events: SSEEvent[] = [];
+    for await (const event of client({ streamReconnectDelay: 0, streamMaxReconnects: 1 })
+      .streamEvents(runId)) events.push(event);
+    expect(events).toEqual([{ id: '2', event: 'run_completed', data: completed.data }]);
+    expect(fetch).toHaveBeenNthCalledWith(2, expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'Last-Event-ID': '0' }) }));
+
+    for (const [maxReconnects, attempts] of [[0, 1], [1, 2], [2, 3]] as const) {
+      const failedFetch = mockFetch().mockRejectedValue(new Error('offline'));
+      await expect(client({
+        streamMaxReconnects: maxReconnects, streamReconnectDelay: 0,
+      }).streamEvents(runId).next()).rejects.toMatchObject({ name: 'HaaSConnectionError' });
+      expect(failedFetch).toHaveBeenCalledTimes(attempts);
+    }
+  });
+
+  it('does not retry authentication/API failures', async () => {
+    const fetch = mockFetch().mockResolvedValue(json({ detail: 'unauthorized' }, 401));
+    await expect(client({ streamMaxReconnects: 5 }).streamEvents(runId).next())
+      .rejects.toMatchObject({ name: 'HaaSAPIError', status: 401 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});

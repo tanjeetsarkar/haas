@@ -1,0 +1,21 @@
+services:
+  atlas-explorer:
+    environment:
+      ATLAS_DATABASE_URL_FILE: /run/secrets/atlas_external_runtime_url
+    secrets: !override
+      - atlas_external_runtime_url
+    depends_on: !reset []
+    networks: !override
+      - haas-core
+
+  atlas-postgres:
+    profiles: ["bundled-postgres"]
+
+  atlas-migrate:
+    environment:
+      ATLAS_MIGRATION_DATABASE_URL_FILE: /run/secrets/atlas_external_migration_url
+    secrets: !override
+      - atlas_external_migration_url
+    networks: !override
+      - haas-core
+

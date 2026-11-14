@@ -1,4 +1,5 @@
-import type { AtlasExplorationSnapshot, AtlasTarget } from '@haas/atlas-explorer-client';
+import type { AtlasExecutionContext, AtlasExecutionEvent, AtlasExplorationSnapshot, AtlasOperationPersistence,
+  AtlasRunObservationResult, AtlasTarget } from '@haas/atlas-explorer-client';
 
 /** UI-owned boundary. No credentials, storage implementation or guessed SDK calls. */
 export interface AtlasAttribute {
@@ -51,14 +52,22 @@ export interface AtlasResearchOperation {
   result: Promise<AtlasWorkspaceData>;
   /** Must cancel the remote run, not merely disconnect the browser. */
   cancel(): Promise<void | { acknowledged: boolean; message?: string }>;
+  /** Observation only; never remote cancellation. */
+  detach?(): void;
 }
 
 export interface AtlasWorkspaceAdapter {
+  resume?(input: {
+    context: AtlasExecutionContext; lastEventId: string; persistence: AtlasOperationPersistence;
+    signal: AbortSignal; onExecution(event: AtlasExecutionEvent): void;
+  }): Promise<AtlasRunObservationResult>;
   /** Scoped research returns the canonical merged graph with parent navigation retained. */
   research(input: {
     query: string;
     parent?: { data: AtlasWorkspaceData; target: AtlasTarget };
     onStatus: (status: AtlasResearchStatus) => void;
+    onExecution?: (event: AtlasExecutionEvent) => void;
+    operationPersistence?: AtlasOperationPersistence;
   }): AtlasResearchOperation;
   save(data: AtlasWorkspaceData): Promise<AtlasSavedSnapshot>;
   load(artifactId: string): Promise<AtlasWorkspaceData>;

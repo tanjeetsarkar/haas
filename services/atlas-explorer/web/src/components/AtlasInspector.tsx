@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
-import type { AtlasEvidence, AtlasExplorationSnapshot, AtlasSource, AtlasTarget } from '@haas/atlas-explorer-client';
+import type { AtlasActionDraftV1, AtlasEvidence, AtlasExplorationSnapshot, AtlasSource, AtlasTarget } from '@haas/atlas-explorer-client';
 import type { AtlasPresentation } from '../explorationAdapter';
 import { evidenceSources, facetResearchComplete, targetClaims, targetRelationships, targetTitle } from '../graphProjection';
 import { PreviewConnections } from './PreviewConnections';
+import { AtlasCardActions } from './AtlasCardActions';
 
 export function AtlasInspectorFrame({ children, sample = false }: { children: ReactNode; sample?: boolean }) {
   return <aside className="atlas-preview__inspector" aria-label="Evidence and details">
@@ -95,12 +96,20 @@ export function AtlasAttributes({ presentation }: { presentation?: AtlasPresenta
   </>;
 }
 
-export function AtlasInspector({ snapshot, target, presentations, onNavigate, onResearch }: {
+export function AtlasInspector({ snapshot, target, presentations, onNavigate, onResearch, onResearchAgain,
+  actionDrafts, editingActionCard, actionDraftText, onEditAction, onActionDraftText, onSaveActionDraft }: {
   snapshot: AtlasExplorationSnapshot;
   target: AtlasTarget | null;
   presentations?: AtlasPresentation[];
   onNavigate: (entityId: string) => void;
   onResearch: (target: AtlasTarget) => void;
+  onResearchAgain?: (target: AtlasTarget) => void;
+  actionDrafts: Record<string, unknown>;
+  editingActionCard: string | null;
+  actionDraftText: string;
+  onEditAction: (cardId: string, initialText: string) => void;
+  onActionDraftText: (value: string) => void;
+  onSaveActionDraft?: (cardId: string, draft: AtlasActionDraftV1) => Promise<void>;
 }) {
   if (!target) return <AtlasInspectorFrame><div className="atlas-preview__inspector-empty">
     <h2>Select a starting point</h2><p>Select an entity, facet or source to inspect actual research data.</p>
@@ -115,6 +124,13 @@ export function AtlasInspector({ snapshot, target, presentations, onNavigate, on
       {entity && <><p>{entity.summary}</p><small>Identity: {entity.identity_status} · {entity.entity_id}</small>
         {entity.external_references.map(r => <p key={`${r.namespace}:${r.value}`}>{r.namespace}: {r.value}</p>)}</>}
     </div>
+    <AtlasCardActions snapshot={snapshot} target={target} drafts={actionDrafts}
+      editingCardId={editingActionCard} draftText={actionDraftText}
+      onEdit={onEditAction} onDraftText={onActionDraftText} onSaveDraft={onSaveActionDraft} />
+    {onResearchAgain && <button type="button" onClick={event => {
+      event.stopPropagation();
+      onResearchAgain(target);
+    }}>Research again</button>}
     {entity?.identity_status === 'candidate' && target.kind === 'entity' && <div className="atlas-preview__facet-note">
       <strong>Candidate identity · not resolved</strong><p>Do not attribute claims to this person until identity is resolved.</p>
       <button type="button" onClick={() => onResearch(target)}>Resolve this identity</button>

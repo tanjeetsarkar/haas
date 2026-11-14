@@ -92,7 +92,7 @@ class HaasOptions(BaseModel):
     thread_id: str | None = Field(default=None, max_length=128)
     preload_skills: list[str] = Field(default_factory=list)
     skills: list[str] | None = None
-    max_steps: int | None = Field(default=None, ge=1, le=50)
+    max_steps: int | None = Field(default=None, ge=1, le=1_000)
     max_cost_usd: float | None = Field(default=None, gt=0.0, le=10.0)
     deadline_sec: int | None = Field(default=None, ge=10, le=86_400)
     max_tool_invocations: int | None = Field(default=None, ge=1, le=1_000)

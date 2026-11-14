@@ -4,6 +4,15 @@ User-visible contract changes, newest first. Policy: [api-deprecation-policy.md]
 
 ## Unreleased
 
+### Changed
+
+- Raised the generic `max_steps` validation ceiling from 50 to 1000 for run
+  requests, agent configurations, tenant policy rules, and OpenAI-compatible
+  `haas` options. The default remains 15; active tenant policies still authorize
+  and cap each run. Cost, tool-invocation, and deadline limits are unchanged.
+  No existing policy is expanded automatically. This preserves the hard run
+  totals described in [ADR 0022](adr/0022-bounded-acquisition-and-tool-free-finalization.md).
+
 ### Fixed
 
 - Held bounded-phase finalizer failures persist their exact claimed-step marker

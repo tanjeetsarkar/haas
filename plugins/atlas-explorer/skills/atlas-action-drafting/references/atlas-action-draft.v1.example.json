@@ -1,0 +1,33 @@
+{
+  "schema_version": "atlas-action-draft.v1",
+  "proposal_id": "draft-example-001",
+  "card_reference": {
+    "card_id": "card-public-example",
+    "workspace_revision": "revision-12",
+    "branch_revision": null
+  },
+  "intent_text": "Ask the user to confirm whether they want information about publicly listed opening hours.",
+  "capability": {
+    "capability_id": null,
+    "schema_version": null,
+    "resolution": "unverified",
+    "reason": "No trusted capability catalog was supplied; this is an unresolved draft only."
+  },
+  "proposed_arguments": [
+    {
+      "field": "requested_information",
+      "value": "opening hours",
+      "source": "user_input",
+      "uncertain": false
+    }
+  ],
+  "evidence_refs": ["card-public-example:opening-hours"],
+  "missing_fields": ["user confirmation of the intended request"],
+  "warnings": [
+    "Argument suggestions are untrusted and have not been checked against a registered schema."
+  ],
+  "external_execution": {
+    "status": "unavailable",
+    "reason": "External execution unavailable — authorization release gates pending"
+  }
+}

@@ -62,9 +62,12 @@ function harness(
         write(chunk, _encoding, done) { body += chunk.toString(); done(); },
       }), {
         statusCode: 0,
+        responseHeaders: {} as Record<string, string>,
         headersSent: false,
         flushHeaders: vi.fn(),
-        writeHead(status: number) { this.statusCode = status; this.headersSent = true; },
+        writeHead(status: number, headers: Record<string, string> = {}) {
+          this.statusCode = status; this.responseHeaders = headers; this.headersSent = true;
+        },
       });
       const next = vi.fn();
       cleanup.push(() => { res.destroy(); });
@@ -217,6 +220,113 @@ describe('loopback and browser request guards', () => {
 });
 
 describe('integrated mocked proxy middleware', () => {
+  it('maps only workspace routes to the fixed service with server-side identity', async () => {
+    const { request, upstream } = mockUpstream();
+    const result = harness().send({
+      url: '/__atlas/workspaces?limit=20', method: 'GET',
+      headers: { origin: 'http://127.0.0.1:4321', authorization: undefined, 'x-tenant-id': undefined },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(request).toHaveBeenCalledWith('http://127.0.0.1:8081/api/v1/workspaces?limit=20', {
+      method: 'GET',
+      headers: expect.objectContaining({
+        host: '127.0.0.1:8081',
+        authorization: `Bearer ${env.HAAS_API_KEY}`,
+        'x-tenant-id': env.HAAS_TENANT,
+        accept: 'application/json',
+      }),
+    }, expect.any(Function));
+    expect(upstream.read()).toBeNull();
+    expect(result.res.statusCode).toBe(0);
+  });
+
+  it.each(['authorization', 'x-tenant-id', 'x-api-key', 'cookie'])(
+    'rejects browser identity header %s on workspace path',
+    (header) => {
+      const { request } = mockUpstream();
+      const result = harness().send({
+        url: '/__atlas/workspaces', method: 'POST',
+        headers: { origin: 'http://127.0.0.1:4321', [header]: 'forged' },
+        body: '{"schema_version":1}',
+      });
+      expect(result.res.statusCode).toBe(403);
+      expect(request).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['/__atlas/workspaces/../v1/me', 'GET'],
+    ['/__atlas/workspaces/not-a-uuid', 'GET'],
+    ['/__atlas/workspaces/00000000-0000-0000-0000-000000000001/mutations', 'GET'],
+    ['/__atlas/workspaces?unexpected=1', 'GET'],
+    ['/__atlas/workspaces?cursor=a&cursor=b', 'GET'],
+    ['/__atlas/workspaces/00000000-0000-0000-0000-000000000001', 'DELETE'],
+  ])('rejects unsupported workspace path or method %s %s', (url, method) => {
+    const { request } = mockUpstream();
+    const result = harness().send({ url, method, headers: { origin: 'http://127.0.0.1:4321' } });
+    expect(result.res.statusCode).toBe(403);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('enforces JSON bodies on mutation routes', () => {
+    const { request } = mockUpstream();
+    const result = harness().send({
+      url: '/__atlas/workspaces', method: 'POST',
+      headers: { origin: 'http://127.0.0.1:4321', 'content-type': 'text/plain' },
+      body: 'not json',
+    });
+    expect(result.res.statusCode).toBe(415);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('uses JSON errors and never forwards upstream Set-Cookie on workspace routes', async () => {
+    const { request } = mockUpstream();
+    const denied = harness().send({
+      url: '/__atlas/workspaces', method: 'GET',
+      headers: { origin: 'http://attacker.example' },
+    });
+    expect(denied.res.statusCode).toBe(403);
+    expect(JSON.parse(denied.body())).toEqual({ code: 'request_denied' });
+    expect(request).not.toHaveBeenCalled();
+
+    const allowed = harness().send({
+      url: '/__atlas/workspaces', method: 'GET',
+      headers: { origin: 'http://127.0.0.1:4321' },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const response = Object.assign(new PassThrough(), {
+      statusCode: 200,
+      headers: { 'content-type': 'application/json', 'set-cookie': 'private=session' },
+    });
+    const onResponse = request.mock.calls[0][2] as (res: IncomingMessage) => void;
+    onResponse(response as unknown as IncomingMessage);
+    const responseEnded = once(response, 'end');
+    response.end('{"items":[]}');
+    await responseEnded;
+    expect(allowed.res.statusCode).toBe(200);
+    expect(allowed.body()).toBe('{"items":[]}');
+    expect(allowed.res.responseHeaders).not.toHaveProperty('Set-Cookie');
+    expect(allowed.res.responseHeaders).toMatchObject({
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    });
+  });
+
+  it('rejects oversized declared workspace request before upstream', () => {
+    const { request } = mockUpstream();
+    const result = harness().send({
+      url: '/__atlas/workspaces', method: 'POST',
+      headers: {
+        origin: 'http://127.0.0.1:4321',
+        'content-type': 'application/json',
+        'content-length': String(300 * 1024 + 1),
+      },
+    });
+    expect(result.res.statusCode).toBe(413);
+    expect(JSON.parse(result.body())).toEqual({ code: 'request_too_large' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it.each(['/v1', '/v1?limit=1', '/v1/runs', '/v1/threads', '/v1/artifacts', '/v1/approvals', '/v1/me'])('forwards broad public API path %s with server auth only', (url) => {
     const { request } = mockUpstream();
     harness().send({

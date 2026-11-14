@@ -29,7 +29,7 @@ export class AtlasSessionManager {
       thread_id: thread.thread_id,
       prompt: `Layer 1 Root Query: ${query}. Emit atlas-layer.v1 JSON.`,
       preload_skills: ['atlas-explorer', 'web-research', 'data-analyst'],
-      max_steps: 6,
+      max_steps: 1000,
       max_cost_usd: 0.15,
       max_tool_invocations: 12,
     });
@@ -52,7 +52,7 @@ export class AtlasSessionManager {
       thread_id: branchedThread.thread_id,
       prompt: `[parent_node_id=${req.parentNodeId}] [dimension=${req.dimensionKey}] ${req.prompt}`,
       preload_skills: ['atlas-explorer', 'web-research', 'data-analyst'],
-      max_steps: 5,
+      max_steps: 1000,
       max_cost_usd: 0.10,
       max_tool_invocations: 8,
     });
